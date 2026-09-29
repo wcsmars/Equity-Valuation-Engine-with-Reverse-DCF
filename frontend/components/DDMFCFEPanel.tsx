@@ -6,12 +6,13 @@
 import React from "react";
 import type { Report } from "@/lib/types";
 import {
+  excludedReason,
   fmtBig,
   fmtCount,
   fmtMoney,
   fmtNum,
   fmtPct,
-  toneForUpside,
+  toneForMethodUpside,
 } from "@/lib/format";
 import { Card, EmptyState, Stat, Table, TD, TH } from "@/components/ui";
 
@@ -21,39 +22,70 @@ function humanizeKey(key: string): string {
 }
 
 // Format an untrusted detail value. Numbers that look like rates/growth render
-// as percentages; other numbers as plain figures; everything else as a string.
-function fmtDetailValue(key: string, value: unknown): string {
+// as percentages, money-like keys (prices, dividends, values, revenue) as
+// currency (compact when large), arrays element-wise; strings pass through.
+function fmtDetailValue(key: string, value: unknown, cur: string): string {
+  if (Array.isArray(value)) {
+    return value.map((v) => fmtDetailValue(key, v, cur)).join(", ") || "—";
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) return "—";
     const k = key.toLowerCase();
     // Year counts (e.g. high_growth_years) are integers, not rates.
     if (k.includes("year")) return String(Math.round(value));
     const rateLike =
-      /(growth|rate|margin|yield|return|wacc|cost|premium|payout|retention|equity_w|weight)/.test(
+      /(growth|rate|margin|yield|return|wacc|cost|premium|payout|retention|pct|equity_w|weight)/.test(
         k
       ) || k === "ke";
     if (rateLike && Math.abs(value) <= 1.5) return fmtPct(value);
-    return fmtNum(value, 4);
+    const moneyLike =
+      /(price|value|pv|dividend|revenue|equity)/.test(k) || k === "d0";
+    if (moneyLike)
+      return Math.abs(value) >= 1e5 ? fmtBig(value, cur) : fmtMoney(value, cur);
+    return fmtNum(value, 2);
   }
   if (value == null) return "—";
   return String(value);
 }
 
-function DetailList({ detail }: { detail: Record<string, unknown> | null | undefined }) {
-  const entries = Object.entries(detail || {});
-  if (entries.length === 0) return null;
+function DetailList({
+  detail,
+  cur,
+}: {
+  detail: Record<string, unknown> | null | undefined;
+  cur: string;
+}) {
+  // Engine notes are free-text sentences: list them under the grid.
+  const rawNotes = detail?.notes;
+  const notes = Array.isArray(rawNotes)
+    ? rawNotes.filter((n): n is string => typeof n === "string" && n !== "")
+    : [];
+  const entries = Object.entries(detail || {}).filter(([k]) => k !== "notes");
+  if (entries.length === 0 && notes.length === 0) return null;
   return (
-    <div className="mt-3 grid grid-cols-1 gap-x-4 gap-y-1 border-t border-line pt-3 sm:grid-cols-2">
-      {entries.map(([key, value]: [string, unknown]) => (
-        <div key={key} className="flex items-baseline justify-between gap-3">
-          <span className="text-xs capitalize text-ink-dim">
-            {humanizeKey(key)}
-          </span>
-          <span className="num text-xs text-ink">
-            {fmtDetailValue(key, value)}
-          </span>
-        </div>
-      ))}
+    <div className="mt-3 border-t border-line pt-3">
+      <div className="grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-2">
+        {entries.map(([key, value]: [string, unknown]) => (
+          <div
+            key={key}
+            className="flex min-w-0 items-baseline justify-between gap-3"
+          >
+            <span className="shrink-0 text-xs capitalize text-ink-dim">
+              {humanizeKey(key)}
+            </span>
+            <span className="num min-w-0 break-words text-right text-xs text-ink">
+              {fmtDetailValue(key, value, cur)}
+            </span>
+          </div>
+        ))}
+      </div>
+      {notes.length > 0 && (
+        <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-ink-faint">
+          {notes.map((n, i) => (
+            <li key={i}>{n}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -70,12 +102,22 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
     fcfe && price ? fcfe.implied_price / price - 1 : null;
 
   const fcfeYears = fcfe?.years || [];
+  // Methods left out of the blended target are shown for reference only (a
+  // flagged company's FCFE, or a low-payout DDM), with the engine's reason and
+  // an uncoloured upside (also uncoloured when the engine gives no verdict).
+  const ddmOut = excludedReason(report.summary, "DDM");
+  const fcfeOut = excludedReason(report.summary, "FCFE");
+  const refOnly = (why: string | null, base: string) =>
+    why ? `${base} · Reference only, not in the blended target: ${why}` : base;
 
   return (
     <div className="grid grid-cols-1 gap-4">
       <Card
         title="Dividend discount model (DDM)"
-        subtitle="Implied value from projected dividends discounted at the cost of equity"
+        subtitle={refOnly(
+          ddmOut,
+          "Implied value from projected dividends discounted at the cost of equity"
+        )}
       >
         {ddm == null ? (
           <EmptyState
@@ -86,9 +128,9 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
           <>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
               <Stat
-                label="Implied price"
+                label={ddmOut ? "Implied price (ref.)" : "Implied price"}
                 value={fmtMoney(ddm.implied_price, cur)}
-                tone={toneForUpside(ddmUpside)}
+                tone={toneForMethodUpside(report.summary, "DDM", ddmUpside)}
                 sub={fmtPct(ddmUpside, { signed: true })}
               />
               <Stat
@@ -102,14 +144,17 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
                 value={fmtPct(ddm.cost_of_equity)}
               />
             </div>
-            <DetailList detail={ddm.detail} />
+            <DetailList detail={ddm.detail} cur={cur} />
           </>
         )}
       </Card>
 
       <Card
         title="Levered FCFE"
-        subtitle="Free cash flow to equity discounted at the cost of equity"
+        subtitle={refOnly(
+          fcfeOut,
+          "Free cash flow to equity discounted at the cost of equity"
+        )}
       >
         {fcfe == null ? (
           <EmptyState
@@ -120,9 +165,9 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
           <>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <Stat
-                label="Implied price"
+                label={fcfeOut ? "Implied price (ref.)" : "Implied price"}
                 value={fmtMoney(fcfe.implied_price, cur)}
-                tone={toneForUpside(fcfeUpside)}
+                tone={toneForMethodUpside(report.summary, "FCFE", fcfeUpside)}
                 sub={fmtPct(fcfeUpside, { signed: true })}
               />
               <Stat
@@ -196,7 +241,7 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
               </div>
             </div>
 
-            <DetailList detail={fcfe.detail} />
+            <DetailList detail={fcfe.detail} cur={cur} />
           </>
         )}
       </Card>

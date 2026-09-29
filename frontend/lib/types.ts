@@ -9,7 +9,12 @@ export interface MarketData {
   price: number;
   shares_outstanding: number;
   market_cap: number;
+  // The beta the models use. For a live quote it is Yahoo's 5-year monthly
+  // beta Blume-adjusted toward 1 (0.67 x raw + 0.33); raw_beta keeps Yahoo's
+  // unadjusted figure. raw_beta is null when no adjustment was made (the
+  // synthetic company, a beta supplied by hand, or no usable beta).
   beta: number | null;
+  raw_beta: number | null;
   dividend_per_share: number | null;
   fifty_two_week_low: number | null;
   fifty_two_week_high: number | null;
@@ -151,8 +156,9 @@ export interface Sensitivity {
   title: string;
   row_label: string;
   col_label: string;
-  row_values: number[];
-  col_values: number[];
+  // Axis values can be null (e.g. the margin axis for a pre-revenue company).
+  row_values: (number | null)[];
+  col_values: (number | null)[];
   grid: (number | null)[][];
 }
 
@@ -168,10 +174,25 @@ export interface Summary {
   name: string;
   currency: string;
   current_price: number;
-  methods: Record<string, number>;
+  methods: Record<string, number | null>;
+  // null when no method produced a usable value, or when the engine gives no
+  // target (e.g. a captive-finance group or a lessor whose only method left
+  // is the DDM: it asks for peers instead).
   blended_target: number | null;
+  // null when there is no target, no price, or the verdict is withheld (a
+  // blend that rests on the DDM alone); the UI then shows "n/a", uncoloured.
   blended_upside: number | null;
   recommendation: string;
+  // Methods shown for reference but left out of the blended target, with the
+  // engine's reason (e.g. a bank's, captive-finance group's or lessor's DCF
+  // and FCFE, or a low-payout DDM).
+  excluded_from_blend?: Record<string, string>;
+  // Why the company is flagged (bank, insurer, REIT, lender, captive finance
+  // arm, lessor, ...); else null.
+  financial_institution?: string | null;
+  // The flag's kind: "bank", "insurer", "reit", "lender", "captive_finance",
+  // "lessor" or "financial" (flagged, kind unknown); null when not flagged.
+  financial_kind?: string | null;
 }
 
 export interface ReverseDCF {
@@ -235,10 +256,22 @@ export interface Assumptions {
   peers?: string; // comma-separated tickers
 }
 
-export type AssumptionsUsed = Assumptions & {
-  cost_of_debt?: number | null;
-  revenue_growth?: number[] | null;
-};
+// The engine's echo of what it actually used (parse_assumptions). Optional
+// inputs the user left unset come back as null.
+export interface AssumptionsUsed {
+  rf: number;
+  erp: number;
+  tax_rate: number | null;
+  cost_of_debt: number | null;
+  forecast_years: number;
+  terminal_growth: number;
+  terminal_method: "gordon" | "exit_multiple";
+  exit_ev_ebitda: number | null;
+  target_ebit_margin: number | null;
+  revenue_growth_y1: number | null;
+  revenue_growth: number[] | null;
+  peers: string | null;
+}
 
 // --- AI researcher -------------------------------------------------------- //
 export type AssumptionField =

@@ -28,12 +28,12 @@ class DemoResultTests(unittest.TestCase):
         # The README "Results" table quotes these figures; keep them in step.
         s = _demo_report().summary
         self.assertAlmostEqual(s["current_price"], 40.84, delta=0.005)
-        expected = {"DCF": 33.38, "Comps (median)": 42.88, "DDM": 10.99, "FCFE": 31.25}
+        expected = {"DCF": 33.38, "Comps (median)": 42.88, "DDM": 10.99, "FCFE": 31.41}
         self.assertEqual(set(s["methods"]), set(expected))
         for method, price in expected.items():
             self.assertAlmostEqual(s["methods"][method], price, delta=0.005, msg=method)
-        self.assertAlmostEqual(s["blended_target"], 32.32, delta=0.005)
-        self.assertAlmostEqual(s["blended_upside"], -0.209, delta=0.0005)
+        self.assertAlmostEqual(s["blended_target"], 32.40, delta=0.005)
+        self.assertAlmostEqual(s["blended_upside"], -0.207, delta=0.0005)
         self.assertEqual(s["recommendation"], "Overvalued")
 
     def test_cli_demo_writes_excel_and_html(self):
@@ -99,6 +99,114 @@ class OfficeExportTests(unittest.TestCase):
             self.assertIn("Synthetic Corp", text)
             self.assertIn("Overvalued", text)
             self.assertGreaterEqual(len(Presentation(deck).slides), 1)
+
+
+class SerializationTests(unittest.TestCase):
+    """The dashboard payload and the AI context for an adjusted beta and for a
+    summary with no blended target or a withheld upside."""
+
+    def _adjusted_report(self):
+        from equity_valuation.data.synthetic import make_company
+
+        class _Adjusted(SyntheticProvider):
+            def get_company_data(self, ticker):
+                company = make_company()
+                company.market.raw_beta = 2.217
+                company.market.beta = 0.67 * 2.217 + 0.33
+                return company
+
+        return value_company(DEMO_TICKER, provider=_Adjusted(), peers=DEMO_PEERS)
+
+    def test_raw_beta_reaches_the_payload_and_the_ai_context(self):
+        from backend.serialization import build_ai_context, report_to_dict
+
+        d = report_to_dict(self._adjusted_report())
+        self.assertEqual(d["company"]["market"]["raw_beta"], 2.217)
+        self.assertAlmostEqual(d["company"]["market"]["beta"], 1.81539, places=9)
+        self.assertEqual(d["dcf"]["wacc"]["detail"]["beta_raw"], 2.217)
+        ctx = build_ai_context(d)
+        self.assertIn("beta 1.815 (Blume-adjusted from raw 2.217)", ctx)
+        self.assertEqual(ctx.count("Blume-adjusted from raw 2.217"), 2)  # PRICE and DCF
+
+        # The synthetic beta is not adjusted: raw_beta is null, no adjustment is claimed.
+        d = report_to_dict(_demo_report())
+        self.assertIsNone(d["company"]["market"]["raw_beta"])
+        ctx = build_ai_context(d)
+        self.assertIn("beta 1.100 |", ctx)
+        self.assertNotIn("Blume", ctx)
+
+    @staticmethod
+    def _kind_payload(kind=None, industry=None):
+        """The dashboard payload of the engine's run for the synthetic company
+        flagged as that kind (or presented as a bank), without peers."""
+        from backend.serialization import report_to_dict
+        from equity_valuation.data.synthetic import make_company
+
+        class _Kind(SyntheticProvider):
+            def get_company_data(self, ticker):
+                company = make_company()
+                if kind:
+                    company.financials._financial_kind = kind
+                if industry:
+                    company.market.sector = "Financial Services"
+                    company.market.industry = industry
+                return company
+
+        return report_to_dict(value_company(DEMO_TICKER, provider=_Kind(), run_comps=False))
+
+    @staticmethod
+    def _line(ctx, prefix):
+        return next(ln for ln in ctx.splitlines() if ln.startswith(prefix))
+
+    def test_ai_context_says_when_there_is_no_target_or_no_upside(self):
+        from backend.serialization import build_ai_context, report_to_dict
+
+        ctx = build_ai_context(report_to_dict(_demo_report()))
+        self.assertIn("VERDICT: Overvalued | blended target $32.40 (-20.7% vs price)", ctx)
+        # The demo's DCF is in the blend: a signed upside, no marker.
+        dcf = self._line(ctx, "DCF: ")
+        self.assertTrue(dcf.endswith("implied $33.38 (-18.3% vs price)"), dcf)
+        self.assertNotIn("reference only", dcf)
+
+        # A lessor without peers (as AER): no target, every method reference only.
+        d = self._kind_payload("lessor")
+        excluded = d["summary"]["excluded_from_blend"]
+        self.assertEqual(set(excluded), {"DCF", "DDM", "FCFE"})
+        ctx = build_ai_context(d)
+        self.assertIn("VERDICT: N/A | blended target: none (no target; supply peers to add "
+                      "trading comps)", ctx)
+        for name in ("DCF", "DDM", "FCFE"):
+            self.assertIn(f"{name} ${d['summary']['methods'][name]:,.2f} (reference only, "
+                          f"not in blend: {excluded[name]})", ctx)
+        # The DCF line is marked too, so its upside is not quoted as the view.
+        dcf = self._line(ctx, "DCF: ")
+        self.assertTrue(dcf.endswith(f"(-18.3% vs price) (reference only, not in blend: "
+                                     f"{excluded['DCF']})"), dcf)
+
+        # A bank without peers (as BAC): the DDM-only target stays, the verdict
+        # is withheld; the DDM is in the blend, the DCF is not.
+        d = self._kind_payload(industry="Banks - Diversified")
+        ctx = build_ai_context(d)
+        self.assertIn("VERDICT: N/A | blended target $10.99 (upside withheld: n/a)", ctx)
+        self.assertIn("DDM $10.99;", ctx)
+        self.assertIn("(reference only, not in blend: not meaningful for a financial "
+                      "institution)", self._line(ctx, "DCF: "))
+
+        # Hand-built (the engine needs a price): no upside because there is no
+        # current price is not a withheld verdict.
+        d["summary"].update(current_price=None)
+        self.assertIn("VERDICT: N/A | blended target $10.99 (upside n/a: no current price)",
+                      build_ai_context(d))
+        # A positive upside carries its sign.
+        d = report_to_dict(_demo_report())
+        d["summary"].update(blended_target=49.0, blended_upside=0.2)
+        self.assertIn("blended target $49.00 (+20.0% vs price)", build_ai_context(d))
+        # An ordinary company whose methods gave no valuation: no peers asked for.
+        d["summary"].update(methods={"DCF": 0.0}, blended_target=None, blended_upside=None,
+                            recommendation="N/A", financial_kind=None,
+                            financial_institution=None)
+        d["comps"] = None
+        self.assertIn("VERDICT: N/A | blended target: n/a", build_ai_context(d))
 
 
 class ReverseDCFTests(unittest.TestCase):

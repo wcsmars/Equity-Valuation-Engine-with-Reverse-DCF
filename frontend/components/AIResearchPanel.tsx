@@ -16,8 +16,15 @@ import type {
   Report,
   ResearchNote,
 } from "@/lib/types";
-import { postChat, postDigest, fileToBase64 } from "@/lib/api";
-import { fmtDate, fmtMult, fmtNum, fmtPct } from "@/lib/format";
+import {
+  MAX_UPLOAD_BYTES,
+  fileToBase64,
+  jsonBytes,
+  planPdfAttachments,
+  postChat,
+  postDigest,
+} from "@/lib/api";
+import { fmtBytes, fmtDate, fmtMult, fmtNum, fmtPct } from "@/lib/format";
 import { Badge, Button, Card, EmptyState, Spinner, cx } from "@/components/ui";
 
 // Render a suggestion value according to its declared unit. Rates are decimals.
@@ -211,21 +218,39 @@ export default function AIResearchPanel({
     e: React.ChangeEvent<HTMLInputElement>
   ): Promise<void> {
     const files = Array.from(e.target.files ?? []);
+    // Reset so re-selecting the same file fires onChange again.
+    e.target.value = "";
+    setErr(null);
+
+    // The digest request carries the model, the research log, the pasted text
+    // and every PDF (base64, about 4/3 of the file size) and is capped at
+    // MAX_UPLOAD_BYTES. Sizes are checked before anything is read, so an
+    // oversized file is refused with a clear message instead of failing
+    // after the upload.
+    const { accepted, refused } = planPdfAttachments(
+      files,
+      jsonBytes({
+        report,
+        extra_context: researchNotes,
+        material_text: material,
+        pdfs,
+      })
+    );
+
     try {
       const added = await Promise.all(
-        files.map(
+        accepted.map(
           async (f: File): Promise<PdfAttachment> => ({
             name: f.name,
             data_base64: await fileToBase64(f),
           })
         )
       );
-      setPdfs((p: PdfAttachment[]) => [...p, ...added]);
+      if (added.length > 0) setPdfs((p: PdfAttachment[]) => [...p, ...added]);
+      if (refused.length > 0) setErr(refused.join(" "));
     } catch (e2) {
       setErr(e2 instanceof Error ? e2.message : String(e2));
     }
-    // Reset so re-selecting the same file fires onChange again.
-    e.target.value = "";
   }
 
   function removePdf(idx: number): void {
@@ -406,7 +431,10 @@ export default function AIResearchPanel({
 
             <div className="space-y-2">
               <label className="block text-xs font-medium text-ink-dim">
-                Attach PDFs
+                Attach PDFs{" "}
+                <span className="font-normal text-ink-faint">
+                  (up to about {fmtBytes((MAX_UPLOAD_BYTES * 3) / 4)} in total)
+                </span>
                 <input
                   type="file"
                   accept="application/pdf"

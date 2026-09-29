@@ -15,7 +15,7 @@
     "dmg": "electron-builder --mac dmg"
   },
   "devDependencies": {
-    "electron": "^42.3.3",
+    "electron": "^42.11.8",
     "electron-builder": "^26.15.0"
   },
   "build": {

@@ -29,12 +29,14 @@ export default function FilingsPanel({
   report,
   extraContext,
   aiEnabled,
+  fmpEnabled,
   onDigested,
 }: {
   ticker: string;
   report: Report;
   extraContext: string;
   aiEnabled: boolean;
+  fmpEnabled: boolean;
   onDigested: (source: string, digest: Digest) => void;
 }) {
   const [filings, setFilings] = useState<FilingsList | null>(null);
@@ -54,7 +56,6 @@ export default function FilingsPanel({
     setFilings(null);
     setFilingsError(null);
     setFilingsLoading(true);
-    setTranscripts(null);
     setErr(null);
 
     fetchFilings(ticker)
@@ -69,6 +70,18 @@ export default function FilingsPanel({
         if (alive) setFilingsLoading(false);
       });
 
+    return () => {
+      alive = false;
+    };
+  }, [ticker]);
+
+  // Separate effect so saving an FMP key in the app re-lists transcripts
+  // without reloading the ticker.
+  useEffect(() => {
+    if (!ticker) return;
+    let alive = true;
+    setTranscripts(null);
+
     fetchTranscripts(ticker)
       .then((t) => {
         if (alive) setTranscripts(t);
@@ -80,7 +93,7 @@ export default function FilingsPanel({
     return () => {
       alive = false;
     };
-  }, [ticker]);
+  }, [ticker, fmpEnabled]);
 
   async function runFilingDigest(f: Filing): Promise<void> {
     setDigestingKey(f.accession_number);
@@ -273,7 +286,12 @@ export default function FilingsPanel({
                       <TD align="right">
                         <Button
                           variant="subtle"
-                          disabled={!aiEnabled || digestingKey !== null}
+                          disabled={
+                            !aiEnabled ||
+                            digestingKey !== null ||
+                            t.year == null ||
+                            t.quarter == null
+                          }
                           onClick={() => runTranscriptDigest(t)}
                         >
                           {isDigesting ? (

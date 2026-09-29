@@ -15,6 +15,7 @@ import type {
 import {
   apiUrl,
   downloadExport,
+  errorDetail,
   fetchEnrichment,
   fetchResearchState,
   fetchValuation,
@@ -25,12 +26,17 @@ import {
   type ExportKind,
 } from "@/lib/api";
 import {
+  fmtBlendedTarget,
+  fmtBlendedUpside,
   fmtDate,
   fmtMoney,
   fmtPct,
+  toneForBlendedUpside,
   toneForRecommendation,
   toneForUpside,
+  watchlistUpside,
 } from "@/lib/format";
+import { NoteOrder, chainSave, settledWithin } from "@/lib/sync";
 import { Badge, Button, Spinner, cx } from "@/components/ui";
 
 import ValuationSummary from "@/components/ValuationSummary";
@@ -67,9 +73,14 @@ function assumptionsFromUsed(used?: AssumptionsUsed): Assumptions {
     exit_ev_ebitda: used.exit_ev_ebitda ?? undefined,
     target_ebit_margin: used.target_ebit_margin ?? undefined,
     revenue_growth_y1: used.revenue_growth_y1 ?? undefined,
-    peers: used.peers,
+    peers: used.peers ?? undefined,
   };
 }
+
+// Longest a ticker load waits for earlier saves to land before re-reading
+// saved research (a local save takes milliseconds; this only bounds a save
+// that never answers).
+const SAVE_WAIT_MS = 10_000;
 
 const FIELD_TO_KEY: Record<AssumptionSuggestion["field"], keyof Assumptions> = {
   terminal_growth: "terminal_growth",
@@ -114,10 +125,31 @@ export default function Home() {
   const [keyAnthropic, setKeyAnthropic] = useState("");
   const [keyFmp, setKeyFmp] = useState("");
   const [savingKeys, setSavingKeys] = useState(false);
+  // Ticker whose saved research couldn't be read (autosave is paused for it).
+  const [restoreFailedFor, setRestoreFailedFor] = useState("");
 
   const autoPeeredFor = useRef<string>("");
+  // Autosave only runs for this ticker: set once its saved research has been
+  // restored and its valuation has loaded, so a switch can never write the
+  // previous ticker's (or a blank) state over the new ticker's saved research.
   const stateLoadedFor = useRef<string>("");
+  // Set once the current load has finished reading this ticker's saved
+  // research (whether or not the read succeeded).
+  const restoreDoneFor = useRef<string>("");
+  // A research note that finished for a ticker whose saved state was still
+  // being re-read; the restore applies it instead of the older saved note.
+  const lateNote = useRef<{ ticker: string; note: ResearchNote } | null>(null);
+  // The debounced autosave waiting to run, so a ticker switch can flush it
+  // instead of dropping the last edits, and every save sent so far (chained,
+  // see chainSave), so a reload reads the saved state only after all of them
+  // have landed.
+  const pendingSave = useRef<(() => void) | null>(null);
+  const lastSave = useRef<Promise<void> | null>(null);
+  // Per-ticker order of note requests, so an older note that finishes after
+  // a newer one never replaces it.
+  const noteOrder = useRef(new NoteOrder());
   const loadSeq = useRef(0); // guards against a stale load finishing late
+  const recomputeSeq = useRef(0); // only the newest recompute may land
 
   useEffect(() => {
     // Retry with backoff — in the desktop app the backend can still be
@@ -147,6 +179,8 @@ export default function Home() {
   useEffect(() => {
     watchlistRef.current = watchlist;
   }, [watchlist]);
+  // Set synchronously by loadTicker (not only after render) so async work
+  // started for the previous ticker can tell it has been superseded.
   const tickerRef = useRef("");
   useEffect(() => {
     tickerRef.current = ticker;
@@ -156,20 +190,35 @@ export default function Home() {
     const t = sym.trim().toUpperCase();
     if (!t) return;
     const seq = ++loadSeq.current;
+    // Write any debounced edits of the ticker on screen before its state is
+    // cleared (and before a reload of the same ticker re-reads it).
+    pendingSave.current?.();
+    const flush = settledWithin(lastSave.current, SAVE_WAIT_MS);
     setLoading(true);
     setError(null);
     setReport(null);
     setEnrichment(null);
+    setAssumptions({});
     setResearchNotes("");
     setDigests([]);
     setNote(null);
+    setNoteLoading(false);
+    setRecomputing(false);
+    setRestoreFailedFor("");
     autoPeeredFor.current = "";
     stateLoadedFor.current = "";
+    restoreDoneFor.current = "";
+    if (lateNote.current?.ticker !== t) lateNote.current = null;
+    tickerRef.current = t;
     setTicker(t);
+    await flush;
+    if (seq !== loadSeq.current) return;
 
     // Restore persisted research FIRST so saved assumptions drive the first
-    // valuation (and saved notes/digests/note come back with it).
+    // valuation (and saved notes/digests/note come back with it). A never-seen
+    // ticker restores as {}; a failed read throws.
     let savedAssumptions: Assumptions = {};
+    let restored = false;
     try {
       const st = await fetchResearchState(t);
       if (seq !== loadSeq.current) return; // a newer load superseded us
@@ -179,10 +228,20 @@ export default function Home() {
       if (st.assumptions && Object.keys(st.assumptions).length > 0) {
         savedAssumptions = st.assumptions;
       }
+      setAssumptions(savedAssumptions);
+      restored = true;
     } catch {
-      /* fresh ticker — nothing persisted yet */
+      if (seq !== loadSeq.current) return;
+      // Value the ticker anyway, but keep autosave off so the blank state
+      // can't overwrite research we merely failed to read.
+      setRestoreFailedFor(t);
     }
-    stateLoadedFor.current = t;
+    // A note that finished while the saved state was being read is newer
+    // than the saved one.
+    restoreDoneFor.current = t;
+    const late = lateNote.current;
+    lateNote.current = null;
+    if (late?.ticker === t) setNote(late.note);
 
     try {
       const rep = await fetchValuation(t, savedAssumptions);
@@ -190,6 +249,7 @@ export default function Home() {
       setReport(rep);
       setAssumptions(assumptionsFromUsed(rep.assumptions_used));
       setTab("Overview");
+      if (restored) stateLoadedFor.current = t;
     } catch (e) {
       if (seq !== loadSeq.current) return;
       setError(e instanceof Error ? e.message : String(e));
@@ -211,17 +271,23 @@ export default function Home() {
 
   const recompute = useCallback(
     async (override?: Assumptions) => {
-      if (!ticker) return;
+      if (!ticker || ticker !== tickerRef.current) return;
       const a = override ?? assumptions;
+      const seq = loadSeq.current;
+      const rseq = ++recomputeSeq.current;
+      // Drop the result if another ticker was loaded or a newer recompute
+      // started meanwhile — it would overwrite the newer report.
+      const current = () =>
+        seq === loadSeq.current && rseq === recomputeSeq.current;
       setRecomputing(true);
       setError(null);
       try {
         const rep = await fetchValuation(ticker, a);
-        setReport(rep);
+        if (current()) setReport(rep);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if (current()) setError(e instanceof Error ? e.message : String(e));
       } finally {
-        setRecomputing(false);
+        if (current()) setRecomputing(false);
       }
     },
     [ticker, assumptions]
@@ -241,18 +307,29 @@ export default function Home() {
     }
   }, [report, enrichment, ticker, assumptions, recompute]);
 
-  // Autosave research state (debounced) once the initial load has happened.
+  // Autosave research state (debounced), only once this ticker's saved state
+  // was restored and its valuation loaded (see stateLoadedFor).
   useEffect(() => {
     if (!ticker || stateLoadedFor.current !== ticker) return;
-    const id = setTimeout(() => {
-      saveResearchState(ticker, {
-        notes: researchNotes,
-        digests,
-        note,
-        assumptions,
-      }).catch(() => {});
-    }, 1500);
-    return () => clearTimeout(id);
+    const save = () => {
+      clearTimeout(id);
+      if (pendingSave.current === save) pendingSave.current = null;
+      lastSave.current = chainSave(
+        lastSave.current,
+        saveResearchState(ticker, {
+          notes: researchNotes,
+          digests,
+          note,
+          assumptions,
+        })
+      );
+    };
+    const id = setTimeout(save, 1500);
+    pendingSave.current = save;
+    return () => {
+      clearTimeout(id);
+      if (pendingSave.current === save) pendingSave.current = null;
+    };
   }, [ticker, researchNotes, digests, note, assumptions]);
 
   // Keep the watchlist snapshot fresh whenever a watched ticker reloads.
@@ -308,8 +385,18 @@ export default function Home() {
     [ticker]
   );
 
+  // A note takes about a minute. If another load started meanwhile, never
+  // show it on another ticker's page: save it to its own ticker (the store
+  // merges), and if that ticker is on screen again show it too, now if its
+  // saved state has been re-read, else once the restore lands (lateNote), so
+  // the restore and the autosave that follows can't put the older note back.
+  // A note from an older request that finishes after a newer request's note
+  // for the same ticker is dropped (noteOrder).
   const generateNote = useCallback(async () => {
-    if (!report) return;
+    if (!report || !ticker) return;
+    const seq = loadSeq.current;
+    const t = ticker;
+    const order = noteOrder.current.start(t);
     setNoteLoading(true);
     setError(null);
     try {
@@ -317,28 +404,48 @@ export default function Home() {
         report,
         extra_context: researchNotes,
       });
-      setNote(n);
+      if (!noteOrder.current.keep(t, order)) return;
+      if (seq === loadSeq.current) {
+        setNote(n);
+      } else {
+        lastSave.current = chainSave(
+          lastSave.current,
+          saveResearchState(t, { note: n })
+        );
+        if (tickerRef.current === t) {
+          if (restoreDoneFor.current === t) setNote(n);
+          else lateNote.current = { ticker: t, note: n };
+        }
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (seq === loadSeq.current)
+        setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setNoteLoading(false);
+      if (seq === loadSeq.current) setNoteLoading(false);
     }
-  }, [report, researchNotes]);
+  }, [report, researchNotes, ticker]);
 
+  // Export the inputs of the valuation on screen, not slider moves that
+  // haven't been recomputed yet, so the file matches the dashboard.
   const handleExport = useCallback(
     async (kind: ExportKind) => {
-      if (!ticker || exporting !== null) return; // no concurrent exports
+      if (!ticker || !report || exporting !== null) return; // no concurrent exports
       setExporting(kind);
       setError(null);
       try {
-        await downloadExport(kind, ticker, assumptions, note);
+        await downloadExport(
+          kind,
+          ticker,
+          assumptionsFromUsed(report.assumptions_used),
+          note
+        );
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
         setExporting(null);
       }
     },
-    [ticker, assumptions, note, exporting]
+    [ticker, report, note, exporting]
   );
 
   const watching = watchlist.some((w) => w.ticker === ticker);
@@ -443,19 +550,23 @@ export default function Home() {
                   fmp_api_key: keyFmp || null,
                 }),
               });
-              if (!res.ok)
-                throw new Error((await res.json())?.detail ?? `${res.status}`);
+              if (!res.ok) throw new Error(await errorDetail(res));
               setStatus(await res.json());
               setKeyAnthropic("");
               setKeyFmp("");
               setShowKeys(false);
               // FMP just connected: refresh enrichment for the loaded ticker.
               if (ticker) {
+                const seq = loadSeq.current;
                 setEnrichLoading(true);
                 fetchEnrichment(ticker)
-                  .then(setEnrichment)
+                  .then((en) => {
+                    if (seq === loadSeq.current) setEnrichment(en);
+                  })
                   .catch(() => {})
-                  .finally(() => setEnrichLoading(false));
+                  .finally(() => {
+                    if (seq === loadSeq.current) setEnrichLoading(false);
+                  });
               }
             } catch (err2) {
               setError(err2 instanceof Error ? err2.message : String(err2));
@@ -523,10 +634,10 @@ export default function Home() {
               </h2>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
                 {watchlist.map((w) => {
-                  const up =
-                    w.blended_target && w.price
-                      ? w.blended_target / w.price - 1
-                      : null;
+                  // No upside (and no colour) without a target or when the
+                  // verdict was withheld.
+                  const up = watchlistUpside(w);
+                  const hasTarget = Number.isFinite(w.blended_target as number);
                   return (
                     <div
                       key={w.ticker}
@@ -559,8 +670,11 @@ export default function Home() {
                         </span>
                         <span className="text-ink-faint">→</span>
                         <span className={toneForUpside(up)}>
-                          {fmtMoney(w.blended_target, w.currency)} (
-                          {fmtPct(up, { signed: true })})
+                          {hasTarget
+                            ? `${fmtMoney(w.blended_target, w.currency)} (${
+                                up == null ? "n/a" : fmtPct(up, { signed: true })
+                              })`
+                            : "no target"}
                         </span>
                       </div>
                       <div className="mt-1 flex items-center justify-between text-[11px]">
@@ -644,16 +758,25 @@ export default function Home() {
                 <div className="text-[11px] uppercase tracking-wider text-ink-faint">
                   Blended fair value
                 </div>
-                <div className="num text-2xl font-semibold text-ink">
-                  {fmtMoney(s.blended_target, s.currency)}
+                {/* A null target reads "n/a" or "No target (supply peers)";
+                    a withheld verdict leaves the upside "n/a", uncoloured. */}
+                <div
+                  className={cx(
+                    "num font-semibold text-ink",
+                    Number.isFinite(s.blended_target as number)
+                      ? "text-2xl"
+                      : "text-base"
+                  )}
+                >
+                  {fmtBlendedTarget(s, report.comps)}
                 </div>
                 <div
                   className={cx(
                     "num text-sm font-medium",
-                    toneForUpside(s.blended_upside)
+                    toneForBlendedUpside(s)
                   )}
                 >
-                  {fmtPct(s.blended_upside, { signed: true })} vs price
+                  {fmtBlendedUpside(s)} vs price
                 </div>
               </div>
               <div className="text-right">
@@ -676,6 +799,13 @@ export default function Home() {
               </div>
             </div>
           </div>
+
+          {restoreFailedFor === ticker && (
+            <div className="mt-3 rounded-lg border border-flat/40 bg-flat/10 px-4 py-2 text-xs text-flat">
+              Couldn&apos;t load the saved research for {ticker}, so autosave is
+              paused to avoid overwriting it. Load the ticker again to retry.
+            </div>
+          )}
 
           {/* Tabs */}
           <div className="mt-4 flex flex-wrap gap-1 border-b border-line">
@@ -737,6 +867,7 @@ export default function Home() {
                 report={report}
                 extraContext={researchNotes}
                 aiEnabled={status?.anthropic_enabled ?? false}
+                fmpEnabled={status?.fmp_enabled ?? false}
                 onDigested={onDigested}
               />
             </div>

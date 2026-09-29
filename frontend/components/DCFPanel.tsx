@@ -6,13 +6,15 @@
 import React from "react";
 import type { Assumptions, Report } from "@/lib/types";
 import {
+  betaStat,
+  excludedReason,
   fmtBig,
   fmtCount,
   fmtMoney,
   fmtMult,
   fmtNum,
   fmtPct,
-  toneForUpside,
+  toneForMethodUpside,
 } from "@/lib/format";
 import {
   AssumptionSlider,
@@ -59,6 +61,15 @@ export default function DCFPanel({
   const lastRev = fin.revenue?.at(-1) ?? 0;
   const lastEbit = fin.ebit?.at(-1) ?? 0;
   const dcfA = dcf.assumptions as Record<string, unknown>;
+  // Left out of the blended target (e.g. a bank, a captive-finance group or a
+  // lessor): the DCF is then shown for reference only.
+  const notInBlend = excludedReason(report.summary, "DCF");
+  const waccDetail = (dcf.wacc?.detail || {}) as Record<string, unknown>;
+  const beta = betaStat(
+    dcf.wacc?.beta,
+    waccDetail.beta_raw as number | null | undefined,
+    waccDetail.beta_source
+  );
 
   // Display defaults come from the engine's OWN assumption echo
   // (dcf.assumptions) so the sliders always show what the model actually used
@@ -113,12 +124,27 @@ export default function DCFPanel({
     { label: "PV of FCFF", cells: (i) => fmtBig(pvf[i], cur) },
   ];
 
+  // The engine deducts minority interest and preferred as well as net debt
+  // (EV − net debt − minority − preferred = equity), so show them when present
+  // or the bridge won't add up.
+  const bs = report.company.balance_sheet;
+  const claim = (v: number | null | undefined) =>
+    typeof v === "number" && Number.isFinite(v) && v !== 0 ? v : null;
+  const minority = claim(bs?.minority_interest);
+  const preferred = claim(bs?.preferred_equity);
+
   const bridge: { label: string; value: React.ReactNode; strong?: boolean }[] = [
     { label: "Sum PV(FCFF)", value: fmtBig(sumPvFcff, cur) },
     { label: "Terminal value", value: fmtBig(dcf.terminal_value, cur) },
     { label: "PV of terminal", value: fmtBig(dcf.pv_terminal, cur) },
     { label: "Enterprise value", value: fmtBig(dcf.enterprise_value, cur), strong: true },
     { label: "(−) Net debt", value: fmtBig(dcf.net_debt, cur) },
+    ...(minority != null
+      ? [{ label: "(−) Minority interest", value: fmtBig(minority, cur) }]
+      : []),
+    ...(preferred != null
+      ? [{ label: "(−) Preferred equity", value: fmtBig(preferred, cur) }]
+      : []),
     { label: "Equity value", value: fmtBig(dcf.equity_value, cur), strong: true },
     { label: "Shares", value: fmtCount(dcf.shares) },
     { label: "Implied price", value: fmtMoney(dcf.implied_price, cur), strong: true },
@@ -147,6 +173,11 @@ export default function DCFPanel({
             max={0.05}
             step={0.0025}
             format={(v) => fmtPct(v)}
+            hint={
+              terminalMethod === "exit_multiple"
+                ? "Not in the terminal value (the exit multiple sets it); still ends the revenue-growth fade and drives DDM/FCFE"
+                : undefined
+            }
             onChange={(v) =>
               setAssumptions({ ...assumptions, terminal_growth: v })
             }
@@ -261,12 +292,20 @@ export default function DCFPanel({
       </Card>
 
       {/* --- Results --------------------------------------------------- */}
-      <Card title="DCF output" className="lg:col-span-2">
+      <Card
+        title="DCF output"
+        subtitle={
+          notInBlend
+            ? `Reference only, not in the blended target: ${notInBlend}`
+            : undefined
+        }
+        className="lg:col-span-2"
+      >
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
           <Stat
-            label="Implied price"
+            label={notInBlend ? "Implied price (ref.)" : "Implied price"}
             value={fmtMoney(dcf.implied_price, cur)}
-            tone={toneForUpside(dcf.upside)}
+            tone={toneForMethodUpside(report.summary, "DCF", dcf.upside)}
             sub={fmtPct(dcf.upside, { signed: true })}
           />
           <Stat label="WACC" value={fmtPct(dcf.wacc?.wacc)} />
@@ -278,7 +317,12 @@ export default function DCFPanel({
             label="After-tax cost of debt"
             value={fmtPct(dcf.wacc?.after_tax_cost_of_debt)}
           />
-          <Stat label="Beta" value={fmtNum(dcf.wacc?.beta, 2)} />
+          <Stat
+            label={beta.label}
+            value={beta.value}
+            sub={beta.sub}
+            title={beta.title}
+          />
           <Stat
             label="Equity weight"
             value={fmtPct(dcf.wacc?.weight_equity)}

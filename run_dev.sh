@@ -4,7 +4,7 @@
 #   cp .env.example .env   # add your ANTHROPIC_API_KEY / FMP_API_KEY (both optional)
 #   ./run_dev.sh
 #
-# Then open http://localhost:3000
+# Then open http://127.0.0.1:3000
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -29,20 +29,28 @@ if [ ! -d frontend/node_modules ]; then
   (cd frontend && npm ci --no-audit --no-fund)
 fi
 
+# Run each server in its own process group so cleanup can stop the whole
+# tree: npm -> sh -> next dev -> next-server would otherwise outlive a plain
+# kill of the npm PID.
+set -m
+
 echo "==> Starting FastAPI on http://127.0.0.1:8000"
 "$VENV/bin/python" -m uvicorn backend.app:app --host 127.0.0.1 --port 8000 &
 BACK=$!
 
-echo "==> Starting Next.js on http://localhost:3000"
+echo "==> Starting Next.js on http://127.0.0.1:3000"
 (cd frontend && npm run dev -- --hostname 127.0.0.1) &
 FRONT=$!
 
-cleanup() { kill "$BACK" "$FRONT" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+cleanup() {
+  trap - EXIT INT TERM HUP
+  kill -TERM -- "-$BACK" "-$FRONT" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
 
 echo ""
 echo "  Backend : http://127.0.0.1:8000  (docs at /docs)"
-echo "  Frontend: http://localhost:3000"
+echo "  Frontend: http://127.0.0.1:3000"
 echo "  Ctrl-C to stop both."
 echo ""
 wait

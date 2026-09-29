@@ -10,11 +10,37 @@ discounted at WACC (optionally on a mid-year convention), and a terminal value
 (Gordon growth or an exit EV/EBITDA multiple) is added to obtain enterprise
 value, then equity value, then an implied per-share price.
 
+History-derived defaults, each noted in ``assumptions['notes']`` when a rule
+changes the plain reading:
+  * EBIT margin: the latest year's, or the recent median when the latest year
+    is a one-off spike (``utils.robust_latest_margin``). A first profitable
+    year after losses is kept but noted (``utils.first_positive_margin``). A
+    loss year after at least three profitable ones on a modest revenue move (a
+    charge year, ``utils.charge_year_margin``), or a positive margin below a
+    third of the prior median after such a run on stable revenue (a collapse
+    year, ``utils.collapsed_margin``), is kept as the start but faded to the prior
+    median (capped at the previous year's margin) as the target margin, with
+    a WARNING note (``margin_fade_target``).
+  * Tax: median effective rate over at least 3 clean profitable years, else the
+    marginal rate (``wacc.effective_tax_rate_detail``).
+  * D&A and capex: revenue-weighted history (``utils.pooled_ratio``); capex well
+    above D&A fades with revenue growth (``utils.growth_capex_path``), noted
+    when the final year ends at least 0.5pp of revenue below history. With no
+    usable capex year at all but D&A above 0, capex is set equal to D&A
+    (maintenance only), with a WARNING note, since D&A is still added back;
+    not for a bank, insurer, REIT or lender (``utils.MAINTENANCE_CAPEX_KINDS``),
+    whose reference-only DCF keeps capex at 0.
+  * dNWC: pooled per unit of revenue change, one-off years left out
+    (``utils.screened_incremental_ratio``), 0 outside [0, 1].
+
 Pure-Python: stdlib + the package's own helpers only. All money is absolute
 units; all rates are decimals; annual series run oldest -> newest.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
+from typing import Optional
 
 from ..schemas import (
     CompanyData,
@@ -22,9 +48,31 @@ from ..schemas import (
     DCFResult,
     MacroAssumptions,
 )
-from ..utils import cagr, fade_path, is_num, mean, safe_div
+from ..utils import (
+    EBIT_DERIVED_KINDS,
+    MAINTENANCE_CAPEX_KINDS,
+    NWC_ONE_OFF_REVENUE_SHARE,
+    charge_year_margin,
+    collapsed_margin,
+    fade_path,
+    financial_kind,
+    first_positive_margin,
+    fiscal_year_labels,
+    growth_capex_path,
+    is_num,
+    material_capex_fade,
+    mean,
+    net_debt_parts,
+    pooled_ratio,
+    robust_latest_margin,
+    safe_div,
+    screened_incremental_ratio,
+    series_cagr,
+)
 from .. import config
-from .wacc import compute_wacc, effective_tax_rate
+from .wacc import compute_wacc, effective_tax_rate_detail
+
+TERMINAL_METHODS = ("gordon", "exit_multiple")
 
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +98,129 @@ def _hist_ratio_mean(numerators, denominators):
     return mean(ratios)
 
 
+def _all_zero(series) -> bool:
+    """True if a series has entries and every finite one is 0 (a zero-filled gap)."""
+    vals = [v for v in (series or []) if is_num(v)]
+    return bool(vals) and all(v == 0 for v in vals)
+
+
+def _ebit_history(fin, derive: bool = True) -> tuple[list, Optional[str]]:
+    """Historical EBIT with zero-filled (unreported) years rebuilt from pretax.
+
+    Providers write 0.0 when a filer has no operating-income tag (e.g. single-step
+    income statements). A 0 there is a gap, not a reading, so where pretax income
+    exists the year is approximated as pretax income + interest expense. With
+    ``derive=False`` (a flagged company other than a lessor,
+    ``utils.EBIT_DERIVED_KINDS``: a bank's or lender's interest is an operating
+    cost, so adding it back would count it twice) the gaps are left alone.
+    """
+    ebit = list(getattr(fin, "ebit", None) or []) if fin is not None else []
+    if not derive:
+        return ebit, None
+    pretax = list(getattr(fin, "pretax_income", None) or []) if fin is not None else []
+    interest = list(getattr(fin, "interest_expense", None) or []) if fin is not None else []
+    out, rebuilt = [], False
+    for i, e in enumerate(ebit):
+        p = pretax[i] if i < len(pretax) else None
+        if (not is_num(e) or e == 0) and is_num(p) and p != 0:
+            it = interest[i] if i < len(interest) and is_num(interest[i]) else 0.0
+            out.append(p + abs(it))
+            rebuilt = True
+        else:
+            out.append(e)
+    note = ("EBIT not reported for some years; approximated as pretax income + "
+            "interest expense") if rebuilt else None
+    return out, note
+
+
+def start_ebit_margin(fin, hist_revenue, base_revenue,
+                      derive_ebit: bool = True) -> tuple[Optional[float], list[str]]:
+    """(starting EBIT margin, notes): latest EBIT / base revenue, else the trailing
+    mean margin, ignoring zero-filled EBIT years. None if nothing is usable.
+
+    A latest margin that is a one-off spike against the recent years (e.g. a
+    divestiture gain booked in operating income) is replaced by the recent
+    median margin, with a note; see ``utils.robust_latest_margin`` for the test.
+    A first positive margin after losses is kept (it may be a real turnaround)
+    but noted, since a one-off gain can produce it too
+    (``utils.first_positive_margin``). ``derive_ebit`` is passed to
+    ``_ebit_history`` (False for a flagged company other than a lessor).
+    Shared with the sensitivity grid so its margin axis centres on the same
+    start.
+    """
+    hist_ebit, note = _ebit_history(fin, derive=derive_ebit)
+    notes = [note] if note else []
+    reported = [e if (is_num(e) and e != 0) else None for e in hist_ebit]
+    latest = reported[-1] if reported else None
+    margin = safe_div(latest, base_revenue) if (is_num(base_revenue) and base_revenue > 0) else None
+    if margin is None:
+        # Fall back to the trailing average EBIT margin.
+        margin = _hist_ratio_mean(reported, hist_revenue)
+    else:
+        robust, spike = robust_latest_margin(reported, hist_revenue)
+        if spike is not None:
+            margin = robust
+            notes.append(
+                f"latest EBIT margin {spike['latest']:.1%} is out of line with the prior "
+                f"median {spike['prior_median']:.1%} (likely a one-off gain or charge); "
+                f"starting from the {spike['years']}-year median {spike['median']:.1%} "
+                "-- set a target EBIT margin if the latest level should persist")
+        else:
+            turn = first_positive_margin(reported, hist_revenue)
+            if turn is not None:
+                notes.append(
+                    f"latest EBIT margin {turn['latest']:.1%} is the first positive year after "
+                    f"losses (prior median {turn['prior_median']:.1%}); kept as the start "
+                    "margin, but check the year for one-off gains such as a disposal "
+                    "-- set a target EBIT margin if it should not persist")
+    return margin, notes
+
+
+def margin_fade_target(fin, hist_revenue, derive_ebit: bool = True) -> Optional[dict]:
+    """Detail of a latest EBIT margin the DCF starts from but does not hold,
+    or None.
+
+    Either rule keeps the latest margin as the start and fades to the
+    detail's ``target`` (the prior median, capped at the margin of the year
+    before) instead of holding it for the whole projection, unless a target
+    EBIT margin is set:
+      * a charge year (``utils.charge_year_margin``, ``rule`` "charge"): a
+        loss after at least three profitable years on a modest revenue move
+        (impairments, restructuring; F FY2025);
+      * a collapse year (``utils.collapsed_margin``, ``rule`` "collapse"): a
+        margin still positive but below a third of the prior median after at
+        least three profitable years, on stable revenue, that the one-off
+        spike test does not catch because the move is under five points (JD
+        FY2025: 0.28% after 1.75-3.41%).
+    Uses the same EBIT history as ``start_ebit_margin`` (shared with the
+    sensitivity grid, whose margin axis centres on the target the DCF fades
+    to).
+    """
+    hist_ebit, _ = _ebit_history(fin, derive=derive_ebit)
+    reported = [e if (is_num(e) and e != 0) else None for e in hist_ebit]
+    if not reported or reported[-1] is None:
+        return None  # the start margin is then a trailing mean, not a latest year
+    charge = charge_year_margin(reported, hist_revenue)
+    if charge is not None:
+        return {**charge, "rule": "charge"}
+    collapse = collapsed_margin(reported, hist_revenue)
+    if collapse is not None:
+        return {**collapse, "rule": "collapse"}
+    return None
+
+
+def resolve_terminal_method(assumptions) -> tuple[str, Optional[str]]:
+    """(terminal method actually used, note): normalise case/whitespace and fall
+    back to Gordon for an unknown method or an exit multiple without a multiple."""
+    raw = assumptions.terminal_method if assumptions else None
+    method = str(raw or "gordon").strip().lower()
+    if method not in TERMINAL_METHODS:
+        return "gordon", f"unknown terminal_method {raw!r}; falling back to Gordon"
+    if method == "exit_multiple" and not is_num(getattr(assumptions, "exit_ev_ebitda", None)):
+        return "gordon", "exit_ev_ebitda missing for exit_multiple method; falling back to Gordon"
+    return method, None
+
+
 # --------------------------------------------------------------------------- #
 #  Main entry point
 # --------------------------------------------------------------------------- #
@@ -63,7 +234,9 @@ def run_dcf(
 
     Degrades gracefully on missing data: any unavailable driver falls back to a
     documented default and the choice is recorded in ``DCFResult.assumptions``
-    (which carries a human-readable ``notes`` list).
+    (which carries a human-readable ``notes`` list). Raises ``ValueError`` only
+    when there is no positive base revenue to project from (an FCFF DCF is not
+    meaningful then; the engine records the failure as a warning).
     """
     notes: list[str] = []
 
@@ -72,8 +245,18 @@ def run_dcf(
     w = wacc_result.wacc
     # Guard a degenerate / non-positive WACC so discounting stays well-defined.
     if not is_num(w) or w <= 0:
-        w = config.DEFAULT_RISK_FREE_RATE + config.DEFAULT_EQUITY_RISK_PREMIUM
-        notes.append(f"WACC non-positive/invalid; using fallback {w:.4f}")
+        computed = w
+        rf = wacc_result.detail.get("risk_free_rate")
+        erp = wacc_result.detail.get("equity_risk_premium")
+        # Beta-1 cost of equity on the caller's macro inputs, else config defaults.
+        w = rf + erp if (is_num(rf) and is_num(erp) and rf + erp > 0) else (
+            config.DEFAULT_RISK_FREE_RATE + config.DEFAULT_EQUITY_RISK_PREMIUM)
+        notes.append(f"computed WACC {computed:.4f} non-positive/invalid; "
+                     f"discounting at fallback rf+ERP {w:.4f}")
+        # Report the rate actually used (UI, exports and sensitivity labels read
+        # DCFResult.wacc.wacc); keep the rejected value for reference.
+        wacc_result = replace(wacc_result, wacc=w,
+                              detail={**wacc_result.detail, "wacc": w, "wacc_computed": computed})
 
     fin = getattr(company, "financials", None)
     bs = getattr(company, "balance_sheet", None)
@@ -91,9 +274,9 @@ def run_dcf(
     hist_revenue = list(getattr(fin, "revenue", None) or []) if fin is not None else []
     base_revenue = _latest(hist_revenue)
     if not is_num(base_revenue) or base_revenue <= 0:
-        # No anchor for projections — return an empty/zeroed result rather than crash.
-        base_revenue = 0.0
-        notes.append("latest revenue unavailable; DCF produces a zero valuation")
+        # No anchor for projections: EV would be 0 and the "price" just
+        # -net_debt/shares, which is not a valuation. Fail loudly instead.
+        raise ValueError("no positive latest revenue to project from; an FCFF DCF is not meaningful")
 
     growth_path = None
     if assumptions and assumptions.revenue_growth:
@@ -105,11 +288,9 @@ def run_dcf(
             growth_path = gp + [gp[-1]] * (n - len(gp))
             notes.append("revenue_growth shorter than forecast_years; padded with last value")
     if growth_path is None:
-        # Derive base growth from historical revenue CAGR over the available span.
-        clean_rev = [r for r in hist_revenue if is_num(r)]
-        base_growth = None
-        if len(clean_rev) >= 2:
-            base_growth = cagr(clean_rev[0], clean_rev[-1], len(clean_rev) - 1)
+        # Derive base growth from historical revenue CAGR over the available span
+        # (zero-filled years are skipped as endpoints but still count as periods).
+        base_growth = series_cagr(hist_revenue, getattr(fin, "fiscal_years", None))
         if base_growth is None:
             base_growth = terminal_growth
             notes.append("historical revenue CAGR unavailable; starting growth at terminal_growth")
@@ -127,18 +308,55 @@ def run_dcf(
         prev = cur
 
     # ----- 3) EBIT margin path -------------------------------------------- #
-    hist_ebit = list(getattr(fin, "ebit", None) or []) if fin is not None else []
-    latest_ebit = _latest(hist_ebit)
-    start_margin = safe_div(latest_ebit, base_revenue) if base_revenue else None
-    if start_margin is None:
-        # Fall back to the trailing average EBIT margin, else a modest default.
-        start_margin = _hist_ratio_mean(hist_ebit, hist_revenue)
+    # A flagged company's missing EBIT is not rebuilt from pretax income +
+    # interest (a lender's interest is an operating cost), except a lessor's,
+    # as the data layer does (utils.EBIT_DERIVED_KINDS); the engine leaves a
+    # flagged company's DCF out of the blended target either way.
+    kind = financial_kind(company)
+    derive_ebit = kind in EBIT_DERIVED_KINDS
+    start_margin, margin_notes = start_ebit_margin(fin, hist_revenue, base_revenue,
+                                                   derive_ebit=derive_ebit)
+    notes.extend(margin_notes)
     if start_margin is None:
         start_margin = 0.0
         notes.append("EBIT margin unavailable; defaulting to 0")
 
-    target_margin = assumptions.target_ebit_margin if (assumptions and is_num(assumptions.target_ebit_margin)) \
-        else start_margin
+    if assumptions and is_num(assumptions.target_ebit_margin):
+        target_margin = assumptions.target_ebit_margin
+    else:
+        target_margin = start_margin
+        # A loss year after a profitable run (a charge year), or a margin that
+        # collapsed to under a third of the prior median (a collapse year), is
+        # not held for the whole projection: start from it, fade to the prior
+        # median (capped at the previous year's margin).
+        fade = margin_fade_target(fin, hist_revenue, derive_ebit=derive_ebit)
+        if fade is not None:
+            target_margin = fade["target"]
+            # A collapse year is a thin margin: show it to two decimals.
+            fmt = ".1%" if fade["rule"] == "charge" else ".2%"
+            if fade["target"] < fade["prior_median"]:
+                year = "last profitable" if fade["rule"] == "charge" else "previous"
+                to = (f"{fade['target']:{fmt}}, the {year} year's margin (below the "
+                      "prior median)")
+            else:
+                to = f"the prior median {fade['prior_median']:{fmt}}"
+            if fade["rule"] == "charge":
+                notes.append(
+                    f"WARNING: latest EBIT margin {fade['latest']:.1%} is a loss after "
+                    f"{fade['profitable_years']} profitable years (prior median "
+                    f"{fade['prior_median']:.1%}) on a {fade['revenue_move']:+.1%} revenue "
+                    "change, likely a charge year (impairments, restructuring); the projection "
+                    f"starts from it and fades to {to} by year {n}. Impairments are non-cash, "
+                    "so the early years understate cash flow when the loss is mostly "
+                    "write-downs -- set a target EBIT margin if the loss should persist")
+            else:
+                notes.append(
+                    f"WARNING: latest EBIT margin {fade['latest']:.2%} is below a third of the "
+                    f"prior median {fade['prior_median']:.2%} after {fade['profitable_years']} "
+                    f"profitable years, on a {fade['revenue_move']:+.1%} revenue change "
+                    "(a trough year: heavy investment, price cuts or charges within operating "
+                    f"profit); the projection starts from it and fades to {to} by year {n} "
+                    "-- set a target EBIT margin if the trough should persist")
     margin_path = fade_path(start_margin, target_margin, n)
     ebit = [rev * m for rev, m in zip(revenue, margin_path)]
 
@@ -150,47 +368,87 @@ def run_dcf(
         tax = macro.tax_rate
         tax_source = "macro.tax_rate"
     else:
-        tax = effective_tax_rate(fin, config.DEFAULT_MARGINAL_TAX_RATE)
-        tax_source = "effective (historical)"
+        # Fewer than 3 clean profitable years (a young issuer's NOL-shielded or
+        # allowance-release years) fall back to the marginal rate, with a note.
+        tax, tax_source, tax_note = effective_tax_rate_detail(fin, config.DEFAULT_MARGINAL_TAX_RATE)
+        if tax_note:
+            notes.append(tax_note)
+        if tax <= 0:
+            # Kept as documented (pass-throughs genuinely pay ~0%), but flag it:
+            # providers also zero-fill an unreported tax line.
+            notes.append("historical effective tax rate is 0% (tax expense zero or unreported); "
+                         "NOPAT is untaxed -- set a tax rate if that is not intended")
     nopat = [e * (1.0 - tax) for e in ebit]
 
     # ----- 5) D&A, Capex, dNWC -------------------------------------------- #
     hist_da = list(getattr(fin, "dep_amort", None) or []) if fin is not None else []
     hist_capex = list(getattr(fin, "capex", None) or []) if fin is not None else []
 
-    if assumptions and is_num(assumptions.da_pct_revenue):
+    # History-derived D&A and capex are revenue-weighted (sum / sum revenue), so
+    # a tiny-revenue ramp year cannot dominate; zero-filled years are gaps, and
+    # an all-zero history is the providers' gap filler, not a real 0%.
+    da_derived = not (assumptions and is_num(assumptions.da_pct_revenue))
+    if not da_derived:
         da_pct = assumptions.da_pct_revenue
     else:
-        da_pct = _hist_ratio_mean(hist_da, hist_revenue)
+        da_pct = None if _all_zero(hist_da) else pooled_ratio(hist_da, hist_revenue)
         if da_pct is None:
             da_pct = 0.0
             notes.append("D&A %revenue unavailable; defaulting to 0")
 
+    capex_path = None
     if assumptions and is_num(assumptions.capex_pct_revenue):
         capex_pct = assumptions.capex_pct_revenue
     else:
-        capex_pct = _hist_ratio_mean(hist_capex, hist_revenue)
-        if capex_pct is None:
+        capex_pct = None if _all_zero(hist_capex) else pooled_ratio(hist_capex, hist_revenue)
+        if capex_pct is None and da_pct > 0 and kind in MAINTENANCE_CAPEX_KINDS:
+            # D&A is still added back, so a capex of 0 would leave the business
+            # with no reinvestment (PSX: DCF 339 vs 233 with capex = D&A; NEE,
+            # AER): assume maintenance capex instead. Not for a bank, insurer,
+            # REIT or lender, whose D&A is no capex proxy (see
+            # utils.MAINTENANCE_CAPEX_KINDS).
+            capex_pct = da_pct
+            notes.append(
+                f"WARNING: no usable capex history (zero or unreported in every year) while D&A "
+                f"is {da_pct:.1%} of revenue; capex set equal to D&A (maintenance only) rather "
+                "than 0, which would add D&A back with no reinvestment and overstate free cash "
+                "flow -- set a capex % of revenue if the filer reports capex under another line")
+        elif capex_pct is None:
             capex_pct = 0.0
             notes.append("capex %revenue unavailable; defaulting to 0")
+        elif da_derived:
+            # Growth-phase capex (well above D&A) is not carried into the
+            # terminal year: net capex scales with revenue growth at the
+            # historical sales-to-capital ratio (utils.growth_capex_path).
+            ref_growth = series_cagr(hist_revenue, getattr(fin, "fiscal_years", None))
+            if is_num(ref_growth):
+                ref_growth = max(config.DEFAULT_REVENUE_GROWTH_FLOOR,
+                                 min(config.DEFAULT_REVENUE_GROWTH_CAP, ref_growth))
+            capex_path = growth_capex_path(capex_pct, da_pct, ref_growth, growth_path)
+            # A negligible fade (capex just past 1.5x D&A) is applied without a
+            # note; capex_pct_path still records it.
+            if material_capex_fade(capex_pct, capex_path):
+                notes.append(
+                    f"capex {capex_pct:.1%} of revenue is growth-phase (D&A {da_pct:.1%}); "
+                    f"net capex scaled with revenue growth, reaching {capex_path[-1]:.1%} "
+                    f"of revenue in year {n}")
 
     # Incremental NWC as a % of the revenue *change*.
     if assumptions and is_num(assumptions.nwc_pct_revenue):
         nwc_pct = assumptions.nwc_pct_revenue
     else:
-        # Derive from history: dNWC_i / dRevenue_i. Unstable -> 0 (conservative).
+        # Derive from history: pooled sum(dNWC_i) / sum(dRevenue_i), so a single
+        # near-flat revenue year cannot dominate. change_in_nwc[i] aligns with
+        # revenue[i]. Outside [0, 1] -> treat as no usable signal -> 0.
+        # A year whose dNWC is a one-off (> 10% of revenue and larger than the
+        # year's revenue change) is left out of the pool, with a note.
         hist_dnwc = list(getattr(fin, "change_in_nwc", None) or []) if fin is not None else []
-        nwc_ratios = []
-        rev_clean = [r for r in hist_revenue if is_num(r)]
-        # change_in_nwc[i] aligns with revenue[i]; pair with the revenue delta.
-        for i in range(1, min(len(hist_dnwc), len(hist_revenue))):
-            d_rev = hist_revenue[i] - hist_revenue[i - 1] \
-                if is_num(hist_revenue[i]) and is_num(hist_revenue[i - 1]) else None
-            if is_num(hist_dnwc[i]) and d_rev is not None and d_rev != 0:
-                r = safe_div(hist_dnwc[i], d_rev)
-                if r is not None:
-                    nwc_ratios.append(r)
-        nwc_pct = mean(nwc_ratios)
+        nwc_pct, one_off = screened_incremental_ratio(hist_dnwc, hist_revenue)
+        if one_off:
+            notes.append(
+                f"dNWC in {fiscal_year_labels(getattr(fin, 'fiscal_years', None), one_off)} "
+                f"exceeds {NWC_ONE_OFF_REVENUE_SHARE:.0%} of revenue and that year's revenue "
+                "change; left out of dNWC/dRevenue as a one-off")
         if nwc_pct is None or nwc_pct < 0 or nwc_pct > 1:
             # Unstable/implausible incremental ratio -> assume zero working-capital drag.
             if nwc_pct is not None:
@@ -198,7 +456,8 @@ def run_dcf(
             nwc_pct = 0.0
 
     da = [rev * da_pct for rev in revenue]
-    capex = [rev * capex_pct for rev in revenue]
+    capex_pcts = capex_path if capex_path is not None else [capex_pct] * n
+    capex = [rev * c for rev, c in zip(revenue, capex_pcts)]
 
     # dNWC_t = (revenue_t - revenue_{t-1}) * nwc_pct; t=0 uses base_revenue.
     dnwc: list[float] = []
@@ -218,22 +477,18 @@ def run_dcf(
     pv_fcff = [fcff[i] * discount_factors[i] for i in range(n)]
 
     # ----- 7) terminal value ---------------------------------------------- #
-    terminal_method = (assumptions.terminal_method if assumptions and assumptions.terminal_method
-                       else "gordon")
+    # An unknown method, or exit_multiple without a multiple, falls back to Gordon
+    # (with a note) so we still produce a number.
+    terminal_method, method_note = resolve_terminal_method(assumptions)
+    if method_note:
+        notes.append(method_note)
     fcff_n = fcff[-1] if fcff else 0.0
     ebitda_n = (ebit[-1] + da[-1]) if (ebit and da) else 0.0
 
     g_used = terminal_growth
     if terminal_method == "exit_multiple":
-        exit_mult = assumptions.exit_ev_ebitda if (assumptions and is_num(assumptions.exit_ev_ebitda)) \
-            else None
-        if exit_mult is None:
-            # Required input missing — fall back to Gordon so we still produce a number.
-            notes.append("exit_ev_ebitda missing for exit_multiple method; falling back to Gordon")
-            terminal_method = "gordon"
-        else:
-            terminal_value = ebitda_n * exit_mult
-    if terminal_method == "gordon":
+        terminal_value = ebitda_n * assumptions.exit_ev_ebitda
+    else:
         # Require WACC - g >= MAX_TERMINAL_GROWTH_VS_WACC; clamp g if violated.
         if w - g_used < config.MAX_TERMINAL_GROWTH_VS_WACC:
             clamped = w - config.MAX_TERMINAL_GROWTH_VS_WACC
@@ -249,6 +504,10 @@ def run_dcf(
             notes.append("WACC-g non-positive after clamp; terminal value set to 0")
         else:
             terminal_value = fcff_n * (1.0 + g_used) / denom
+            if fcff_n < 0:
+                notes.append("final-year FCFF is negative, so the Gordon terminal value "
+                             "capitalises a perpetual cash outflow; review the EBIT margin "
+                             "and reinvestment drivers")
 
     # Discount the TV. A Gordon TV is a perpetuity valued as of year N and shares
     # the final explicit flow's timing (N-0.5 under mid-year, else N). An
@@ -271,15 +530,14 @@ def run_dcf(
     # ----- 8) bridge to equity & implied price ---------------------------- #
     enterprise_value = sum(pv_fcff) + pv_terminal
 
-    # net_debt already = total_debt - cash; add minority interest & preferred to
-    # bridge from enterprise to common-equity value.
-    net_debt = bs.net_debt if (bs is not None and is_num(getattr(bs, "net_debt", None))) else 0.0
+    # net_debt = total_debt - cash (each missing component assumed 0 on its own);
+    # add minority interest & preferred to bridge from enterprise to common equity.
+    net_debt, bridge_notes = net_debt_parts(bs)
+    notes.extend(bridge_notes)
     minority = getattr(bs, "minority_interest", 0.0) if bs is not None else 0.0
     preferred = getattr(bs, "preferred_equity", 0.0) if bs is not None else 0.0
     minority = minority if is_num(minority) else 0.0
     preferred = preferred if is_num(preferred) else 0.0
-    if bs is None or not is_num(getattr(bs, "net_debt", None)):
-        notes.append("balance-sheet net debt unavailable; assumed 0")
 
     total_claims = net_debt + minority + preferred
     equity_value = enterprise_value - total_claims
@@ -312,6 +570,9 @@ def run_dcf(
         "tax_source": tax_source,
         "da_pct_revenue": da_pct,
         "capex_pct_revenue": capex_pct,
+        # Per-year capex % actually applied (differs from capex_pct_revenue only
+        # when growth-phase capex is faded).
+        "capex_pct_path": list(capex_pcts),
         "nwc_pct_revenue": nwc_pct,
         "terminal_method": terminal_method,
         "terminal_growth": terminal_growth,

@@ -3,9 +3,13 @@
 Two public entry points:
 
   * ``dcf_sensitivity`` re-runs the unlevered FCFF DCF (``models.dcf.run_dcf``)
-    across two 2-D grids, capturing the implied price per cell:
-        Grid 1 — WACC  x  terminal growth   (Gordon terminal only)
-        Grid 2 — EBIT margin  x  terminal growth
+    across two 2-D grids, capturing the implied price per cell. The column axis
+    follows the headline DCF's terminal method, so the centre cell of each grid
+    is the headline price:
+        Gordon:        Grid 1 — WACC x terminal growth
+                       Grid 2 — EBIT margin x terminal growth
+        Exit multiple: Grid 1 — WACC x exit EV/EBITDA
+                       Grid 2 — EBIT margin x exit EV/EBITDA
     Each cell is an independent DCF run on a *cloned* macro/assumptions pair
     (via ``dataclasses.replace``) so the base inputs are never mutated.
 
@@ -20,7 +24,13 @@ Design notes:
     render a blank cell.
   * Row/column *values* are the ACTUAL resulting levels (e.g. the realized WACC
     read back off the returned ``DCFResult``), not the raw deltas, so the labels
-    on the grid are economically meaningful.
+    on the grid are economically meaningful. A cell the DCF could only price by
+    changing its inputs (terminal g clamped below WACC, or a non-positive WACC
+    replaced by the fallback rate), or an invalid one (an exit multiple <= 0),
+    is stored as NaN rather than shown under a label it does not represent.
+  * Axis labels tell renderers how to format values: a label containing
+    "EV/EBITDA" or "multiple" holds multiples (12.0 -> "12.0x"); "WACC",
+    "Terminal growth" and "EBIT margin" hold decimal rates.
 
 """
 
@@ -36,8 +46,17 @@ from ..schemas import (
     MacroAssumptions,
     SensitivityResult,
 )
-from ..utils import is_num, median
-from .dcf import run_dcf
+from ..utils import (
+    EBIT_DERIVED_KINDS,
+    NOT_IN_BLEND,
+    ddm_reference_only,
+    financial_institution,
+    financial_kind,
+    is_num,
+    median,
+    net_debt_parts,
+)
+from .dcf import margin_fade_target, resolve_terminal_method, run_dcf, start_ebit_margin
 
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +71,13 @@ def _safe_implied_price(
     """Run one DCF cell, returning (implied_price, realized_wacc).
 
     Never raises: on any failure both elements degrade to ``float('nan')`` so the
-    caller can keep building a rectangular grid.
+    caller can keep building a rectangular grid. The price is also NaN when the
+    DCF had to clamp the cell's terminal growth or replace a non-positive WACC,
+    since the cell would then not be priced at its row/column labels.
     """
     try:
         result = run_dcf(company, macro, assumptions, current_price)
-    except Exception:  # pragma: no cover - defensive; run_dcf shouldn't raise
+    except Exception:  # defensive: e.g. no positive revenue base
         return float("nan"), float("nan")
 
     price = getattr(result, "implied_price", None)
@@ -66,31 +87,46 @@ def _safe_implied_price(
     # level the model actually used (rf bump propagates through CAPM + weights).
     realized_wacc = float("nan")
     wacc_obj = getattr(result, "wacc", None)
+    detail = getattr(wacc_obj, "detail", None) or {}
     if wacc_obj is not None:
         w = getattr(wacc_obj, "wacc", None)
+        if "wacc_computed" in detail:
+            # Discounted at the fallback rate: keep the CAPM WACC as the (ordered)
+            # row label and blank the cell.
+            w = detail["wacc_computed"]
+            price = float("nan")
         if is_num(w):
             realized_wacc = float(w)
+
+    a = getattr(result, "assumptions", None) or {}
+    g_req, g_used = a.get("terminal_growth"), a.get("terminal_growth_used")
+    if is_num(g_req) and is_num(g_used) and g_used != g_req:
+        price = float("nan")  # g clamped to WACC - gap: not the column's growth
     return price, realized_wacc
 
 
 def _base_latest_ebit_margin(company: CompanyData) -> float:
-    """Latest historical EBIT / revenue, or NaN if it can't be computed.
+    """The target EBIT margin the headline DCF fades to without an explicit
+    one, or NaN if it can't be computed.
 
-    Mirrors the base-margin derivation inside the DCF so the margin grid is
-    centered on the same starting point the model uses.
+    Uses the DCF's own derivation: the start margin (latest EBIT / revenue, or
+    the recent median after a one-off spike), or, after a charge year or a
+    collapse year, the target the DCF fades to (``dcf.margin_fade_target``).
+    The margin rows set the target margin, so the centre row is the headline.
     """
     fin = getattr(company, "financials", None)
     if fin is None:
         return float("nan")
-    revenue = getattr(fin, "revenue", None)
-    ebit = getattr(fin, "ebit", None)
-    if not revenue or not ebit:
-        return float("nan")
+    revenue = list(getattr(fin, "revenue", None) or [])
     rev_latest = revenue[-1] if revenue else None
-    ebit_latest = ebit[-1] if ebit else None
-    if not is_num(rev_latest) or rev_latest == 0 or not is_num(ebit_latest):
+    if not is_num(rev_latest) or rev_latest <= 0:
         return float("nan")
-    return float(ebit_latest) / float(rev_latest)
+    derive = financial_kind(company) in EBIT_DERIVED_KINDS  # as the DCF
+    margin, _ = start_ebit_margin(fin, revenue, rev_latest, derive_ebit=derive)
+    fade = margin_fade_target(fin, revenue, derive_ebit=derive) if is_num(margin) else None
+    if fade is not None:
+        margin = fade["target"]
+    return float(margin) if is_num(margin) else float("nan")
 
 
 # --------------------------------------------------------------------------- #
@@ -102,11 +138,17 @@ def dcf_sensitivity(
     assumptions: DCFAssumptions,
     current_price: float,
 ) -> list[SensitivityResult]:
-    """Build the WACCxgrowth and marginxgrowth implied-price sensitivity grids.
+    """Build the WACC and EBIT-margin implied-price sensitivity grids.
 
-    Both grids force the Gordon terminal method (``terminal_method='gordon'``)
-    so terminal-growth shifts have a well-defined effect; the exit-multiple
-    branch ignores terminal growth entirely.
+    The column axis matches the headline DCF's terminal method, so each grid's
+    centre cell equals the headline implied price:
+      * Gordon (or a fallback to it): columns are terminal growth levels, label
+        ``"Terminal growth"``, and every cell runs the Gordon method.
+      * Exit multiple: columns are exit EV/EBITDA multiples (the headline
+        multiple +/- ``config.SENSITIVITY_EXIT_MULTIPLE_DELTAS``, e.g. 10.0 to
+        14.0 around 12.0; the steps shrink for a multiple no larger than the
+        widest step so every column stays positive), label
+        ``"Exit EV/EBITDA"``, and every cell runs the exit-multiple method.
 
     Returns a list of up to two ``SensitivityResult`` objects. A grid that can't
     be built at all (e.g. base margin unknown) is still returned, populated with
@@ -128,11 +170,35 @@ def dcf_sensitivity(
         base_rf = config.DEFAULT_RISK_FREE_RATE
     base_rf = float(base_rf)
 
-    # The actual terminal-growth levels are shared across both grids' columns.
-    growth_levels = [base_growth + d for d in growth_deltas]
+    # Column axis, shared by both grids: exit multiples when the headline DCF
+    # uses one, else terminal-growth levels (Gordon).
+    headline_method, _ = resolve_terminal_method(assumptions)
+    if headline_method == "exit_multiple":
+        base_multiple = float(assumptions.exit_ev_ebitda)
+        steps = list(config.SENSITIVITY_EXIT_MULTIPLE_DELTAS)
+        widest = max((abs(d) for d in steps), default=0.0)
+        if base_multiple > 0 and widest >= base_multiple:
+            # Shrink the steps for a very low multiple so every column stays a
+            # positive multiple (1.5x -> 0.75x..2.25x instead of -0.5x..3.5x).
+            steps = [d * base_multiple / (2.0 * widest) for d in steps]
+        col_levels = [base_multiple + d for d in steps]
+        col_label = "Exit EV/EBITDA"
+        col_title = "exit EV/EBITDA"
+
+        def cell_assumptions(base: DCFAssumptions, col: float):
+            if col <= 0:
+                return None  # not a valid multiple -> blank cell
+            return replace(base, exit_ev_ebitda=col, terminal_method="exit_multiple")
+    else:
+        col_levels = [base_growth + d for d in growth_deltas]
+        col_label = "Terminal growth"
+        col_title = "terminal growth"
+
+        def cell_assumptions(base: DCFAssumptions, col: float):
+            return replace(base, terminal_growth=col, terminal_method="gordon")
 
     # ----------------------------------------------------------------------- #
-    # Grid 1 — WACC (rows) x terminal growth (cols)
+    # Grid 1 — WACC (rows) x terminal growth or exit multiple (cols)
     #
     # We shift WACC by bumping the risk-free rate by each delta. Because
     # ke = rf + beta*ERP and kd often keys off rf, a +Δ on rf moves the realized
@@ -145,17 +211,16 @@ def dcf_sensitivity(
         bumped_macro = replace(macro, risk_free_rate=base_rf + wd)
         row_prices: list[float] = []
         realized_for_row = float("nan")
-        for g in growth_levels:
-            cell_assumptions = replace(
-                assumptions,
-                terminal_growth=g,
-                terminal_method="gordon",
-            )
+        for col in col_levels:
+            cell = cell_assumptions(assumptions, col)
+            if cell is None:
+                row_prices.append(float("nan"))
+                continue
             price, realized_wacc = _safe_implied_price(
-                company, bumped_macro, cell_assumptions, current_price
+                company, bumped_macro, cell, current_price
             )
             row_prices.append(price)
-            # Realized WACC is independent of terminal growth, so the first
+            # Realized WACC is independent of the column input, so the first
             # finite read for this row is representative of the whole row.
             if not is_num(realized_for_row) and is_num(realized_wacc):
                 realized_for_row = realized_wacc
@@ -170,17 +235,17 @@ def dcf_sensitivity(
 
     results.append(
         SensitivityResult(
-            title="DCF implied price: WACC vs terminal growth",
+            title=f"DCF implied price: WACC vs {col_title}",
             row_label="WACC",
-            col_label="Terminal growth",
+            col_label=col_label,
             row_values=row_wacc_levels,
-            col_values=list(growth_levels),
+            col_values=list(col_levels),
             grid=grid1,
         )
     )
 
     # ----------------------------------------------------------------------- #
-    # Grid 2 — EBIT margin (rows) x terminal growth (cols)
+    # Grid 2 — EBIT margin (rows) x terminal growth or exit multiple (cols)
     #
     # Margin rows are the base latest EBIT margin shifted by each absolute delta.
     # If the base margin can't be derived we still emit the grid (all NaN) so the
@@ -201,29 +266,24 @@ def dcf_sensitivity(
     grid2: list[list[float]] = []
     for m in margin_levels:
         row_prices = []
-        for g in growth_levels:
-            if not is_num(m):
+        for col in col_levels:
+            cell = cell_assumptions(assumptions, col) if is_num(m) else None
+            if cell is None:
                 row_prices.append(float("nan"))
                 continue
-            cell_assumptions = replace(
-                assumptions,
-                target_ebit_margin=m,
-                terminal_growth=g,
-                terminal_method="gordon",
-            )
             price, _ = _safe_implied_price(
-                company, macro, cell_assumptions, current_price
+                company, macro, replace(cell, target_ebit_margin=m), current_price
             )
             row_prices.append(price)
         grid2.append(row_prices)
 
     results.append(
         SensitivityResult(
-            title="DCF implied price: EBIT margin vs terminal growth",
+            title=f"DCF implied price: EBIT margin vs {col_title}",
             row_label="EBIT margin",
-            col_label="Terminal growth",
+            col_label=col_label,
             row_values=list(margin_levels),
-            col_values=list(growth_levels),
+            col_values=list(col_levels),
             grid=grid2,
         )
     )
@@ -269,7 +329,8 @@ def _finite_grid_values(grid) -> list[float]:
 
 
 def _find_wacc_growth_grid(sensitivities):
-    """Return the WACC x growth SensitivityResult from a list, or None."""
+    """Return the WACC-row SensitivityResult (x terminal growth, or x exit
+    multiple for an exit-multiple DCF) from a list, or None."""
     if not sensitivities:
         return None
     for s in sensitivities:
@@ -302,16 +363,26 @@ def build_football_field(report) -> list[FootballFieldRow]:
 
     Conventions:
       * '52-week range'  : low/high from market 52wk lo/hi, base = current_price.
-      * 'DCF'            : WACC x growth grid min/median/max if present,
+      * 'DCF'            : WACC grid min/max (its centre cell is the headline
+                            dcf.implied_price, which is the base; the bar is
+                            still widened to contain it if that cell is blank),
                             else +/-15% around dcf.implied_price.
       * 'EV/EBITDA comps' / 'P/E comps': spread from comps stats applied to the
                             target metric where available, else the comps implied
                             price summary, else skipped.
       * 'DDM' / 'FCFE'   : +/-10% bands around their implied prices.
+    For a bank, insurer, REIT or lender, a captive-finance group or a
+    debt-funded lessor (``utils.financial_institution``) the DCF and FCFE bars
+    are labelled 'DCF (not in blend)' / 'FCFE (not in blend)': the engine
+    leaves both out of the blended target, and an unmarked bar would read as a
+    valuation range. The DDM bar is marked the same way when the engine leaves
+    a captive-finance group's or a lessor's DDM out (``utils.ddm_reference_only``:
+    a low payout, or no comps to blend it with).
     """
     rows: list[FootballFieldRow] = []
 
     company = getattr(report, "company", None)
+    mark = NOT_IN_BLEND if (company is not None and financial_institution(company)) else ""
     market = getattr(company, "market", None) if company is not None else None
     dcf = getattr(report, "dcf", None)
     comps = getattr(report, "comps", None)
@@ -362,17 +433,20 @@ def build_football_field(report) -> list[FootballFieldRow]:
             high = max(grid_vals)
             med = median(grid_vals)
             # Center on the median of the grid; if the point estimate is finite,
-            # prefer it as the base (it's the engine's headline number).
+            # prefer it as the base (it's the engine's headline number). The grid
+            # follows the headline's terminal method, so its centre cell is the
+            # headline; still widen the bar to contain the headline (e.g. when
+            # that cell is blank) rather than moving the marker.
             base = float(dcf_implied) if is_num(dcf_implied) else float(med)
-            base = min(max(base, low), high)
+            low, high = min(low, base), max(high, base)
             rows.append(
-                FootballFieldRow(method="DCF", low=low, base=base, high=high)
+                FootballFieldRow(method="DCF" + mark, low=low, base=base, high=high)
             )
         elif is_num(dcf_implied):
             low, base, high = _band(float(dcf_implied), 0.15)
             base = min(max(base, low), high)
             rows.append(
-                FootballFieldRow(method="DCF", low=low, base=base, high=high)
+                FootballFieldRow(method="DCF" + mark, low=low, base=base, high=high)
             )
 
     # ----------------------------------------------------------------------- #
@@ -389,8 +463,9 @@ def build_football_field(report) -> list[FootballFieldRow]:
         if is_num(ddm_price):
             low, base, high = _band(float(ddm_price), 0.10)
             base = min(max(base, low), high)
+            ddm_mark = NOT_IN_BLEND if ddm_reference_only(report) else ""
             rows.append(
-                FootballFieldRow(method="DDM", low=low, base=base, high=high)
+                FootballFieldRow(method="DDM" + ddm_mark, low=low, base=base, high=high)
             )
 
     if fcfe is not None:
@@ -399,7 +474,7 @@ def build_football_field(report) -> list[FootballFieldRow]:
             low, base, high = _band(float(fcfe_price), 0.10)
             base = min(max(base, low), high)
             rows.append(
-                FootballFieldRow(method="FCFE", low=low, base=base, high=high)
+                FootballFieldRow(method="FCFE" + mark, low=low, base=base, high=high)
             )
 
     return rows
@@ -435,8 +510,7 @@ def _ev_bridge_inputs(company):
 
     net_debt = minority = preferred = 0.0
     if bs is not None:
-        nd = getattr(bs, "net_debt", None)
-        net_debt = float(nd) if is_num(nd) else 0.0
+        net_debt, _ = net_debt_parts(bs)
         mi = getattr(bs, "minority_interest", 0.0)
         minority = float(mi) if is_num(mi) else 0.0
         pe_eq = getattr(bs, "preferred_equity", 0.0)

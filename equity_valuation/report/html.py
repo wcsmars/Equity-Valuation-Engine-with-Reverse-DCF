@@ -27,6 +27,9 @@ from typing import Optional
 from .. import config
 from ..schemas import ValuationReport
 from ..utils import is_num, median
+# The rules every output shares (no-target text, method-upside colour, the
+# Blume note) live with the Excel exporter.
+from .excel import BLUME_NOTE, method_upside_toned, no_target_text
 
 # plotly is the only hard third-party dependency of this module. Import it at the
 # top so an environment without plotly fails loudly rather than silently writing
@@ -102,7 +105,9 @@ def _upside_class(upside: Optional[float]) -> str:
 #  Figure builders (each returns an HTML fragment or '' when not applicable)
 # --------------------------------------------------------------------------- #
 # We track whether plotly.js has already been embedded so only the FIRST figure
-# carries the library. ``_PlotEmbedder`` keeps that state local to one render.
+# carries the library. ``_PlotEmbedder`` keeps that state local to one render:
+# write_html creates one per call and hands it to every figure builder, so
+# concurrent renders (the backend exports from request threads) never share it.
 class _PlotEmbedder:
     """Serializes plotly figures, embedding plotly.js exactly once."""
 
@@ -121,7 +126,8 @@ class _PlotEmbedder:
         return frag
 
 
-def _football_field_fig(report: ValuationReport, symbol: str) -> str:
+def _football_field_fig(report: ValuationReport, symbol: str,
+                        embed: _PlotEmbedder) -> str:
     """Horizontal floating bars (low->high) with a base marker and a current-price line."""
     rows = [r for r in (report.football_field or []) if r is not None]
     # Keep only rows with at least a usable low/high span.
@@ -202,10 +208,10 @@ def _football_field_fig(report: ValuationReport, symbol: str) -> str:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_xaxes(showgrid=True, gridcolor="#eee", zeroline=False)
-    return _EMBED.to_html(fig)
+    return embed.to_html(fig)
 
 
-def _fcff_fig(report: ValuationReport, symbol: str) -> str:
+def _fcff_fig(report: ValuationReport, symbol: str, embed: _PlotEmbedder) -> str:
     """Bar chart of projected FCFF by forecast year."""
     dcf = report.dcf
     if dcf is None:
@@ -222,7 +228,7 @@ def _fcff_fig(report: ValuationReport, symbol: str) -> str:
             x=xs,
             y=ys,
             marker=dict(color="#2e8b8b"),
-            hovertemplate="FY %{x}<br>FCFF: " + symbol + "%{y:,.0f}<extra></extra>",
+            hovertemplate="Year %{x}<br>FCFF: " + symbol + "%{y:,.0f}<extra></extra>",
         )
     )
     fig.update_layout(
@@ -236,10 +242,10 @@ def _fcff_fig(report: ValuationReport, symbol: str) -> str:
         font=dict(family="Segoe UI, Helvetica, Arial, sans-serif", size=13),
     )
     fig.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=True, zerolinecolor="#ccc")
-    return _EMBED.to_html(fig)
+    return embed.to_html(fig)
 
 
-def _comps_fig(report: ValuationReport) -> str:
+def _comps_fig(report: ValuationReport, embed: _PlotEmbedder) -> str:
     """Bar chart of each peer's EV/EBITDA against the target's EV/EBITDA."""
     comps = report.comps
     if comps is None:
@@ -261,8 +267,11 @@ def _comps_fig(report: ValuationReport) -> str:
         values.append(float(target_mult))
         colors.append("#c0392b")
 
-    # Peer median reference line.
-    med = median(values[:len(peers)]) if peers else None
+    # Peer median reference line: the comps model's (outlier-trimmed) median,
+    # which is what the stats table and the implied prices use.
+    med = ((getattr(comps, "stats", None) or {}).get("ev_ebitda") or {}).get("median")
+    if not is_num(med):
+        med = median(values[:len(peers)]) if peers else None
 
     fig = go.Figure(
         go.Bar(
@@ -290,11 +299,19 @@ def _comps_fig(report: ValuationReport) -> str:
         font=dict(family="Segoe UI, Helvetica, Arial, sans-serif", size=13),
     )
     fig.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=False)
-    return _EMBED.to_html(fig)
+    return embed.to_html(fig)
 
 
-def _sensitivity_figs(report: ValuationReport, symbol: str) -> list[str]:
-    """One heatmap per SensitivityResult (implied price across the grid)."""
+def _sensitivity_figs(report: ValuationReport, symbol: str,
+                      embed: _PlotEmbedder) -> list[str]:
+    """One heatmap per SensitivityResult (implied price across the grid).
+
+    Axes are formatted by their label (see ``_axis_tick``), so a WACC x exit
+    EV/EBITDA grid reads '12.0x' across the top. Invalid cells (None/NaN) stay
+    blank, and a caption under the chart says why. The centre cell is outlined
+    as the base case only when it reproduces the headline DCF price (see
+    ``_base_case_cell``).
+    """
     frags: list[str] = []
     for sens in (report.sensitivities or []):
         if sens is None:
@@ -304,18 +321,31 @@ def _sensitivity_figs(report: ValuationReport, symbol: str) -> list[str]:
         cols = getattr(sens, "col_values", None)
         if not grid or not rows or not cols:
             continue
-        # Row/col axis tick labels: terminal-growth / WACC / margin levels are
-        # decimals -> percentages; anything else (e.g. exit multiples) -> number.
         row_label = _esc(getattr(sens, "row_label", "") or "")
         col_label = _esc(getattr(sens, "col_label", "") or "")
-        row_text = [_axis_tick(v, getattr(sens, "row_label", "")) for v in rows]
-        col_text = [_axis_tick(v, getattr(sens, "col_label", "")) for v in cols]
+        # Plotly merges equal category labels, so repeated ticks (e.g. several
+        # 'n/a' margin rows for a pre-revenue company) are made distinct.
+        row_text = _unique_ticks(
+            [_axis_tick(v, getattr(sens, "row_label", "")) for v in rows])
+        col_text = _unique_ticks(
+            [_axis_tick(v, getattr(sens, "col_label", "")) for v in cols])
 
         # Cell text: formatted implied prices (blank when nan/None).
         cell_text = [
             [_fmt_price(v, symbol) if is_num(v) else "" for v in (grow or [])]
             for grow in grid
         ]
+        # A blank cell anywhere in the rows x cols rectangle gets a caption
+        # saying why (a plotly title does not wrap, so it goes under the chart).
+        has_blank = False
+        for i in range(len(rows)):
+            grow = list(grid[i] or []) if i < len(grid) else []
+            has_blank = has_blank or not all(
+                j < len(grow) and is_num(grow[j]) for j in range(len(cols)))
+        base_cell = _base_case_cell(sens, report)
+        title = _esc(getattr(sens, "title", "") or "Sensitivity")
+        if base_cell is not None:
+            title += "<br><sup>Outlined cell = headline DCF (base case)</sup>"
         fig = go.Figure(
             go.Heatmap(
                 z=grid,
@@ -332,33 +362,113 @@ def _sensitivity_figs(report: ValuationReport, symbol: str) -> list[str]:
             )
         )
         fig.update_layout(
-            title=_esc(getattr(sens, "title", "") or "Sensitivity"),
+            title=title,
             xaxis_title=col_label,
             yaxis_title=row_label,
-            height=360,
-            margin=dict(l=10, r=20, t=60, b=50),
+            height=380 if base_cell is not None else 360,
+            margin=dict(l=10, r=20, t=70 if base_cell is not None else 60, b=50),
             paper_bgcolor="white",
             font=dict(family="Segoe UI, Helvetica, Arial, sans-serif", size=13),
         )
-        # Keep rows top-to-bottom in the order provided.
-        fig.update_yaxes(autorange="reversed")
-        frags.append(_EMBED.to_html(fig))
+        if base_cell is not None:
+            # Category axes place cell k at k, so the cell spans k +/- 0.5.
+            i, j = base_cell
+            fig.add_shape(type="rect", xref="x", yref="y",
+                          x0=j - 0.5, x1=j + 0.5, y0=i - 0.5, y1=i + 0.5,
+                          line=dict(color="#1c2733", width=2.5))
+        # Category axes (so the base-case outline lands on cell indices); keep
+        # rows top-to-bottom in the order provided.
+        fig.update_xaxes(type="category")
+        fig.update_yaxes(type="category", autorange="reversed")
+        caption = (f"<p class='fig-note'>{_esc(BLANK_SENSITIVITY_CELL_NOTE)}</p>"
+                   if has_blank else "")
+        frags.append(embed.to_html(fig) + caption)
     return frags
 
 
+# Why a sensitivity cell can be blank (models/sensitivity.py stores NaN for a
+# cell it cannot price at its own row/column inputs); the same text as the
+# Excel report's note under each grid.
+BLANK_SENSITIVITY_CELL_NOTE = (
+    "Blank cell = no valid DCF price at those inputs: terminal growth too close "
+    "to WACC, a non-positive WACC the model would replace with its fallback rate, "
+    "an exit multiple of zero or less, or no base EBIT margin to vary."
+)
+
+# Beside the terminal growth of an exit-multiple DCF, whose terminal value is
+# EBITDA_N x the exit multiple; the same text as the Excel DCF sheet's note.
+EXIT_MULTIPLE_GROWTH_NOTE = (
+    "Not used in this DCF's terminal value (the exit multiple sets it); still the "
+    "rate revenue growth fades to, and the terminal growth of DDM and FCFE."
+)
+
+
+def _is_multiple_axis(label: Optional[str]) -> bool:
+    """True for a sensitivity axis that varies a valuation multiple.
+
+    The shared contract: labels containing 'EV/EBITDA' or 'multiple' (e.g. the
+    'Exit EV/EBITDA' axis of an exit-multiple DCF grid) hold multiples such as
+    12.0; every other axis the engine builds holds a decimal rate.
+    """
+    low = (label or "").lower()
+    return "ev/ebitda" in low or "multiple" in low
+
+
 def _axis_tick(value: Optional[float], label: str) -> str:
-    """Format a sensitivity axis level. Rate-like axes -> %, else a number/multiple."""
+    """Format a sensitivity axis level by its axis label.
+
+    Multiple axes -> '12.0x'; rate axes (WACC, growth, margin) -> a percentage
+    whatever the magnitude (a -152% margin stays a percent). Only an axis with
+    an unrecognised label falls back on magnitude (|x| < 1 -> percent).
+    """
     if not is_num(value):
         return "n/a"
     low = (label or "").lower()
+    if _is_multiple_axis(low):
+        return _fmt_mult(value)
     if any(k in low for k in ("wacc", "growth", "margin", "rate", "discount")):
         return _fmt_pct(value, 2)
-    if "multiple" in low or "ebitda" in low or "ev/" in low:
-        return _fmt_mult(value)
     # Small decimals are almost always rates; render as percent to be safe.
     if abs(value) < 1.0:
         return _fmt_pct(value, 2)
     return _fmt_num(value)
+
+
+def _unique_ticks(labels: list[str]) -> list[str]:
+    """Make repeated tick labels distinct with invisible zero-width spaces."""
+    seen: dict[str, int] = {}
+    out = []
+    for lab in labels:
+        k = seen.get(lab, 0)
+        seen[lab] = k + 1
+        out.append(lab + "\u200b" * k)
+    return out
+
+
+def _base_case_cell(sens, report: ValuationReport) -> Optional[tuple[int, int]]:
+    """(row, col) of a grid's centre cell when it is the headline DCF case.
+
+    The centre of an odd-sized grid holds the unshifted inputs, so it should
+    reproduce the headline DCF implied price. When it does not (e.g. a Gordon
+    grid shown beside an exit-multiple headline, or a missing centre cell) it
+    is not the base case, and None is returned so nothing is highlighted.
+    """
+    dcf = getattr(report, "dcf", None)
+    headline = getattr(dcf, "implied_price", None) if dcf is not None else None
+    rows = getattr(sens, "row_values", None) or []
+    cols = getattr(sens, "col_values", None) or []
+    grid = getattr(sens, "grid", None) or []
+    if not is_num(headline) or len(rows) % 2 == 0 or len(cols) % 2 == 0:
+        return None
+    i, j = len(rows) // 2, len(cols) // 2
+    grid_row = grid[i] if i < len(grid) else None
+    cell = grid_row[j] if grid_row and j < len(grid_row) else None
+    if not is_num(cell):
+        return None
+    headline = float(headline)
+    if abs(float(cell) - headline) > max(1e-6, 1e-6 * abs(headline)):
+        return None
+    return i, j
 
 
 # --------------------------------------------------------------------------- #
@@ -411,13 +521,22 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         f"{header}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
     )
 
-    # Value bridge (EV -> equity -> per share).
+    # Value bridge (EV -> equity -> per share). The model subtracts every senior
+    # claim, so show minority interest and preferred equity next to net debt.
+    bs = getattr(getattr(report, "company", None), "balance_sheet", None)
+
+    def _claim(attr: str) -> float:
+        v = getattr(bs, attr, None) if bs is not None else None
+        return float(v) if is_num(v) else 0.0
+
     bridge_items = [
         ("Sum PV of FCFF", _fmt_big(sum(v for v in pv if is_num(v)), symbol)),
         ("Terminal value (undiscounted)", _fmt_big(getattr(dcf, "terminal_value", None), symbol)),
         ("PV of terminal value", _fmt_big(getattr(dcf, "pv_terminal", None), symbol)),
         ("Enterprise value", _fmt_big(getattr(dcf, "enterprise_value", None), symbol)),
         ("Less: net debt", _fmt_big(getattr(dcf, "net_debt", None), symbol)),
+        ("Less: minority interest", _fmt_big(_claim("minority_interest"), symbol)),
+        ("Less: preferred equity", _fmt_big(_claim("preferred_equity"), symbol)),
         ("Equity value", _fmt_big(getattr(dcf, "equity_value", None), symbol)),
         ("Shares", _fmt_big(getattr(dcf, "shares", None))),
         ("Implied price", _fmt_price(getattr(dcf, "implied_price", None), symbol)),
@@ -428,9 +547,11 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         for k, v in bridge_items
     )
     up = getattr(dcf, "upside", None)
+    # Uncoloured for a reference-only DCF or when the engine gives no verdict.
+    up_cls = _upside_class(up) if method_upside_toned(report.summary, "DCF") else "neutral"
     bridge_rows += (
         f"<tr><th class='rowhead'>Upside</th>"
-        f"<td class='{_upside_class(up)}'>{_fmt_pct(up)}</td></tr>"
+        f"<td class='{up_cls}'>{_fmt_pct(up)}</td></tr>"
     )
     bridge = (
         "<table class='kv'><tbody>" + bridge_rows + "</tbody></table>"
@@ -544,28 +665,36 @@ def _blended_target(report: ValuationReport) -> tuple[Optional[float], Optional[
     """(blended target, upside). Prefer report.summary; else median of FF bases."""
     summary = report.summary or {}
     # Source the header's blended target from report.summary so it matches the
-    # Excel Summary sheet; prefer the canonical 'blended_target' key, then accept
-    # a few alternative spellings the engine might populate.
+    # Excel Summary sheet and the CLI. A None there means no target (no method
+    # produced a usable price, or the engine asks for peers): show it in words
+    # (``no_target_text``) rather than inventing a target.
     target = None
-    for key in ("blended_target", "target_price", "blended", "target", "fair_value"):
-        if is_num(summary.get(key)):
-            target = float(summary[key])
-            break
-    if target is None:
-        # Fall back to the football-field median only when summary is absent.
-        bases = [getattr(r, "base", None) for r in (report.football_field or [])]
+    if "blended_target" in summary:
+        if is_num(summary.get("blended_target")):
+            target = float(summary["blended_target"])
+    else:
+        # No engine summary at all: fall back to the median of the valuation
+        # methods' football-field bases. The 52-week row is market data (its
+        # base is the current price), not a valuation, so it is excluded.
+        bases = [getattr(r, "base", None) for r in (report.football_field or [])
+                 if "52-w" not in str(getattr(r, "method", "") or "").lower()]
         target = median([b for b in bases if is_num(b)])
 
-    # Likewise prefer the summary's blended upside (canonical key first) so the
-    # header agrees with the Excel Summary sheet.
+    # Likewise take the summary's blended upside so the header agrees with the
+    # Excel Summary sheet. A None there is kept: the engine withholds the
+    # upside when it gives no verdict (a blend that rests on the DDM alone).
     upside = None
-    for key in ("blended_upside", "upside"):
-        if is_num(summary.get(key)):
-            upside = float(summary[key])
-            break
-    if upside is None and is_num(target) and is_num(report.current_price) and report.current_price:
+    if target is not None and "blended_upside" in summary:
+        if is_num(summary.get("blended_upside")):
+            upside = float(summary["blended_upside"])
+    elif is_num(target) and is_num(report.current_price) and report.current_price:
         upside = target / report.current_price - 1.0
     return target, upside
+
+
+def _verdict_class(verdict: object) -> str:
+    """CSS class for the verdict card; no colour when no verdict is given."""
+    return {"Undervalued": "pos", "Overvalued": "neg"}.get(str(verdict), "neutral")
 
 
 def _header_html(report: ValuationReport, symbol: str) -> str:
@@ -575,11 +704,17 @@ def _header_html(report: ValuationReport, symbol: str) -> str:
     market = getattr(company, "market", None)
     currency = getattr(market, "currency", None) if market is not None else None
     target, upside = _blended_target(report)
+    verdict = (report.summary or {}).get("recommendation") or "n/a"
 
     cards = [
         ("Current price", _fmt_price(report.current_price, symbol), "neutral"),
-        ("Blended target", _fmt_price(target, symbol), "neutral"),
+        ("Blended target",
+         _fmt_price(target, symbol) if is_num(target)
+         else _esc(no_target_text(report.summary, report.comps)),
+         "neutral"),
+        # n/a (uncoloured) when there is no target or the verdict is withheld.
         ("Upside / downside", _fmt_pct(upside), _upside_class(upside)),
+        ("Verdict", _esc(verdict), _verdict_class(verdict)),
     ]
     cards_html = "".join(
         f"<div class='card'><div class='card-label'>{_esc(lbl)}</div>"
@@ -592,8 +727,67 @@ def _header_html(report: ValuationReport, symbol: str) -> str:
         f"<h1>{name}</h1>"
         f"<div class='subtitle'>{sub}</div>"
         f"<div class='cards'>{cards_html}</div>"
-        "</header>"
+        + _methods_table(report, symbol)
+        + "</header>"
     )
+
+
+def _methods_table(report: ValuationReport, symbol: str) -> str:
+    """Each method's implied price and upside: the inputs to the blended target."""
+    methods = (report.summary or {}).get("methods") or {}
+    if not methods:
+        return ""
+    # Methods shown for reference but left out of the blend (e.g. a bank's DCF
+    # and FCFE) are marked with the engine's reason.
+    # Their upside, and every upside when the engine gives no verdict, is
+    # uncoloured (``method_upside_toned``).
+    excluded = (report.summary or {}).get("excluded_from_blend") or {}
+    cur = report.current_price
+    rows = []
+    for name, price in methods.items():
+        up = (price / cur - 1.0) if (is_num(price) and is_num(cur) and cur) else None
+        mark = (f" <span class='aside'>(not in blend: {_esc(excluded[name])})</span>"
+                if name in excluded else "")
+        cls = _upside_class(up) if method_upside_toned(report.summary, name) else "neutral"
+        rows.append(
+            f"<tr><th class='rowhead'>{_esc(name)}{mark}</th>"
+            f"<td>{_fmt_price(price, symbol)}</td>"
+            f"<td class='{cls}'>{_fmt_pct(up)}</td></tr>"
+        )
+    return (
+        "<h3 class='subhead'>Valuation by method</h3>"
+        "<table class='kv methods'><thead><tr><th></th><th>Implied price</th>"
+        "<th>Upside</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
+def _beta_item(report: ValuationReport) -> Optional[tuple[str, str]]:
+    """(label, value HTML) for the beta behind the DCF's cost of equity.
+
+    The market data Blume-adjusts Yahoo's beta toward 1 (``BLUME_FORMULA``) and
+    keeps the raw figure (``MarketData.raw_beta``; the WACC records it as
+    ``detail['beta_raw']``), so an adjusted beta reads 'Beta (adj.)' with the
+    raw value beside it. None when the DCF has no beta.
+    """
+    wacc = getattr(getattr(report, "dcf", None), "wacc", None)
+    beta = getattr(wacc, "beta", None)
+    if not is_num(beta):
+        return None
+    detail = getattr(wacc, "detail", None) or {}
+    if detail.get("beta_source") == "DEFAULT_BETA":
+        return ("Beta (default)", _fmt_num(beta) +
+                "<br><span class='aside'>No usable market beta.</span>")
+    raw = detail.get("beta_raw")
+    if not is_num(raw):
+        raw = getattr(getattr(getattr(report, "company", None), "market", None),
+                      "raw_beta", None)
+    if is_num(raw) and abs(float(raw) - float(beta)) > 1e-9:
+        return ("Beta (adj.)", _fmt_num(beta) + "<br><span class='aside'>"
+                + _esc(f"Raw beta {float(raw):.3f}, {BLUME_NOTE}") + "</span>")
+    if "adjusted" in str(detail.get("beta_source") or ""):
+        return ("Beta (adj.)", _fmt_num(beta) +
+                "<br><span class='aside'>Adjusted by the market data (see the notes).</span>")
+    return ("Beta", _fmt_num(beta))
 
 
 def _footnotes_html(report: ValuationReport) -> str:
@@ -617,11 +811,24 @@ def _footnotes_html(report: ValuationReport) -> str:
             items.append(("WACC", _fmt_pct(wacc.wacc, 2)))
             if is_num(getattr(wacc, "cost_of_equity", None)):
                 items.append(("Cost of equity", _fmt_pct(wacc.cost_of_equity, 2)))
+            beta = _beta_item(report)
+            if beta is not None:
+                items.append(beta)
         adict = getattr(dcf, "assumptions", {}) or {}
-        if is_num(adict.get("terminal_growth")):
-            items.append(("Terminal growth", _fmt_pct(adict.get("terminal_growth"), 2)))
+        # The growth actually used (the model clamps it below WACC when needed).
+        g_used = adict.get("terminal_growth_used", adict.get("terminal_growth"))
+        if is_num(g_used):
+            growth = _fmt_pct(g_used, 2)
+            if adict.get("terminal_method") == "exit_multiple":
+                growth += f"<br><span class='aside'>{_esc(EXIT_MULTIPLE_GROWTH_NOTE)}</span>"
+            items.append(("Terminal growth", growth))
         if adict.get("terminal_method"):
             items.append(("Terminal method", _esc(adict.get("terminal_method"))))
+        # The multiple that sets an exit-multiple terminal value (and centres
+        # the exit EV/EBITDA sensitivity axis).
+        exit_mult = adict.get("exit_ev_ebitda")
+        if adict.get("terminal_method") == "exit_multiple" and is_num(exit_mult):
+            items.append(("Exit EV/EBITDA", _fmt_mult(exit_mult)))
         if is_num(adict.get("tax_rate")):
             items.append(("DCF tax rate", _fmt_pct(adict.get("tax_rate"), 1)))
 
@@ -702,6 +909,8 @@ table.grid tr.stat-row td { background:#f3f7fb; font-style:italic; color:var(--m
 table.kv { width:auto; min-width:280px; }
 table.kv th.rowhead { text-align:left; padding:5px 14px 5px 0; color:var(--muted); font-weight:600; }
 table.kv td { text-align:right; padding:5px 0; font-weight:600; }
+table.kv.methods td { padding-left:18px; }
+table.kv.methods thead th { text-align:right; color:var(--muted); font-size:12px; font-weight:600; padding-left:18px; }
 .bridge { margin-top:14px; }
 .pos { color:var(--pos); }
 .neg { color:var(--neg); }
@@ -710,6 +919,9 @@ ul.notes { margin:8px 0; padding-left:20px; color:var(--muted); font-size:13px; 
 ul.notes li.warn { color:var(--neg); }
 .disclaimer { margin-top:20px; font-size:11px; color:var(--muted); border-top:1px solid var(--line); padding-top:12px; }
 .empty { color:var(--muted); font-style:italic; }
+.aside { color:var(--muted); font-weight:400; font-size:12px; }
+table.kv td .aside { display:inline-block; max-width:360px; }
+.fig-note { margin:2px 0 16px; color:var(--muted); font-size:12px; font-style:italic; }
 footer.gen { margin-top:30px; color:var(--muted); font-size:11px; text-align:center; }
 """
 
@@ -736,11 +948,6 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-# Module-level embedder reference; reset at the start of every render so each call
-# to write_html embeds plotly.js exactly once for its own document.
-_EMBED = _PlotEmbedder()
-
-
 def _section(title: str, *fragments: str) -> str:
     """Wrap non-empty fragments in a titled section card; '' if all empty."""
     body = "".join(f for f in fragments if f)
@@ -757,8 +964,7 @@ def write_html(report: ValuationReport, path: str) -> str:
     or empty, the corresponding section is simply omitted. The function never
     raises on missing fields — it degrades to ``n/a`` cells and skipped sections.
     """
-    global _EMBED
-    _EMBED = _PlotEmbedder()  # fresh per-render embed state (plotly.js once)
+    embed = _PlotEmbedder()  # per-render embed state (plotly.js once per document)
 
     # Resolve the currency symbol from the company's market data.
     market = getattr(getattr(report, "company", None), "market", None)
@@ -769,21 +975,21 @@ def write_html(report: ValuationReport, path: str) -> str:
     header = _header_html(report, symbol)
 
     # --- Football field (always its own section when data exists) --------- #
-    ff_fig = _football_field_fig(report, symbol)
+    ff_fig = _football_field_fig(report, symbol, embed)
     football = _section("Valuation summary", ff_fig) if ff_fig else ""
 
     # --- DCF -------------------------------------------------------------- #
     dcf_table = _dcf_table(report, symbol)
-    dcf_chart = _fcff_fig(report, symbol)
+    dcf_chart = _fcff_fig(report, symbol, embed)
     dcf_section = _section("Discounted cash flow (DCF)", dcf_table, dcf_chart)
 
     # --- Comps ------------------------------------------------------------ #
     comps_table = _comps_table(report, symbol)
-    comps_chart = _comps_fig(report)
+    comps_chart = _comps_fig(report, embed)
     comps_section = _section("Trading comparables", comps_table, comps_chart)
 
     # --- Sensitivities ---------------------------------------------------- #
-    sens_figs = _sensitivity_figs(report, symbol)
+    sens_figs = _sensitivity_figs(report, symbol, embed)
     sens_section = _section("Sensitivity analysis", *sens_figs) if sens_figs else ""
 
     # --- Footnotes / assumptions / warnings ------------------------------- #

@@ -1,7 +1,12 @@
 # Backend (FastAPI) — installed on top of the engine's requirements.txt
-fastapi>=0.110
+# 0.132+ refuses JSON bodies sent without a Content-Type (strict_content_type),
+# a second line behind the app's own cross-site checks. The app's middleware
+# is pure ASGI and does not itself need a newer FastAPI or Starlette.
+fastapi>=0.132
 uvicorn[standard]>=0.29
-anthropic>=0.69
+# messages.create(output_config=...) needs 0.77+; 0.78 is the first release
+# whose types include the adaptive thinking config the service sends.
+anthropic>=0.78
 # Office artifacts (research memo / briefing deck)
 python-docx>=1.1
 python-pptx>=1.0

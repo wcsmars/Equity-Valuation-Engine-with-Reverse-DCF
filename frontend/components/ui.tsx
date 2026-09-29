@@ -10,6 +10,7 @@
 // numeric figure for tabular mono digits.
 
 import React from "react";
+import { setsTextColor } from "@/lib/format";
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
@@ -39,8 +40,8 @@ export function Card({
       )}
     >
       {(title || right) && (
-        <header className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
-          <div>
+        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-line px-4 py-3">
+          <div className="min-w-0">
             {title && (
               <h3 className="text-sm font-semibold tracking-wide text-ink">
                 {title}
@@ -50,7 +51,8 @@ export function Card({
               <p className="mt-0.5 text-xs text-ink-faint">{subtitle}</p>
             )}
           </div>
-          {right && <div className="shrink-0">{right}</div>}
+          {/* Wraps under the title on narrow screens instead of overflowing. */}
+          {right && <div className="min-w-0 max-w-full">{right}</div>}
         </header>
       )}
       <div className={cx("px-4 py-3", bodyClassName)}>{children}</div>
@@ -65,15 +67,17 @@ export function Stat({
   sub,
   tone,
   className,
+  title,
 }: {
   label: React.ReactNode;
   value: React.ReactNode;
   sub?: React.ReactNode;
   tone?: string; // a text-* class, e.g. "text-up"
   className?: string;
+  title?: string; // hover tooltip for the whole stat
 }) {
   return (
-    <div className={cx("min-w-0", className)}>
+    <div className={cx("min-w-0", className)} title={title}>
       <div className="text-[11px] uppercase tracking-wider text-ink-faint">
         {label}
       </div>
@@ -159,7 +163,9 @@ export function TD({
   return (
     <td
       className={cx(
-        "whitespace-nowrap border-b border-line/60 px-2.5 py-1.5 text-ink",
+        "whitespace-nowrap border-b border-line/60 px-2.5 py-1.5",
+        // A colour in className (an upside tone) replaces the default ink.
+        !setsTextColor(className) && "text-ink",
         num && "num",
         align === "left" && "text-left",
         align === "right" && "text-right",

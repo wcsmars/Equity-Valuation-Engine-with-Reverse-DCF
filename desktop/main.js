@@ -66,23 +66,27 @@ function getFreePort() {
 }
 
 // Minimal .env parser so the AI/FMP keys reach the backend even when launched
-// from Finder (no shell environment).
+// from Finder (no shell environment). It reads typical lines the way
+// run_dev.sh's `source .env` does: an optional `export ` prefix, single- or
+// double-quoted values, and trailing ` # comments` on unquoted values. It does
+// not expand variables or read multi-line values.
 function loadDotenv(file) {
   const out = {};
   try {
     for (const line of fs.readFileSync(file, "utf8").split("\n")) {
-      const t = line.trim();
+      const t = line.trim().replace(/^export\s+/, "");
       if (!t || t.startsWith("#")) continue;
       const eq = t.indexOf("=");
       if (eq === -1) continue;
       const k = t.slice(0, eq).trim();
-      let v = t.slice(eq + 1).trim();
-      if (
-        (v.startsWith('"') && v.endsWith('"')) ||
-        (v.startsWith("'") && v.endsWith("'"))
-      )
-        v = v.slice(1, -1);
-      if (k) out[k] = v;
+      const raw = t.slice(eq + 1);
+      const dq = raw.trim().match(/^"((?:[^"\\]|\\.)*)"/);
+      const sq = raw.trim().match(/^'([^']*)'/);
+      let v;
+      if (dq) v = dq[1].replace(/\\(["\\$`])/g, "$1");
+      else if (sq) v = sq[1];
+      else v = raw.replace(/\s+#.*$/, "").trim();
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) out[k] = v;
     }
   } catch (_) {
     /* no .env is fine */
@@ -140,7 +144,7 @@ function hasProductionBuild() {
   return fs.existsSync(path.join(FRONTEND_DIR, ".next", "BUILD_ID"));
 }
 
-function buildFrontend(onLog) {
+function buildFrontend(onLog, logTail) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, NODE_ENV: "production" };
     if (USE_ELECTRON_NODE) env.ELECTRON_RUN_AS_NODE = "1";
@@ -150,7 +154,12 @@ function buildFrontend(onLog) {
       buildProc = null; // quitting mid-build must kill it (see killServers)
       code === 0
         ? resolve()
-        : reject(new Error("Frontend build failed (code " + code + ")"));
+        : reject(
+            new Error(
+              `Frontend build failed (code ${code}).\n\nRecent output:\n` +
+                logTail().slice(-1200)
+            )
+          );
     });
   });
 }
@@ -176,6 +185,8 @@ async function startServers(onLog) {
   const dotenv = loadDotenv(path.join(PROJECT_ROOT, ".env"));
 
   // Keep a rolling log tail so startup failures can show WHAT went wrong.
+  // `log` forwards to the caller's sink; never rebind `onLog` to `log`, or
+  // the wrapper would call itself.
   const logBuf = [];
   const log = (line) => {
     logBuf.push(line);
@@ -183,7 +194,6 @@ async function startServers(onLog) {
     if (onLog) onLog(line);
   };
   const tail = () => logBuf.join("\n");
-  onLog = log;
 
   // Backend first — its heavy imports overlap with any frontend build below.
   backendProc = spawn(
@@ -201,11 +211,15 @@ async function startServers(onLog) {
     ],
     { cwd: PROJECT_ROOT, env: { ...process.env, ...dotenv, PYTHONUNBUFFERED: "1" } }
   );
-  pipeLogs("backend", backendProc, onLog);
+  pipeLogs("backend", backendProc, log);
+  // Watch the backend from the moment it is spawned: a crash during a long
+  // first-run build must not wait for the health-check timeout.
+  const backendDied = watchChildExit("The valuation backend", backendProc, tail);
+  backendDied.catch(() => {});
 
   // Self-heal a missing/dev-clobbered production build before next start.
   if (!hasProductionBuild()) {
-    if (onLog) onLog("[build] No production build — building the UI (first run)…");
+    log("[build] No production build — building the UI (first run)…");
     if (mainWindow) {
       mainWindow.webContents
         .executeJavaScript(
@@ -213,7 +227,7 @@ async function startServers(onLog) {
         )
         .catch(() => {});
     }
-    await buildFrontend(onLog);
+    await Promise.race([buildFrontend(log, tail), backendDied]);
   }
 
   const fenv = {
@@ -227,14 +241,14 @@ async function startServers(onLog) {
     cwd: FRONTEND_DIR,
     env: fenv,
   });
-  pipeLogs("frontend", frontendProc, onLog);
+  pipeLogs("frontend", frontendProc, log);
 
   // Wait until BOTH servers are truly ready before revealing the dashboard, so
   // an early request can't hit a not-yet-listening backend and 500. Race the
   // health probes against child-process death so a crashed server surfaces
   // its log tail immediately instead of a silent multi-minute spinner.
   const failures = [
-    watchChildExit("The valuation backend", backendProc, tail),
+    backendDied,
     watchChildExit("The frontend server", frontendProc, tail),
   ];
   await Promise.race([
@@ -295,15 +309,15 @@ function createWindow() {
 
   // News / filing links open in the user's default browser, not the app.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("http")) shell.openExternal(url);
+    openInBrowser(url);
     return { action: "deny" };
   });
   // Plain target=_blank anchors that navigate the window itself: keep the app
-  // pinned to its own localhost UI and push everything else to the browser.
+  // pinned to its own local UI origin and push everything else to the browser.
   mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith("http://127.0.0.1") && !url.startsWith("http://localhost")) {
+    if (!isAppUrl(url)) {
       event.preventDefault();
-      if (url.startsWith("http")) shell.openExternal(url);
+      openInBrowser(url);
     }
   });
   // Cmd+R during the loading→dashboard handoff (or a failed load) can strand
@@ -321,6 +335,27 @@ function createWindow() {
   });
 }
 
+// Only the exact origin of the local frontend (scheme, host and port) may load
+// in the app window.
+function isAppUrl(url) {
+  try {
+    return Boolean(appUrl) && new URL(url).origin === new URL(appUrl).origin;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Hand only http(s) links to the OS; other schemes would reach arbitrary
+// protocol handlers.
+function openInBrowser(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol === "http:" || u.protocol === "https:") shell.openExternal(u.href);
+  } catch (_) {
+    /* not a valid URL */
+  }
+}
+
 // foo.docx -> foo (2).docx if needed, so repeated exports never overwrite.
 function uniquePath(p) {
   if (!fs.existsSync(p)) return p;
@@ -334,9 +369,12 @@ function uniquePath(p) {
 }
 
 // Double-launching would spawn a second backend/frontend pair fighting over
-// the same store file — focus the existing window instead.
-if (!app.requestSingleInstanceLock()) {
-  app.quit();
+// the same store file — focus the existing window instead. app.quit() is
+// asynchronous and would still let whenReady() below start servers, so a
+// second instance exits immediately.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.exit(0);
 }
 app.on("second-instance", () => {
   if (mainWindow) {
@@ -346,6 +384,7 @@ app.on("second-instance", () => {
 });
 
 app.whenReady().then(async () => {
+  if (!gotLock) return;
   createWindow();
 
   const problems = preflight();

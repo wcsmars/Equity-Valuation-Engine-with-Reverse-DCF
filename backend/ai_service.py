@@ -10,14 +10,16 @@ Three capabilities, all grounded in the currently-loaded valuation model:
                           to a Word memo / PowerPoint deck.
   * chat(...)          -> grounded Q&A.
 
-Uses the model selected by ANTHROPIC_MODEL with adaptive thinking; PDFs ride as
-native base64 document blocks; structured outputs use output_config.format.
+Uses the model selected by ANTHROPIC_MODEL with adaptive thinking (Haiku
+models, which lack adaptive thinking and effort, run without them); PDFs ride
+as native base64 document blocks; structured outputs use output_config.format.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -217,10 +219,37 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
 
+def _request_params(format_: Optional[dict] = None) -> dict:
+    """thinking + output_config kwargs for messages.create. Haiku 4.5
+    supports neither adaptive thinking nor output_config.effort, so a Haiku
+    ANTHROPIC_MODEL override runs without them (output_config.format still
+    applies)."""
+    params: dict = {}
+    output_config: dict = {}
+    if not MODEL.startswith("claude-haiku"):
+        params["thinking"] = {"type": "adaptive"}
+        output_config["effort"] = "high"
+    if format_ is not None:
+        output_config["format"] = format_
+    if output_config:
+        params["output_config"] = output_config
+    return params
+
+
 def _pdf_blocks(pdfs: Optional[list[dict]]) -> list[dict]:
     blocks: list[dict] = []
     for f in pdfs or []:
+        if not isinstance(f, dict):
+            continue
         data = f.get("data_base64") or f.get("data")
+        if not isinstance(data, str):
+            continue
+        # Accept a data URL ("data:application/pdf;base64,....") and
+        # line-wrapped base64 (e.g. `base64` CLI output); the API wants the
+        # bare, unwrapped payload.
+        if data.startswith("data:") and "," in data:
+            data = data.split(",", 1)[1]
+        data = re.sub(r"\s+", "", data)
         if not data:
             continue
         blocks.append(
@@ -246,13 +275,9 @@ def _structured(client, system: str, content: list[dict], schema: dict,
     msg = client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
-        thinking={"type": "adaptive"},
         system=system,
-        output_config={
-            "effort": "high",
-            "format": {"type": "json_schema", "schema": schema},
-        },
         messages=[{"role": "user", "content": content}],
+        **_request_params({"type": "json_schema", "schema": schema}),
     )
     if msg.stop_reason == "max_tokens":
         raise AIError(
@@ -287,7 +312,7 @@ def digest(
         _SYSTEM.format(context=context or "(no model loaded)"),
         content,
         _DIGEST_SCHEMA,
-        max_tokens=10_000,
+        max_tokens=16_000,
     )
 
 
@@ -304,36 +329,69 @@ def research_note(context: str, pdfs: Optional[list[dict]] = None) -> dict:
     )
 
 
+def _validate_turns(turns) -> list[dict]:
+    """Chat history must be [{role: user|assistant, content: non-empty str}],
+    starting and ending with a user turn (current models reject a trailing
+    assistant turn as prefill, and empty content anywhere)."""
+    if not isinstance(turns, list) or not turns:
+        raise AIError("No message to answer.")
+    out: list[dict] = []
+    for i, t in enumerate(turns, start=1):
+        if not isinstance(t, dict):
+            raise AIError(f"Chat turn {i} must be an object with role and content.")
+        role, content = t.get("role"), t.get("content")
+        if role not in ("user", "assistant"):
+            raise AIError(f"Chat turn {i} has role {role!r}; use 'user' or 'assistant'.")
+        if not isinstance(content, str) or not content.strip():
+            raise AIError(f"Chat turn {i} ({role}) has empty content.")
+        out.append({"role": role, "content": content})
+    if out[0]["role"] != "user":
+        raise AIError("The conversation must start with a user message.")
+    if out[-1]["role"] != "user":
+        raise AIError("The last chat turn must be the user's question.")
+    return out
+
+
 def chat(
     context: str,
     turns: list[dict],
     pdfs: Optional[list[dict]] = None,
 ) -> str:
     """Grounded Q&A. `turns` is [{role, content}, ...]; PDFs attach to the
-    final user turn."""
+    final user turn. Never returns an empty reply: a refusal or a response
+    with no text raises AIError instead."""
+    turns = _validate_turns(turns)
     client = _client()
-    if not turns:
-        raise AIError("No message to answer.")
 
-    messages: list[dict] = [
-        {"role": t["role"], "content": t["content"]} for t in turns[:-1]
-    ]
+    messages: list[dict] = [dict(t) for t in turns[:-1]]
     last = turns[-1]
     blocks = _pdf_blocks(pdfs)
     if blocks:
         messages.append(
-            {"role": last["role"],
+            {"role": "user",
              "content": [*blocks, {"type": "text", "text": last["content"]}]}
         )
     else:
-        messages.append({"role": last["role"], "content": last["content"]})
+        messages.append({"role": "user", "content": last["content"]})
 
+    # Thinking tokens count against max_tokens; leave room for the answer.
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
+        max_tokens=16_000,
         system=_SYSTEM.format(context=context or "(no model loaded)"),
-        output_config={"effort": "high"},
         messages=messages,
+        **_request_params(),
     )
-    return _text(msg)
+    if msg.stop_reason == "refusal":
+        raise AIError("The model declined to answer this question.")
+    reply = _text(msg).strip()
+    if not reply:
+        if msg.stop_reason == "max_tokens":
+            raise AIError(
+                "The answer hit the output limit before any text was "
+                "produced. Try a narrower question."
+            )
+        raise AIError("The model returned an empty answer. Try rephrasing.")
+    if msg.stop_reason == "max_tokens":
+        reply += "\n\n[Answer truncated: output limit reached.]"
+    return reply

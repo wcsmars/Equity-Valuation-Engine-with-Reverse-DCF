@@ -3,7 +3,12 @@ import type { Config } from "tailwindcss";
 // Design tokens for the whole app. Panels should use these semantic colors
 // (bg-surface, border-line, text-ink, text-up/down/flat) rather than ad-hoc hex.
 const config: Config = {
-  content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"],
+  // lib/ too: its helpers (lib/format.ts) return tone classes.
+  content: [
+    "./app/**/*.{ts,tsx}",
+    "./components/**/*.{ts,tsx}",
+    "./lib/**/*.{ts,tsx}",
+  ],
   theme: {
     extend: {
       colors: {

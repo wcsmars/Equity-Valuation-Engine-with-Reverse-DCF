@@ -23,11 +23,13 @@ import datetime as _dt
 from typing import Optional
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .. import config
+from ..data.market import _BLUME_MARKET_WEIGHT, _BLUME_RAW_WEIGHT
 from ..schemas import ValuationReport
 from ..utils import is_num, median
 
@@ -47,9 +49,79 @@ _LABEL_FONT = Font(bold=True)
 _NOTE_FONT = Font(italic=True, color="808080")
 _GREEN_FONT = Font(color="0B6E0B")   # positive upside
 _RED_FONT = Font(color="C00000")     # negative upside
+_BASE_CASE_FILL = PatternFill("solid", fgColor="FFF2CC")  # sensitivity cell = headline DCF
 _RIGHT = Alignment(horizontal="right")
 _LEFT = Alignment(horizontal="left")
 _CENTER = Alignment(horizontal="center")
+
+# --------------------------------------------------------------------------- #
+#  Rules shared by every output (this workbook, the HTML report, the memo and
+#  deck, and the AI context import them from here; the dashboard's
+#  lib/format.ts keeps a copy that a test pins to these values)
+# --------------------------------------------------------------------------- #
+# The Blume adjustment the market data applies to Yahoo's raw beta.
+BLUME_FORMULA = f"{_BLUME_RAW_WEIGHT:g} x raw + {_BLUME_MARKET_WEIGHT:g}"
+BLUME_NOTE = f"Blume-adjusted toward 1 ({BLUME_FORMULA})"
+
+# In place of a blended target when the engine gives none because the
+# company's kind sets its methods aside (a bank's, a captive-finance group's or
+# a lessor's DCF and FCFE, and a low-payout or lone DDM) and no usable peers
+# were supplied: trading comps would give a target.
+NO_TARGET_SUPPLY_PEERS = "No target (supply peers)"
+
+
+def _has_peers(comps: object) -> bool:
+    """True when trading comps ran on at least one usable peer. ``comps`` is a
+    CompsResult, its JSON dict, or None (comps not run)."""
+    if comps is None:
+        return False
+    peers = comps.get("peers") if isinstance(comps, dict) else getattr(comps, "peers", None)
+    return bool(peers)
+
+
+def needs_peers(summary: Optional[dict], comps: object = None) -> bool:
+    """True when there is no blended target because the company is flagged
+    (``financial_kind``) and every method it has is reference only, and no
+    usable peers were supplied. Not when peers were supplied but comps gave no
+    price, and not when an ordinary company's methods gave no valuation (0.00);
+    those read 'n/a'. The engine asks for peers in the same cases."""
+    summary = summary or {}
+    if is_num(summary.get("blended_target")):
+        return False
+    methods = summary.get("methods") or {}
+    if not methods or any(str(name).startswith("Comps") for name in methods):
+        return False
+    if not (summary.get("financial_kind") or summary.get("financial_institution")):
+        return False
+    return not _has_peers(comps)
+
+
+def no_target_text(summary: Optional[dict], comps: object = None) -> str:
+    """What to show for a missing blended target: 'No target (supply peers)'
+    when ``needs_peers``, else 'n/a'."""
+    return NO_TARGET_SUPPLY_PEERS if needs_peers(summary, comps) else "n/a"
+
+
+def method_upside_toned(summary: Optional[dict], name: str) -> bool:
+    """Whether a method's upside is coloured by its sign. Not for a method left
+    out of the blended target (``excluded_from_blend``: shown for reference
+    only, e.g. a lessor's DCF), and not for any method when the engine gives no
+    verdict ('N/A': no target, or a verdict withheld for a blend that rests on
+    the DDM alone), so no output shows a direction the engine does not give.
+    ``name`` is the summary's method name ("DCF", "Comps (median)", "DDM",
+    "FCFE")."""
+    summary = summary or {}
+    if name in (summary.get("excluded_from_blend") or {}):
+        return False
+    return summary.get("recommendation") != "N/A"
+
+
+# Beside the terminal growth of an exit-multiple DCF, whose terminal value is
+# EBITDA_N x the exit multiple (the HTML report's Key assumptions say the same).
+EXIT_MULTIPLE_GROWTH_NOTE = (
+    "Not used in this DCF's terminal value (the exit multiple sets it); still the "
+    "rate revenue growth fades to, and the terminal growth of DDM and FCFE."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +136,10 @@ def _set(ws: Worksheet, row: int, col: int, value: object,
          *, fmt: Optional[str] = None, font: Optional[Font] = None,
          align: Optional[Alignment] = None) -> "Cell":  # type: ignore[name-defined]
     """Write a value into (row, col) and apply optional number format / style."""
+    if isinstance(value, str):
+        # Control characters (e.g. from exception text in a warning) are illegal
+        # in XLSX XML and would make openpyxl refuse to write the whole file.
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
     cell = ws.cell(row=row, column=col, value=value)
     if fmt is not None:
         cell.number_format = fmt
@@ -111,7 +187,7 @@ def _money_fmt(report: ValuationReport) -> str:
 # (rendered as a percent). Everything else -- d0, dps, *_pv, *_value, price,
 # stage PVs -- is money.
 _RATE_KEY_TOKENS = (
-    "growth", "rate", "ke", "coe", "roe", "retention", "yield", "wacc",
+    "growth", "rate", "ke", "coe", "roe", "retention", "yield", "wacc", "cost_of",
 )
 
 
@@ -121,6 +197,41 @@ def _is_rate_key(key: object) -> bool:
     if name == "g" or name.endswith("_g"):
         return True
     return any(tok in name for tok in _RATE_KEY_TOKENS)
+
+
+def _is_years_key(key: object) -> bool:
+    """True if a detail key's NAME is a horizon in years (e.g. high_growth_years)."""
+    name = str(key).lower()
+    return name.endswith("years") or name == "h_half"
+
+
+def _detail_fmt(key: object, value: float, money_fmt: str) -> str:
+    """Number format for one numeric model-detail entry, chosen by key name."""
+    if _is_years_key(key):
+        return "0" if float(value).is_integer() else "0.0"
+    return PERCENT_FMT if _is_rate_key(key) else money_fmt
+
+
+def _year_labels(report: ValuationReport, years: list) -> list[str]:
+    """Column headers for a projection table.
+
+    Calendar years render as "FY 2025". Relative indices (the DCF numbers its
+    forecast 1..n from the latest fiscal year) are mapped onto that fiscal year
+    when it is known, so the DCF and FCFE tables label the same periods alike;
+    otherwise they render as "Year 1".
+    """
+    fin = getattr(report.company, "financials", None)
+    fys = [int(y) for y in (getattr(fin, "fiscal_years", None) or []) if is_num(y)]
+    last_fy = fys[-1] if fys else None
+    labels = []
+    for y in years:
+        if is_num(y) and y >= 1000:
+            labels.append(f"FY {int(y)}")
+        elif is_num(y) and last_fy is not None:
+            labels.append(f"FY {last_fy + int(y)}")
+        else:
+            labels.append(f"Year {y}")
+    return labels
 
 
 # --------------------------------------------------------------------------- #
@@ -162,19 +273,28 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     _header_row(ws, row, ["Method", "Implied price", "Upside vs. current"])
     row += 1
 
-    def _method_line(label: str, implied: object) -> None:
+    # Methods the engine shows for reference but leaves out of the blended
+    # target (e.g. a bank's DCF and FCFE), keyed by its summary method name.
+    summary = getattr(report, "summary", None) or {}
+    excluded = summary.get("excluded_from_blend") or {}
+
+    def _method_line(label: str, implied: object, key: str) -> None:
         nonlocal row
         imp = _num(implied)
+        if key in excluded:
+            label = f"{label} (not in blend)"
+            _note(ws, row, f"Not in blend: {excluded[key]}", col=4)
         _set(ws, row, 1, label)
         _set(ws, row, 2, imp, fmt=money_fmt, align=_RIGHT)
-        if imp is not None and cur_price is not None:
+        if imp is not None and cur_price:
             # Live upside formula referencing the implied-price cell and current price.
             up_cell = _set(ws, row, 3, f"=B{row}/{current_price_cell}-1",
                            fmt=PERCENT_FMT, align=_RIGHT)
             # Best-effort sign coloring (Excel won't recolor on edit; this is the
-            # value as-computed now -- a "plus", per the contract).
-            up_val = (imp / cur_price - 1.0) if cur_price else None
-            if up_val is not None:
+            # value as-computed now -- a "plus", per the contract). None for a
+            # method left out of the blend or when the engine gives no verdict.
+            up_val = imp / cur_price - 1.0
+            if method_upside_toned(summary, key):
                 up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
         else:
             _set(ws, row, 3, "n/a", align=_RIGHT)
@@ -185,20 +305,21 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     ddm = report.ddm
     fcfe = report.fcfe
 
-    _method_line("DCF (FCFF)", getattr(dcf, "implied_price", None) if dcf else None)
+    _method_line("DCF (FCFF)", getattr(dcf, "implied_price", None) if dcf else None, "DCF")
     comps_med = None
     if comps is not None:
         comps_med = (comps.implied_price_summary or {}).get("median")
-    _method_line("Trading comps (median)", comps_med)
-    _method_line("DDM", getattr(ddm, "implied_price", None) if ddm else None)
-    _method_line("FCFE", getattr(fcfe, "implied_price", None) if fcfe else None)
+    _method_line("Trading comps (median)", comps_med, "Comps (median)")
+    _method_line("DDM", getattr(ddm, "implied_price", None) if ddm else None, "DDM")
+    _method_line("FCFE", getattr(fcfe, "implied_price", None) if fcfe else None, "FCFE")
 
     # Blended target: prefer the engine-computed value on report.summary so the
-    # Excel and HTML headline targets always agree; fall back to the local
-    # median-of-methods only when that key is absent.
-    summary = getattr(report, "summary", None) or {}
-    blended = _num(summary.get("blended_target")) if "blended_target" in summary else None
-    if blended is None:
+    # Excel and HTML headline targets always agree (a None there means no
+    # target, written as 'n/a' or 'No target (supply peers)', never a number);
+    # fall back to the local median-of-methods only when that key is absent.
+    if "blended_target" in summary:
+        blended = _num(summary.get("blended_target"))
+    else:
         method_prices = [
             _num(getattr(dcf, "implied_price", None) if dcf else None),
             _num(comps_med),
@@ -207,9 +328,17 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
         ]
         blended = median([p for p in method_prices if p is not None])
     _set(ws, row, 1, "Blended target (median)", font=_LABEL_FONT)
-    blended_cell = _set(ws, row, 2, _num(blended), fmt=money_fmt, align=_RIGHT)
-    blended_cell.font = _LABEL_FONT
-    if blended is not None and cur_price is not None:
+    blended = _num(blended)
+    if blended is None:
+        # No target: say so in words (never a number), with no upside.
+        _set(ws, row, 2, no_target_text(summary, comps), font=_LABEL_FONT, align=_RIGHT)
+        _set(ws, row, 3, "n/a", align=_RIGHT)
+    else:
+        _set(ws, row, 2, blended, fmt=money_fmt, font=_LABEL_FONT, align=_RIGHT)
+    # The engine withholds the upside (None) when it gives no verdict, e.g. for
+    # a blend that rests on the DDM alone: the target stays, the upside is n/a.
+    withheld = "blended_upside" in summary and _num(summary.get("blended_upside")) is None
+    if blended is not None and cur_price and not withheld:
         up_cell = _set(ws, row, 3, f"=B{row}/{current_price_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
         # Prefer the engine-computed blended_upside for sign-coloring (keeps the
@@ -217,9 +346,14 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
         if "blended_upside" in summary:
             up_val = _num(summary.get("blended_upside"))
         else:
-            up_val = blended / cur_price - 1.0 if cur_price else None
+            up_val = blended / cur_price - 1.0
         if up_val is not None:
             up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
+    elif blended is not None:
+        _set(ws, row, 3, "n/a", align=_RIGHT)
+    row += 1
+    _set(ws, row, 1, "Verdict", font=_LABEL_FONT)
+    _set(ws, row, 2, summary.get("recommendation") or "n/a", align=_RIGHT)
     row += 2
 
     # --- Football-field ranges -------------------------------------------- #
@@ -249,12 +383,37 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
             _note(ws, row, f"• {w}")
             row += 1
 
-    _set_widths(ws, {1: 28, 2: 18, 3: 18, 4: 18})
+    # Column B is wide enough for the bold, right-aligned 'No target (supply
+    # peers)', which cannot overflow into column A's label.
+    _set_widths(ws, {1: 28, 2: 26, 3: 18, 4: 18})
 
 
 # --------------------------------------------------------------------------- #
 #  Sheet: DCF
 # --------------------------------------------------------------------------- #
+def _beta_label(report: ValuationReport) -> tuple[str, Optional[str]]:
+    """(row label, note) for the DCF's beta.
+
+    The market data Blume-adjusts Yahoo's beta toward 1 (``BLUME_FORMULA``) and
+    keeps the raw figure (``MarketData.raw_beta``; the WACC records it as
+    ``detail['beta_raw']``), so an adjusted beta reads 'Beta (adj.)' with the
+    raw value in a note. The HTML report's Key assumptions say the same.
+    """
+    wacc = getattr(getattr(report, "dcf", None), "wacc", None)
+    beta = getattr(wacc, "beta", None)
+    detail = getattr(wacc, "detail", None) or {}
+    if detail.get("beta_source") == "DEFAULT_BETA":
+        return "Beta (default)", "No usable market beta."
+    raw = detail.get("beta_raw")
+    if not is_num(raw):
+        raw = getattr(getattr(report.company, "market", None), "raw_beta", None)
+    if is_num(beta) and is_num(raw) and abs(float(raw) - float(beta)) > 1e-9:
+        return "Beta (adj.)", f"Raw beta {float(raw):.3f}, {BLUME_NOTE}"
+    if "adjusted" in str(detail.get("beta_source") or ""):
+        return "Beta (adj.)", "Adjusted by the market data (see the notes)."
+    return "Beta", None
+
+
 def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _title(ws, "Discounted Cash Flow (Unlevered FCFF)")
     dcf = report.dcf
@@ -278,28 +437,43 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, row, 2, wacc_val, fmt=PERCENT_FMT, align=_RIGHT)
     row += 1
     if wacc_res is not None:
+        beta_label, beta_note = _beta_label(report)
         for label, attr, fmt in (
             ("Cost of equity", "cost_of_equity", PERCENT_FMT),
             ("After-tax cost of debt", "after_tax_cost_of_debt", PERCENT_FMT),
             ("Weight equity", "weight_equity", PERCENT_FMT),
             ("Weight debt", "weight_debt", PERCENT_FMT),
-            ("Beta", "beta", "0.00"),
+            (beta_label, "beta", "0.00"),
         ):
             _set(ws, row, 1, label)
             _set(ws, row, 2, _num(getattr(wacc_res, attr, None)), fmt=fmt, align=_RIGHT)
+            if attr == "beta" and beta_note:
+                _note(ws, row, beta_note, col=3)
             row += 1
 
     # Selected assumption-dict entries (terminal method/growth, tax, mid-year).
     term_method = assumptions.get("terminal_method")
-    term_growth = assumptions.get("terminal_growth")
+    # The growth actually used (the model clamps it below WACC when needed).
+    term_growth = assumptions.get("terminal_growth_used", assumptions.get("terminal_growth"))
     tax_rate = assumptions.get("tax_rate")
     mid_year = assumptions.get("mid_year_convention")
     _set(ws, row, 1, "Terminal method")
     _set(ws, row, 2, str(term_method) if term_method is not None else "n/a", align=_RIGHT)
     row += 1
+    # The multiple that sets an exit-multiple terminal value (and centres the
+    # exit EV/EBITDA sensitivity axis).
+    exit_mult = assumptions.get("exit_ev_ebitda")
+    if term_method == "exit_multiple" and is_num(exit_mult):
+        _set(ws, row, 1, "Exit EV/EBITDA")
+        _set(ws, row, 2, _num(exit_mult), fmt=MULTIPLE_FMT, align=_RIGHT)
+        row += 1
     _set(ws, row, 1, "Terminal growth")
     term_growth_cell_ref = f"B{row}"
     _set(ws, row, 2, _num(term_growth), fmt=PERCENT_FMT, align=_RIGHT)
+    if term_method == "exit_multiple":
+        # The multiple alone sets this DCF's terminal value; the growth rate
+        # still ends the revenue-growth fade and drives DDM and FCFE.
+        _note(ws, row, EXIT_MULTIPLE_GROWTH_NOTE, col=3)
     row += 1
     _set(ws, row, 1, "Tax rate")
     _set(ws, row, 2, _num(tax_rate), fmt=PERCENT_FMT, align=_RIGHT)
@@ -325,7 +499,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
 
     # Header: metric label column + one column per forecast year.
     _header_row(ws, table_top, ["(values in reporting currency)"]
-                + [f"FY {y}" for y in years])
+                + _year_labels(report, years))
     # Column index of the first data year (column 2 = "B").
     first_year_col = 2
 
@@ -349,7 +523,9 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
         else:
             prev = get_column_letter(col - 1)
             cur = get_column_letter(col)
-            _set(ws, r_growth, col, f"={cur}{r_rev}/{prev}{r_rev}-1",
+            # Guarded: the model projects zero revenue when it has no base.
+            _set(ws, r_growth, col,
+                 f'=IF({prev}{r_rev}=0,"",{cur}{r_rev}/{prev}{r_rev}-1)',
                  fmt=PERCENT_FMT, align=_RIGHT)
 
     r_ebit = body + 2
@@ -359,7 +535,8 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, r_margin, 1, "  EBIT margin %", font=_LABEL_FONT)
     for j in range(n):
         col = get_column_letter(first_year_col + j)
-        _set(ws, r_margin, first_year_col + j, f"={col}{r_ebit}/{col}{r_rev}",
+        _set(ws, r_margin, first_year_col + j,
+             f'=IF({col}{r_rev}=0,"",{col}{r_ebit}/{col}{r_rev})',
              fmt=PERCENT_FMT, align=_RIGHT)
 
     r_nopat = body + 4
@@ -442,9 +619,22 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     net_debt_cell = f"B{row}"
     row += 1
 
-    # Equity value = EV - net debt  (LIVE formula).
+    # The model bridges EV to common equity through every senior claim, not just
+    # net debt (models/dcf.py): minority interest and preferred equity too.
+    bs = getattr(report.company, "balance_sheet", None)
+    claim_cells = []
+    for label, attr in (("Less: minority interest", "minority_interest"),
+                        ("Less: preferred equity", "preferred_equity")):
+        claim = _num(getattr(bs, attr, None)) if bs is not None else None
+        _set(ws, row, 1, label, font=_LABEL_FONT)
+        _set(ws, row, 2, claim if claim is not None else 0.0, fmt=money_fmt, align=_RIGHT)
+        claim_cells.append(f"B{row}")
+        row += 1
+
+    # Equity value = EV - net debt - minority - preferred  (LIVE formula).
     _set(ws, row, 1, "Equity value", font=_LABEL_FONT)
-    _set(ws, row, 2, f"={ev_cell}-{net_debt_cell}", fmt=money_fmt, align=_RIGHT)
+    _set(ws, row, 2, f"={ev_cell}-{net_debt_cell}-" + "-".join(claim_cells),
+         fmt=money_fmt, align=_RIGHT)
     equity_cell = f"B{row}"
     row += 1
 
@@ -479,7 +669,8 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
                        fmt=PERCENT_FMT, align=_RIGHT)
     else:
         up_cell = _set(ws, row, 2, up_val, fmt=PERCENT_FMT, align=_RIGHT)
-    if up_val is not None:
+    # Uncoloured for a reference-only DCF or when the engine gives no verdict.
+    if up_val is not None and method_upside_toned(report.summary, "DCF"):
         up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
 
     _set_widths(ws, {1: 26, **{c: 16 for c in range(2, max(3, n + 2))}})
@@ -629,8 +820,17 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
                     # Classify by KEY NAME, not magnitude: a $0.96 dividend or an
                     # $0.85 per-share PV must not render as "96.0%"/"85.0%". Only
                     # keys whose name signals a rate get the percent mask.
-                    fmt = PERCENT_FMT if _is_rate_key(key) else money_fmt
-                    _set(ws, row, 2, float(val), fmt=fmt, align=_RIGHT)
+                    _set(ws, row, 2, float(val), fmt=_detail_fmt(key, val, money_fmt),
+                         align=_RIGHT)
+                elif isinstance(val, (list, tuple)) and val and all(is_num(v) for v in val):
+                    # Per-year series (dividends, stage PVs): one value per column.
+                    for j, v in enumerate(val):
+                        _set(ws, row, 2 + j, float(v),
+                             fmt=_detail_fmt(key, v, money_fmt), align=_RIGHT)
+                elif isinstance(val, (list, tuple)):
+                    # Text lists (notes): readable text, not a Python repr.
+                    text = "; ".join(str(v) for v in val) if val else "none"
+                    _set(ws, row, 2, text, align=_RIGHT)
                 else:
                     _set(ws, row, 2, str(val), align=_RIGHT)
                 row += 1
@@ -655,7 +855,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     pv_series = list(getattr(fcfe, "pv_fcfe", []) or [])
 
     # Projection table: metrics as rows, forecast years as columns.
-    _header_row(ws, row, ["(reporting currency)"] + [f"FY {y}" for y in years])
+    _header_row(ws, row, ["(reporting currency)"] + _year_labels(report, years))
     table_top = row
     first_col = 2
     row += 1
@@ -733,7 +933,8 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     if cur_p:
         up_cell = _set(ws, row, 2, f"={implied_cell}/{current_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
-        if imp is not None:
+        # Uncoloured for a reference-only FCFE or when the engine gives no verdict.
+        if imp is not None and method_upside_toned(report.summary, "FCFE"):
             up_cell.font = _GREEN_FONT if (imp / cur_p - 1.0) >= 0 else _RED_FONT
     else:
         _set(ws, row, 2, None, fmt=PERCENT_FMT, align=_RIGHT)
@@ -744,6 +945,76 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
 # --------------------------------------------------------------------------- #
 #  Sheet: Sensitivity
 # --------------------------------------------------------------------------- #
+_RATE_AXIS_TOKENS = ("wacc", "growth", "margin", "rate", "discount")
+
+# Why a sensitivity cell can be blank (models/sensitivity.py stores NaN for a
+# cell it cannot price at its own row/column inputs). The HTML report shows the
+# same text under its heatmaps.
+BLANK_SENSITIVITY_CELL_NOTE = (
+    "Blank cell = no valid DCF price at those inputs: terminal growth too close "
+    "to WACC, a non-positive WACC the model would replace with its fallback rate, "
+    "an exit multiple of zero or less, or no base EBIT margin to vary."
+)
+
+
+def _is_multiple_axis(label: object) -> bool:
+    """True for a sensitivity axis that varies a valuation multiple.
+
+    The shared contract: labels containing 'EV/EBITDA' or 'multiple' (e.g. the
+    'Exit EV/EBITDA' axis of an exit-multiple DCF grid) hold multiples such as
+    12.0; every other axis the engine builds holds a decimal rate.
+    """
+    low = str(label or "").lower()
+    return "ev/ebitda" in low or "multiple" in low
+
+
+def _axis_fmt(label: object, value: object) -> str:
+    """Number format for one sensitivity axis level, chosen by the axis label.
+
+    Multiple axes -> 12.0x; rate axes (WACC, growth, margin) -> percent whatever
+    the magnitude, so a -152% margin does not show as -1.52. Only an axis with
+    an unrecognised label falls back on magnitude (|x| < 1 -> percent).
+    """
+    if _is_multiple_axis(label):
+        return MULTIPLE_FMT
+    low = str(label or "").lower()
+    if any(tok in low for tok in _RATE_AXIS_TOKENS):
+        return PERCENT_FMT
+    return PERCENT_FMT if (is_num(value) and abs(float(value)) < 1) else "0.00"
+
+
+def _axis_value(value: object) -> object:
+    """An axis level for writing: the number, or 'n/a' when it is missing."""
+    num = _num(value)
+    return "n/a" if num is None else num
+
+
+def _base_case_cell(sens: object, report: ValuationReport) -> Optional[tuple[int, int]]:
+    """(row, col) of a grid's centre cell when it is the headline DCF case.
+
+    The centre of an odd-sized grid holds the unshifted inputs, so it should
+    reproduce the headline DCF implied price. When it does not (e.g. a Gordon
+    grid shown beside an exit-multiple headline, or a missing centre cell) it
+    is not the base case, and None is returned so nothing is highlighted.
+    """
+    dcf = getattr(report, "dcf", None)
+    headline = getattr(dcf, "implied_price", None) if dcf is not None else None
+    rows = list(getattr(sens, "row_values", None) or [])
+    cols = list(getattr(sens, "col_values", None) or [])
+    grid = list(getattr(sens, "grid", None) or [])
+    if not is_num(headline) or len(rows) % 2 == 0 or len(cols) % 2 == 0:
+        return None
+    i, j = len(rows) // 2, len(cols) // 2
+    grid_row = grid[i] if i < len(grid) else None
+    cell = grid_row[j] if grid_row and j < len(grid_row) else None
+    if not is_num(cell):
+        return None
+    headline = float(headline)
+    if abs(float(cell) - headline) > max(1e-6, 1e-6 * abs(headline)):
+        return None
+    return i, j
+
+
 def _write_sensitivity(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _title(ws, "Sensitivity Analysis")
     sensitivities = report.sensitivities or []
@@ -776,27 +1047,39 @@ def _write_sensitivity(ws: Worksheet, report: ValuationReport, money_fmt: str) -
         corner = _set(ws, row, 1, f"{row_label} \\ {col_label}",
                       font=_HEADER_FONT, align=_CENTER)
         corner.fill = _HEADER_FILL
-        # Column headers are the axis *levels* (rates/margins/multiples).
-        # Heuristic format: |level| < 1 -> percent, else plain multiple.
+        # Column headers are the axis *levels*, formatted by the axis label
+        # (rates -> percent, EV/EBITDA multiples -> 12.0x).
         for j, cval in enumerate(col_values):
-            cell = _set(ws, row, 2 + j, _num(cval),
-                        fmt=PERCENT_FMT if (is_num(cval) and abs(float(cval)) < 1)
-                        else "0.00",
+            cell = _set(ws, row, 2 + j, _axis_value(cval),
+                        fmt=_axis_fmt(col_label, cval),
                         font=_HEADER_FONT, align=_CENTER)
             cell.fill = _HEADER_FILL
         row += 1
 
-        # Body rows: row-axis level in column 1, then implied prices.
+        # Body rows: row-axis level in column 1, then implied prices. The
+        # centre cell is marked as the base case only when it reproduces the
+        # headline DCF price.
+        base_cell = _base_case_cell(sens, report)
+        has_blank = False
         for i, rval in enumerate(row_values):
-            rcell = _set(ws, row, 1, _num(rval),
-                         fmt=PERCENT_FMT if (is_num(rval) and abs(float(rval)) < 1)
-                         else "0.00", font=_LABEL_FONT, align=_RIGHT)
+            rcell = _set(ws, row, 1, _axis_value(rval), fmt=_axis_fmt(row_label, rval),
+                         font=_LABEL_FONT, align=_RIGHT)
             rcell.fill = PatternFill("solid", fgColor="D9E1F2")
             grid_row = grid[i] if i < len(grid) else []
             for j in range(ncols):
                 val = grid_row[j] if j < len(grid_row) else None
-                # NaN (failed cell) -> blank rather than the literal "nan".
-                _set(ws, row, 2 + j, _num(val), fmt=money_fmt, align=_RIGHT)
+                # NaN/None (invalid combination) -> blank, not the literal "nan".
+                cell = _set(ws, row, 2 + j, _num(val), fmt=money_fmt, align=_RIGHT)
+                has_blank = has_blank or cell.value is None
+                if base_cell == (i, j):
+                    cell.font = _LABEL_FONT
+                    cell.fill = _BASE_CASE_FILL
+            row += 1
+        if base_cell is not None:
+            _note(ws, row, "Highlighted cell = headline DCF (base case).")
+            row += 1
+        if has_blank:
+            _note(ws, row, BLANK_SENSITIVITY_CELL_NOTE)
             row += 1
         row += 2  # spacer between grids
 
@@ -815,8 +1098,9 @@ def write_excel(report: ValuationReport, path: str) -> str:
     Sheets: Summary, DCF, Comps, DDM_FCFE, Sensitivity. Every model section is
     guarded against being None and degrades to a human-readable "not available"
     note. Live Excel formulas are used where practical (PV = FCFF*DF,
-    EV = SUM(PVs)+PV_TV, equity = EV - net debt, implied = equity/shares,
-    upside = implied/current - 1) so the workbook recalculates on user edits.
+    EV = SUM(PVs)+PV_TV, equity = EV - net debt - minority interest - preferred
+    equity, implied = equity/shares, upside = implied/current - 1) so the
+    workbook recalculates on user edits.
     """
     money_fmt = _money_fmt(report)
 
@@ -830,11 +1114,17 @@ def write_excel(report: ValuationReport, path: str) -> str:
     ws_sens = wb.create_sheet("Sensitivity")
 
     # Each writer is independently guarded; one bad section must not sink the file.
-    _write_summary(ws_summary, report, money_fmt)
-    _write_dcf(ws_dcf, report, money_fmt)
-    _write_comps(ws_comps, report, money_fmt)
-    _write_ddm_fcfe(ws_ddm, report, money_fmt)
-    _write_sensitivity(ws_sens, report, money_fmt)
+    for writer, ws in (
+        (_write_summary, ws_summary),
+        (_write_dcf, ws_dcf),
+        (_write_comps, ws_comps),
+        (_write_ddm_fcfe, ws_ddm),
+        (_write_sensitivity, ws_sens),
+    ):
+        try:
+            writer(ws, report, money_fmt)
+        except Exception as exc:  # noqa: BLE001 - degrade to a note on that sheet
+            _note(ws, ws.max_row + 2, f"This section could not be written: {exc}")
 
     wb.save(path)
     return path

@@ -14,28 +14,96 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from equity_valuation.report.excel import no_target_text
+from equity_valuation.utils import is_num
 
 from .valuation_service import run_valuation_report
 
 _OUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
 _SYM = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥"}
+_AUTHOR = "Equity Research Automation"
 
 
 def _money(x, cur="USD", dec=2) -> str:
-    if x is None:
+    if not is_num(x):
         return "n/a"
-    return f"{_SYM.get(cur, '')}{x:,.{dec}f}"
+    sign = "-" if x < 0 else ""
+    return f"{sign}{_SYM.get(cur, '')}{abs(x):,.{dec}f}"
+
+
+def _cap(x) -> str:
+    """Compact market cap for the comps table: 2,345B / 3.4B / 300M."""
+    if not is_num(x) or x == 0:
+        return "n/a"
+    if abs(x) >= 1e10:
+        return f"{x / 1e9:,.0f}B"
+    if abs(x) >= 1e9:
+        return f"{x / 1e9:.1f}B"
+    if abs(x) >= 1e6:
+        return f"{x / 1e6:,.0f}M"
+    return f"{x:,.0f}"
+
+
+def _set_core_properties(props, title: str) -> None:
+    """Replace the python-docx/python-pptx template metadata (third-party
+    author, 2013 dates, 'generated using ...' comment) with our own."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    props.title = title
+    props.author = _AUTHOR
+    props.last_modified_by = _AUTHOR
+    props.created = now
+    props.modified = now
+    props.comments = ""
+    props.subject = ""
+    props.keywords = ""
+    props.category = ""
+    props.revision = 1
 
 
 def _pct(x, signed=False) -> str:
-    if x is None:
+    if not is_num(x):
         return "n/a"
     s = "+" if (signed and x > 0) else ""
     return f"{s}{x * 100:.1f}%"
+
+
+def _blended_target(summary: dict, cur: str, comps=None) -> str:
+    """The blended target, or why there is none (never a made-up figure):
+    'No target (supply peers)' or 'n/a', by the rule the Excel and HTML
+    reports share (``no_target_text``; ``comps`` is the report's CompsResult)."""
+    if is_num(summary.get("blended_target")):
+        return _money(summary["blended_target"], cur)
+    return no_target_text(summary, comps)
+
+
+def _blended_upside(summary: dict) -> str:
+    """The engine's blended upside; 'n/a' without a target, or when the
+    verdict is withheld (the engine then returns None)."""
+    if not is_num(summary.get("blended_target")):
+        return "n/a"
+    return _pct(summary.get("blended_upside"), signed=True)
+
+
+def _headline(summary: dict, cur: str, comps=None) -> str:
+    """'blended fair value $32.40 (-20.7%)', '... $20.87 (upside n/a)' or
+    'blended fair value: No target (supply peers)'."""
+    target = _blended_target(summary, cur, comps)
+    if not is_num(summary.get("blended_target")):
+        return f"blended fair value: {target}"
+    upside = _blended_upside(summary)
+    return f"blended fair value {target} ({'upside n/a' if upside == 'n/a' else upside})"
+
+
+def _method_label(summary: dict, name: str) -> str:
+    """A method's table label, marked when the engine left it out of the blended
+    target (e.g. a bank's DCF and FCFE, shown for reference only)."""
+    excluded = summary.get("excluded_from_blend") or {}
+    return f"{name} (not in blend)" if name in excluded else name
 
 
 def _safe(name: str) -> str:
@@ -89,8 +157,7 @@ def export_memo(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     meta = doc.add_paragraph()
     run = meta.add_run(
         f"Prepared {date.today().isoformat()} · price {_money(s.get('current_price'), cur)} · "
-        f"blended fair value {_money(s.get('blended_target'), cur)} "
-        f"({_pct(s.get('blended_upside'), signed=True)}) · model verdict: {s.get('recommendation')}"
+        f"{_headline(s, cur, report.comps)} · model verdict: {s.get('recommendation') or 'n/a'}"
     )
     run.font.color.rgb = RGBColor(0x60, 0x70, 0x8A)
 
@@ -107,20 +174,45 @@ def export_memo(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     price = s.get("current_price")
     for name, val in methods.items():
         row = table.add_row().cells
-        row[0].text = name
+        row[0].text = _method_label(s, name)
         row[1].text = _money(val, cur)
         row[2].text = _pct((val / price - 1) if (val and price) else None, signed=True)
     row = table.add_row().cells
     row[0].text = "Blended target"
-    row[1].text = _money(s.get("blended_target"), cur)
-    row[2].text = _pct(s.get("blended_upside"), signed=True)
+    row[1].text = _blended_target(s, cur, report.comps)
+    row[2].text = _blended_upside(s)
+    excluded = s.get("excluded_from_blend") or {}
+    if excluded:
+        doc.add_paragraph(
+            "Not in the blended target: "
+            + "; ".join(f"{name} ({why})" for name, why in excluded.items()) + "."
+        )
 
     # --- key assumptions ------------------------------------------------------ #
     doc.add_heading("Key model assumptions", level=1)
     wacc = report.dcf.wacc.wacc if report.dcf else None
+    dcf_used = (report.dcf.assumptions or {}) if report.dcf else {}
+    # The method the DCF actually applied (it falls back to Gordon when no
+    # exit multiple is given).
+    method = dcf_used.get("terminal_method") or echo.get("terminal_method")
+    # The growth the DCF actually used; it clamps the input below WACC.
+    g_used = dcf_used.get("terminal_growth_used", echo.get("terminal_growth"))
+    horizon = (
+        f"Forecast horizon: {echo.get('forecast_years')} years · terminal growth "
+        f"{_pct(g_used)} ({method})"
+    )
+    exit_mult = dcf_used.get("exit_ev_ebitda", echo.get("exit_ev_ebitda"))
+    if method == "exit_multiple" and is_num(exit_mult):
+        # The multiple alone sets the DCF terminal value; the growth rate still
+        # ends the revenue-growth fade and drives DDM and FCFE.
+        horizon = (
+            f"Forecast horizon: {echo.get('forecast_years')} years · terminal value at "
+            f"exit EV/EBITDA {exit_mult:.1f}x · terminal growth {_pct(g_used)} "
+            "(revenue fade, DDM and FCFE; not the DCF terminal value)"
+        )
     bullets = [
         f"WACC: {_pct(wacc)} · risk-free {_pct(echo.get('rf'))} · ERP {_pct(echo.get('erp'))}",
-        f"Forecast horizon: {echo.get('forecast_years')} years · terminal growth {_pct(echo.get('terminal_growth'))} ({echo.get('terminal_method')})",
+        horizon,
     ]
     if echo.get("revenue_growth_y1") is not None:
         bullets.append(f"Year-1 revenue growth: {_pct(echo.get('revenue_growth_y1'))} (fading to terminal)")
@@ -170,6 +262,10 @@ def export_memo(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     r.italic = True
     r.font.size = Pt(8.5)
 
+    _set_core_properties(
+        doc.core_properties,
+        title or f"{s.get('name')} ({s.get('ticker')}) — Research Memo",
+    )
     path = _ensure_out() / f"{_safe(ticker.upper())}_research_memo.docx"
     doc.save(str(path))
     return str(path)
@@ -236,10 +332,11 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     text(sl, 0.7, 3.3, 11.9, 0.6,
          f"Valuation briefing · {date.today().isoformat()}", 18, False, DIM)
     verdict = s.get("recommendation") or "n/a"
-    vcolor = GREEN if verdict == "Undervalued" else ROSE if verdict == "Overvalued" else AMBER
+    # No colour when no verdict is given (no target, or a withheld verdict).
+    vcolor = {"Undervalued": GREEN, "Overvalued": ROSE, "Fairly valued": AMBER}.get(verdict, DIM)
     text(sl, 0.7, 4.2, 11.9, 0.6,
-         f"Price {_money(price, cur)} · blended fair value {_money(s.get('blended_target'), cur)} "
-         f"({_pct(s.get('blended_upside'), signed=True)}) · {verdict}", 18, True, vcolor)
+         f"Price {_money(price, cur)} · {_headline(s, cur, report.comps)} · {verdict}",
+         18, True, vcolor)
 
     # --- slide 2: method summary ------------------------------------------------- #
     sl = add_slide()
@@ -251,12 +348,12 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     tbl.cell(0, 0).text, tbl.cell(0, 1).text, tbl.cell(0, 2).text = (
         "Method", "Implied value", "Vs. price")
     for i, (name, val) in enumerate(methods, start=1):
-        tbl.cell(i, 0).text = name
+        tbl.cell(i, 0).text = _method_label(s, name)
         tbl.cell(i, 1).text = _money(val, cur)
         tbl.cell(i, 2).text = _pct((val / price - 1) if (val and price) else None, signed=True)
     tbl.cell(rows - 1, 0).text = "Blended target"
-    tbl.cell(rows - 1, 1).text = _money(s.get("blended_target"), cur)
-    tbl.cell(rows - 1, 2).text = _pct(s.get("blended_upside"), signed=True)
+    tbl.cell(rows - 1, 1).text = _blended_target(s, cur, report.comps)
+    tbl.cell(rows - 1, 2).text = _blended_upside(s)
 
     # --- slide 3: football field --------------------------------------------------- #
     rows_ff = report.football_field or []
@@ -310,8 +407,7 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
             tbl.cell(0, j).text = h
         for i, rrow in enumerate(rows_c, start=1):
             tbl.cell(i, 0).text = rrow.ticker + (" (target)" if i == 1 else "")
-            tbl.cell(i, 1).text = (
-                f"{rrow.market_cap / 1e9:,.0f}B" if rrow.market_cap else "n/a")
+            tbl.cell(i, 1).text = _cap(rrow.market_cap)
             for j, attr in enumerate(["ev_ebitda", "ev_sales", "pe", "pb"], start=2):
                 v = getattr(rrow, attr)
                 tbl.cell(i, j).text = f"{v:.1f}x" if v else "n/a"
@@ -335,6 +431,10 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
          "Generated by Equity Research Automation — model estimates driven by user "
          "assumptions. Research support, not investment advice.", 14, False, DIM)
 
+    _set_core_properties(
+        prs.core_properties,
+        f"{s.get('name')} ({s.get('ticker')}) — Valuation Briefing",
+    )
     path = _ensure_out() / f"{_safe(ticker.upper())}_briefing.pptx"
     prs.save(str(path))
     return str(path)

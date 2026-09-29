@@ -15,6 +15,7 @@ import type {
   TranscriptMeta,
   WatchlistItem,
 } from "./types";
+import { fmtBytes } from "./format";
 
 // In the desktop (Electron) app the backend runs on a dynamic port that the
 // shell injects as ?api=<port>. Next.js bakes rewrites() at build time, so the
@@ -33,22 +34,115 @@ export function apiUrl(path: string): string {
   return `${apiBase()}${path}`;
 }
 
+// Readable message for a failed response. FastAPI sends {"detail": "..."} for
+// HTTPException but a list of {loc, msg, type} objects for 422 validation
+// errors, which would otherwise surface as "[object Object]".
+export async function errorDetail(res: Response): Promise<string> {
+  const fallback = `${res.status} ${res.statusText}`.trim();
+  let d: unknown;
+  try {
+    d = (await res.json())?.detail;
+  } catch {
+    return fallback; // non-JSON body (e.g. a proxy error page)
+  }
+  if (typeof d === "string") return d || fallback;
+  if (Array.isArray(d)) {
+    const msgs = d.map((x) => {
+      if (x && typeof x === "object" && typeof x.msg === "string") {
+        const loc = Array.isArray(x.loc)
+          ? x.loc.filter((p: unknown) => p !== "body").join(".")
+          : "";
+        return loc ? `${loc}: ${x.msg}` : x.msg;
+      }
+      return typeof x === "string" ? x : JSON.stringify(x);
+    });
+    return msgs.join("; ") || fallback;
+  }
+  if (d && typeof d === "object") {
+    const o = d as Record<string, unknown>;
+    const m = o.message ?? o.msg ?? o.detail;
+    return typeof m === "string" && m ? m : JSON.stringify(d);
+  }
+  return d == null ? fallback : String(d);
+}
+
+// --- request size ------------------------------------------------------------ //
+// The backend caps request bodies by route and answers 413 above the cap:
+// /api/ai/* carries base64 PDFs and takes up to 50 MiB, which is also the Next
+// proxy's cap (middlewareClientMaxBodySize in next.config.mjs); every other
+// route takes plain JSON and up to 8 MiB. Checking here fails fast, before a
+// large upload, with a message that says what to do. The limits are decimal
+// (1 MB = 1,000,000 bytes, as file browsers usually show sizes), so they sit
+// just below the server caps. PDFs travel base64-encoded inside the JSON
+// body, so each one costs about 4/3 of its file size.
+export const MAX_UPLOAD_BYTES = 50_000_000;
+const MAX_JSON_BYTES = 8_000_000;
+
+// UTF-8 size of a request body as sent.
+export function jsonBytes(body: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(body)).length;
+}
+
+// Size a file of `n` bytes takes once base64-encoded.
+export function base64Bytes(n: number): number {
+  return 4 * Math.ceil(n / 3);
+}
+
+// Split picked files into those that fit the upload cap and those refused
+// (with a message for each), given the bytes the rest of the request already
+// takes. Only sizes are read, so an oversized file is refused before it is
+// loaded or uploaded.
+export function planPdfAttachments<
+  F extends { name: string; size: number; type: string },
+>(files: F[], usedBytes: number): { accepted: F[]; refused: string[] } {
+  let used = usedBytes;
+  const accepted: F[] = [];
+  const refused: string[] = [];
+  for (const f of files) {
+    if (f.type !== "application/pdf" && !/\.pdf$/i.test(f.name)) {
+      refused.push(`"${f.name}" is not a PDF.`);
+      continue;
+    }
+    // Encoded payload plus its JSON framing ({"name": ..., "data_base64": ...}).
+    const cost = base64Bytes(f.size) + jsonBytes(f.name) + 32;
+    if (used + cost > MAX_UPLOAD_BYTES) {
+      const room = Math.max(0, Math.floor(((MAX_UPLOAD_BYTES - used) * 3) / 4));
+      refused.push(
+        `"${f.name}" (${fmtBytes(f.size)}) was not attached: an upload is limited to ${fmtBytes(
+          MAX_UPLOAD_BYTES
+        )} and PDFs grow by a third when encoded, so about ${fmtBytes(
+          room
+        )} of PDF can still be attached.`
+      );
+      continue;
+    }
+    used += cost;
+    accepted.push(f);
+  }
+  return { accepted, refused };
+}
+
+function checkRequestSize(path: string, bytes: number): void {
+  const upload = path.startsWith("/api/ai/");
+  const limit = upload ? MAX_UPLOAD_BYTES : MAX_JSON_BYTES;
+  if (bytes <= limit) return;
+  throw new Error(
+    `This request is ${fmtBytes(bytes)}, over the ${fmtBytes(limit)} limit. ` +
+      (upload
+        ? "Remove or shrink attached PDFs (or trim the research log) and try again."
+        : "Trim the research log and try again.")
+  );
+}
+
 async function postJSON<T>(path: string, body: unknown): Promise<T> {
+  const payload = JSON.stringify(body);
+  checkRequestSize(path, new TextEncoder().encode(payload).length);
   const res = await fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: payload,
   });
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const j = await res.json();
-      if (j?.detail) detail = j.detail;
-    } catch {
-      /* keep status text */
-    }
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await errorDetail(res));
   return res.json() as Promise<T>;
 }
 
@@ -102,13 +196,7 @@ export async function postChat(args: {
 // --- filings & transcripts -------------------------------------------------- //
 export async function fetchFilings(ticker: string): Promise<FilingsList> {
   const res = await fetch(apiUrl(`/api/filings/${encodeURIComponent(ticker)}`));
-  if (!res.ok) {
-    let detail = `${res.status}`;
-    try {
-      detail = (await res.json())?.detail ?? detail;
-    } catch {}
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await errorDetail(res));
   return res.json() as Promise<FilingsList>;
 }
 
@@ -170,6 +258,30 @@ export async function postResearchNote(args: {
 
 export type ExportKind = "excel" | "html" | "memo" | "deck";
 
+// Fallback names match the backend's own (used when the Content-Disposition
+// header isn't readable, e.g. cross-origin in the desktop app).
+const EXPORT_NAMES: Record<ExportKind, string> = {
+  excel: "valuation.xlsx",
+  html: "valuation.html",
+  memo: "research_memo.docx",
+  deck: "briefing.pptx",
+};
+
+function filenameFromDisposition(h: string | null): string | null {
+  if (!h) return null;
+  const star = /filename\*\s*=\s*[\w-]*'[^']*'([^;]+)/i.exec(h);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      /* fall through to the plain filename */
+    }
+  }
+  const plain = /filename\s*=\s*(?:"([^"]+)"|([^;]+))/i.exec(h);
+  const name = (plain?.[1] ?? plain?.[2] ?? "").trim();
+  return name || null;
+}
+
 export async function downloadExport(
   kind: ExportKind,
   ticker: string,
@@ -181,18 +293,13 @@ export async function downloadExport(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ticker, note: note ?? null, ...assumptions }),
   });
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      detail = (await res.json())?.detail ?? detail;
-    } catch {}
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await errorDetail(res));
   const blob = await res.blob();
-  const ext = { excel: "xlsx", html: "html", memo: "docx", deck: "pptx" }[kind];
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `${ticker}_${kind === "excel" ? "valuation" : kind}.${ext}`;
+  a.download =
+    filenameFromDisposition(res.headers.get("Content-Disposition")) ??
+    `${ticker}_${EXPORT_NAMES[kind]}`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -225,7 +332,9 @@ export async function fetchResearchState(
   const res = await fetch(
     apiUrl(`/api/research_state/${encodeURIComponent(ticker)}`)
   );
-  if (!res.ok) return {};
+  // A never-seen ticker is 200 {}; anything else is a failed read, and must
+  // not look like an empty state (autosave would then wipe the saved one).
+  if (!res.ok) throw new Error(`research state: ${await errorDetail(res)}`);
   return res.json();
 }
 

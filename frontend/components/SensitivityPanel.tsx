@@ -4,11 +4,24 @@
 // rendered as a color-coded HTML table (price implied at row/col axis pairs).
 // Green = undervalued (price above current), rose = overvalued. Follows the
 // structure, density, and color usage of ValuationSummary.
+//
+// Grids come in two kinds: WACC x terminal growth (Gordon DCF) and WACC x
+// exit EV/EBITDA (exit-multiple DCF). Axes are formatted by their label, a
+// null cell is an invalid combination ("n/a"), and the centre cell is ringed
+// as the base case only when it reproduces the headline DCF price.
 
 import React from "react";
 import type { Report, Sensitivity } from "@/lib/types";
-import { fmtMoney, fmtPct } from "@/lib/format";
+import { fmtMoney } from "@/lib/format";
+import { baseCaseCell, fmtAxis } from "@/lib/sensitivity";
 import { cx, Card, EmptyState } from "@/components/ui";
+
+// Tooltip for a null cell (the engine stores NaN, serialized as null); the
+// same reasons the Excel and HTML reports give under their grids.
+const INVALID_CELL_HINT =
+  "No valid DCF price at these inputs: terminal growth too close to WACC, a " +
+  "non-positive WACC the model would replace with its fallback rate, an exit " +
+  "multiple of zero or less, or no base EBIT margin to vary.";
 
 // Background color for a cell, keyed off upside vs. current price.
 function cellStyle(
@@ -38,10 +51,12 @@ function SensitivityGrid({
   s,
   currentPrice,
   cur,
+  base,
 }: {
   s: Sensitivity;
   currentPrice: number;
   cur: string;
+  base: [number, number] | null;
 }) {
   const rowValues = s.row_values || [];
   const colValues = s.col_values || [];
@@ -56,10 +71,6 @@ function SensitivityGrid({
     );
   }
 
-  // The center cell is the base case — highlight it lightly.
-  const centerRow = Math.floor(rowValues.length / 2);
-  const centerCol = Math.floor(colValues.length / 2);
-
   return (
     <div className="overflow-x-auto">
       <table className="num w-full border-collapse text-xs">
@@ -73,7 +84,7 @@ function SensitivityGrid({
                 key={j}
                 className="whitespace-nowrap border border-line/60 bg-surface-raised px-2.5 py-1.5 text-center text-[11px] font-semibold text-ink-dim"
               >
-                {fmtPct(c)}
+                {fmtAxis(c, s.col_label)}
               </th>
             ))}
           </tr>
@@ -84,21 +95,24 @@ function SensitivityGrid({
             return (
               <tr key={i}>
                 <th className="whitespace-nowrap border border-line/60 bg-surface-raised px-2.5 py-1.5 text-right text-[11px] font-semibold text-ink-dim">
-                  {fmtPct(r)}
+                  {fmtAxis(r, s.row_label)}
                 </th>
                 {colValues.map((_c, j) => {
                   const price = row[j] ?? null;
-                  const isCenter = i === centerRow && j === centerCol;
+                  const valid = typeof price === "number" && Number.isFinite(price);
+                  const isBase = base !== null && i === base[0] && j === base[1];
                   return (
                     <td
                       key={j}
                       style={cellStyle(price, currentPrice)}
+                      title={valid ? undefined : INVALID_CELL_HINT}
                       className={cx(
-                        "whitespace-nowrap border border-line/60 px-2.5 py-1.5 text-center text-ink",
-                        isCenter && "font-semibold ring-1 ring-inset ring-ink/40"
+                        "whitespace-nowrap border border-line/60 px-2.5 py-1.5 text-center",
+                        valid ? "text-ink" : "text-ink-faint",
+                        isBase && "font-semibold ring-1 ring-inset ring-ink/40"
                       )}
                     >
-                      {fmtMoney(price, cur, 0)}
+                      {valid ? fmtMoney(price, cur, 0) : "n/a"}
                     </td>
                   );
                 })}
@@ -115,6 +129,7 @@ export default function SensitivityPanel({ report }: { report: Report }) {
   const grids = report.sensitivities || [];
   const cur = report.summary.currency;
   const currentPrice = report.current_price;
+  const headline = report.dcf?.implied_price;
 
   if (grids.length === 0) {
     return (
@@ -129,19 +144,27 @@ export default function SensitivityPanel({ report }: { report: Report }) {
 
   return (
     <div className="flex flex-col gap-4">
-      {grids.map((s, idx) => (
-        <Card
-          key={s.title || idx}
-          title={s.title}
-          subtitle={`Implied price by ${s.row_label} and ${s.col_label} · shaded vs. current ${fmtMoney(
-            currentPrice,
-            cur,
-            0
-          )}`}
-        >
-          <SensitivityGrid s={s} currentPrice={currentPrice} cur={cur} />
-        </Card>
-      ))}
+      {grids.map((s, idx) => {
+        const base = baseCaseCell(s, headline);
+        return (
+          <Card
+            key={s.title || idx}
+            title={s.title}
+            subtitle={`Implied price by ${s.row_label} and ${s.col_label} · shaded vs. current ${fmtMoney(
+              currentPrice,
+              cur,
+              0
+            )}${base ? " · ringed cell = headline DCF" : ""}`}
+          >
+            <SensitivityGrid
+              s={s}
+              currentPrice={currentPrice}
+              cur={cur}
+              base={base}
+            />
+          </Card>
+        );
+      })}
     </div>
   );
 }

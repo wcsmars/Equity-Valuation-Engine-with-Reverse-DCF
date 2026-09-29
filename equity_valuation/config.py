@@ -8,6 +8,8 @@ engine. Keep all magic numbers here so the models stay clean.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import re
 
 # --- Macro / CAPM defaults (decimals) --------------------------------------- #
 DEFAULT_RISK_FREE_RATE = 0.042       # ~10y US Treasury yield
@@ -39,7 +41,52 @@ SENSITIVITY_EXIT_MULTIPLE_DELTAS = (-2.0, -1.0, 0.0, 1.0, 2.0)    # absolute +/-
 
 # --- HTTP / EDGAR ----------------------------------------------------------- #
 # SEC requires a descriptive User-Agent with contact info on every request.
-SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "").strip()
+PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
+
+def _dotenv_value(raw: str) -> str:
+    """Parse one .env value the way the desktop launcher and `source` do.
+
+    A leading double-quoted token keeps backslash escapes of `"`, `\\`, `$` and
+    `` ` ``; a leading single-quoted token is literal; an unquoted value drops a
+    trailing ` # comment`.
+    """
+    text = raw.strip()
+    double = re.match(r'"((?:[^"\\]|\\.)*)"', text)
+    if double:
+        return re.sub(r'\\(["\\$`])', r"\1", double.group(1))
+    single = re.match(r"'([^']*)'", text)
+    if single:
+        return single.group(1)
+    return re.sub(r"\s+#.*$", "", raw).strip()
+
+
+def _resolve_sec_user_agent(environ=os.environ, env_path: Path = PROJECT_ENV_FILE) -> str:
+    """Return SEC_USER_AGENT from the environment, else from the project .env.
+
+    The .env file is parsed like the desktop launcher parses it: blank and `#`
+    lines are skipped, an optional `export ` prefix is allowed, quoting and
+    inline comments follow `_dotenv_value`, and the last assignment wins. An
+    empty result disables EDGAR requests.
+    """
+    value = (environ.get("SEC_USER_AGENT") or "").strip()
+    if value:
+        return value
+    try:
+        lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError):
+        return ""
+    for line in lines:
+        text = re.sub(r"^export\s+", "", line.strip())
+        if not text or text.startswith("#"):
+            continue
+        key, sep, raw = text.partition("=")
+        if sep and key.strip() == "SEC_USER_AGENT":
+            value = _dotenv_value(raw).strip()
+    return value
+
+
+SEC_USER_AGENT = _resolve_sec_user_agent()
 SEC_REQUEST_TIMEOUT = 20             # seconds
 SEC_MAX_RETRIES = 3
 HTTP_RETRY_BACKOFF = 1.5             # seconds, exponential

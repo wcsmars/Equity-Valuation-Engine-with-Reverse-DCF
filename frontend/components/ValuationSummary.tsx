@@ -6,12 +6,17 @@
 import React from "react";
 import type { Report } from "@/lib/types";
 import {
+  betaStat,
+  excludedReason,
   fmtBig,
+  fmtBlendedTarget,
+  fmtBlendedUpside,
   fmtCount,
   fmtMoney,
-  fmtNum,
   fmtPct,
-  toneForUpside,
+  footballFieldTone,
+  toneForBlendedUpside,
+  toneForMethodUpside,
 } from "@/lib/format";
 import { Badge, Card, Stat, Table, TD, TH } from "@/components/ui";
 
@@ -39,12 +44,8 @@ function FootballField({ report }: { report: Report }) {
         {rows.map((r) => {
           const left = pos(r.low);
           const width = Math.max(pos(r.high) - left, 0.8);
-          const tone =
-            r.base >= price * 1.05
-              ? "bg-up/30 border-up"
-              : r.base <= price * 0.95
-              ? "bg-down/30 border-down"
-              : "bg-flat/30 border-flat";
+          // Grey for a reference-only method or when there is no verdict.
+          const tone = footballFieldTone(report.summary, r.method, r.base, price);
           return (
             <div key={r.method} className="flex items-center gap-3">
               <div className="w-32 shrink-0 truncate text-right text-xs text-ink-dim">
@@ -98,6 +99,8 @@ export default function ValuationSummary({ report }: { report: Report }) {
   const m = report.company.market;
   const cur = s.currency;
   const methods = Object.entries(s.methods || {});
+  const excluded = s.excluded_from_blend || {};
+  const beta = betaStat(m.beta, m.raw_beta);
 
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -109,7 +112,16 @@ export default function ValuationSummary({ report }: { report: Report }) {
         <FootballField report={report} />
       </Card>
 
-      <Card title="Method summary">
+      <Card
+        title="Method summary"
+        subtitle={
+          Object.keys(excluded).length > 0
+            ? `Not in the blended target: ${Object.entries(excluded)
+                .map(([name, why]) => `${name} (${why})`)
+                .join("; ")}`
+            : undefined
+        }
+      >
         <Table>
           <thead>
             <tr>
@@ -120,22 +132,41 @@ export default function ValuationSummary({ report }: { report: Report }) {
           </thead>
           <tbody>
             {methods.map(([name, price]) => {
-              const up = s.current_price ? price / s.current_price - 1 : null;
+              const up =
+                price != null && s.current_price
+                  ? price / s.current_price - 1
+                  : null;
+              // Shown for reference only: the blended target leaves it out
+              // (a flagged company's DCF and FCFE, whatever its kind). Its
+              // upside, and every upside when there is no verdict, is dim.
+              const why = excludedReason(s, name);
               return (
                 <tr key={name}>
-                  <TD align="left">{name}</TD>
+                  <TD align="left">
+                    {name}
+                    {why && (
+                      <span
+                        className="ml-1.5 text-[10px] text-ink-faint"
+                        title={`Not in the blended target: ${why}`}
+                      >
+                        (not in blend)
+                      </span>
+                    )}
+                  </TD>
                   <TD num>{fmtMoney(price, cur)}</TD>
-                  <TD num className={toneForUpside(up)}>
+                  <TD num className={toneForMethodUpside(s, name, up)}>
                     {fmtPct(up, { signed: true })}
                   </TD>
                 </tr>
               );
             })}
+            {/* No target -> "n/a" or "No target (supply peers)"; a withheld
+                verdict -> the upside reads "n/a", uncoloured. */}
             <tr className="font-semibold">
               <TD align="left">Blended target</TD>
-              <TD num>{fmtMoney(s.blended_target, cur)}</TD>
-              <TD num className={toneForUpside(s.blended_upside)}>
-                {fmtPct(s.blended_upside, { signed: true })}
+              <TD num>{fmtBlendedTarget(s, report.comps)}</TD>
+              <TD num className={toneForBlendedUpside(s)}>
+                {fmtBlendedUpside(s)}
               </TD>
             </tr>
           </tbody>
@@ -145,7 +176,12 @@ export default function ValuationSummary({ report }: { report: Report }) {
       <Card title="Snapshot" className="lg:col-span-3">
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
           <Stat label="Market cap" value={fmtBig(m.market_cap, cur)} />
-          <Stat label="Beta" value={fmtNum(m.beta, 2)} />
+          <Stat
+            label={beta.label}
+            value={beta.value}
+            sub={beta.sub}
+            title={beta.title}
+          />
           <Stat
             label="52-week range"
             value={

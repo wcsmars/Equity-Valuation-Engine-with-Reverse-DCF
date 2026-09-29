@@ -107,6 +107,7 @@ class CorsTests(unittest.TestCase):
             "http://127.0.0.1:49152",
             "http://localhost",
             "https://localhost:3000",
+            "http://[::1]:3000",
         ):
             with self.subTest(origin=origin):
                 self.assertTrue(cors.is_allowed_origin(origin))

@@ -13,6 +13,36 @@ Valuation methods:
   * Equity multiples (pe, pb) apply directly to per-share earnings / book value.
   * peg is display-only for the target unless a clean earnings-growth figure is
     available to back out an implied P/E.
+  * For a bank, insurer, lender/BDC, a company with a consolidated captive
+    finance arm or a debt-funded operating lessor
+    (``utils.financial_institution_detail``), the EV multiples give no implied
+    price: its debt funds its lending or its lease fleet, so it is not a
+    financing claim to strip out of EV (JPM: EV/Sales implied $106 against
+    $277 from P/E and $200 from P/B). The implied price uses P/E and P/B
+    only, with a note; PEG is left out too (a volatile earnings CAGR), and
+    peer EV multiples and PEG are still shown. Equity REITs keep every
+    multiple: their debt finances property like an operating company's, and
+    EV/EBITDA is the usual REIT multiple (P/E is distorted by property
+    depreciation). A mortgage REIT (AGNC, NLY, STWD) is classed as a lender:
+    its repo and warehouse borrowing funds a book of loans and mortgage
+    securities, so it gets P/E and P/B only.
+  * When the target's latest net margin has collapsed below operating profit
+    (the FCFE's screen, ``ddm_fcfe.net_margin_collapse``: under a quarter of
+    what its EBIT implies after interest and tax, with the EBIT margin
+    positive and not a one-off) and is also under a quarter of its prior
+    median, the P/E (and PEG) implied price is left out, with a note: a peer
+    P/E applied to that EPS prices the impairment or tax charge, not the
+    business (BP FY2025: a P/E-implied GBP 0.04 took the comps median from
+    9.15 to 6.97). The same happens when the net margin is under a quarter of
+    its own prior median in a year whose EBIT margin is itself out of line,
+    which that screen skips (``ddm_fcfe.ebit_charge_collapse``). An EBIT
+    margin that is a one-off drop, or under a third of its prior median,
+    points to a charge inside operating profit, so also inside EBITDA (EBIT +
+    D&A): EV/EBITDA is left out too, and EV/Sales and P/B are kept (GM
+    FY2025: EBIT margin 1.6% against 6.7%, net 1.46% against 6.1%, a
+    P/E-implied 25.48 against 79.91 from P/B, so the comps median was 52.70,
+    'Overvalued -35%'). Next to a one-off rise in the EBIT margin the charge
+    is below operating profit, and only P/E and PEG are left out.
 
 All monetary inputs are absolute units (not millions); multiples are pure ratios.
 The provider is touched ONLY through the DataProvider interface
@@ -30,12 +60,37 @@ from ..data.base import DataProvider
 from ..schemas import CompanyData, CompRow, CompsResult
 from ..utils import (
     cagr,
+    financial_institution_detail,
     is_num,
     median,
+    net_debt_parts,
     safe_div,
     summary_stats,
     trim_outliers,
 )
+from .ddm_fcfe import NET_MARGIN_COLLAPSE_SHARE, ebit_charge_collapse, net_margin_collapse
+
+# EV multiples: the target's net debt is stripped from the implied EV.
+EV_MULTIPLES = ("ev_ebitda", "ev_sales")
+# Kinds (``utils.financial_institution_detail``) whose debt funds a lending
+# book, so the implied price uses P/E and P/B only. "financial" is a flagged
+# company of unknown kind. Equity REITs are not listed (see the module notes);
+# a mortgage REIT is a "lender".
+EQUITY_MULTIPLES_ONLY_KINDS = ("bank", "insurer", "lender", "financial", "captive_finance",
+                               "lessor")
+# Multiples that give such a company no implied price: the EV multiples, and
+# PEG (it rests on a net-income CAGR that provisions, reserve releases and
+# mark-to-market swings make volatile; P/E and P/B are the usual multiples).
+EQUITY_ONLY_DROPPED = EV_MULTIPLES + ("peg",)
+# Start of the note that says so; the engine also lists it among the warnings.
+EQUITY_MULTIPLES_NOTE_PREFIX = "Equity multiples only"
+# Earnings multiples left out when the latest net margin has collapsed (with
+# EV/EBITDA when the charge is inside EBIT; see the module notes), and the
+# start of the note that says so (the engine also lists it among the warnings).
+EARNINGS_MULTIPLES = ("pe", "peg")
+EARNINGS_COLLAPSE_NOTE_PREFIX = "P/E-implied price left out"
+# How that note names the multiples it leaves out.
+_MULTIPLE_NAMES = {"pe": "P/E", "peg": "PEG", "ev_ebitda": "EV/EBITDA"}
 
 
 # --------------------------------------------------------------------------- #
@@ -308,6 +363,7 @@ def run_comps(
     provider: DataProvider,
     peers: Optional[list[str]],
     current_price: float,
+    tax_rate: Optional[float] = None,
 ) -> CompsResult:
     """Run a trading-comps valuation for `company`.
 
@@ -322,6 +378,9 @@ def run_comps(
         peers; if that is still empty, an empty CompsResult (with a note) returns.
     current_price : float
         Latest market price per share for the target.
+    tax_rate : float | None
+        An explicit tax rate (the CLI's ``--tax``) for the net-margin collapse
+        screen, as the FCFE uses; else the effective rate.
 
     Returns
     -------
@@ -338,11 +397,9 @@ def run_comps(
     minority = 0.0
     preferred = 0.0
     if bs is not None:
-        try:
-            nd = bs.net_debt
-            net_debt = float(nd) if is_num(nd) else 0.0
-        except Exception:
-            net_debt = 0.0
+        # Component-wise, so a missing cash figure does not discard known debt.
+        net_debt, nd_notes = net_debt_parts(bs)
+        notes.extend(nd_notes)
         mi = getattr(bs, "minority_interest", 0.0)
         minority = float(mi) if is_num(mi) else 0.0
         pe_eq = getattr(bs, "preferred_equity", 0.0)
@@ -445,10 +502,82 @@ def run_comps(
             earnings_growth=earnings_growth,
         )
 
+    # --- A lender's EV multiples give no implied price ------------------------ #
+    # Its debt (deposits, the borrowing behind a loan book or a finance arm's
+    # leases) funds its operations, so stripping it from a peer-multiple EV
+    # does not isolate equity (JPM: EV/Sales $106 vs P/E $277 and P/B $200).
+    flag = financial_institution_detail(company)
+    if flag is not None and flag[1] in EQUITY_MULTIPLES_ONLY_KINDS:
+        for m in EQUITY_ONLY_DROPPED:
+            implied[m] = None
+        funds = {"captive_finance": "its finance arm's loans and leases",
+                 "lessor": "the fleet it leases out"}.get(flag[1], "its lending and investing")
+        notes.append(
+            f"{EQUITY_MULTIPLES_NOTE_PREFIX} ({flag[0]}): EV/EBITDA and EV/Sales give no "
+            f"implied price, because most of the target's debt funds {funds} and is not a "
+            "financing claim to strip out of enterprise value; the implied price uses P/E "
+            "and P/B (PEG, which rests on a volatile earnings CAGR, and the peer EV "
+            "multiples are shown for reference only).")
+
+    # --- A collapsed latest net margin gives no earnings-based price ---------- #
+    # The FCFE's screen (net margin under a quarter of what EBIT implies, EBIT
+    # in line), plus the net margin under a quarter of its own prior median:
+    # a peer P/E on that EPS prices the charge, not the business (BP FY2025).
+    # Or the EBIT margin is itself out of line and the net margin is under a
+    # quarter of its prior median (``ebit_charge_collapse``): a charge inside
+    # EBIT (GM FY2025) also sits in EBITDA, which every provider builds as
+    # EBIT + D&A, so EV/EBITDA goes too; next to a one-off EBIT gain the charge
+    # is below EBIT, and only the EPS multiples go.
+    collapse = net_margin_collapse(fin, tax_rate) if fin is not None else None
+    prior_med = collapse.get("prior_median") if collapse else None
+    reason = None
+    to_drop = EARNINGS_MULTIPLES
+    if (collapse is not None and is_num(prior_med) and prior_med > 0
+            and collapse["latest"] < NET_MARGIN_COLLAPSE_SHARE * prior_med):
+        reason = (
+            f"the latest net margin {collapse['latest']:.2%} is under a quarter of both its "
+            f"prior median {prior_med:.2%} and the {collapse['implied']:.1%} its EBIT margin "
+            f"{collapse['ebit_margin']:.1%} implies after interest and tax (items below "
+            "operating profit such as impairments, or an abnormal tax charge)")
+    else:
+        charge = ebit_charge_collapse(fin) if fin is not None else None
+        if charge is not None:
+            ebit_m, ebit_prior = charge["ebit_margin"], charge["ebit_prior_median"]
+            inside = (" (likely a charge inside operating profit, such as restructuring, "
+                      "impairments or a write-down)")
+            if charge["ebit_move"] == "gain":
+                ebit_text = (
+                    f"the latest EBIT margin {ebit_m:.1%} is a one-off rise above its prior "
+                    f"median {ebit_prior:.1%} (likely a charge below operating profit, such as "
+                    "impairments or an abnormal tax charge, next to a one-off gain within it)")
+            elif charge["ebit_move"] == "drop":
+                ebit_text = (f"the latest EBIT margin {ebit_m:.1%} is a one-off drop from its "
+                             f"prior median {ebit_prior:.1%}{inside}")
+            else:  # "collapse": a thin margin, shown to two decimals as in the DCF
+                ebit_text = (f"the latest EBIT margin {ebit_m:.2%} is under a third of its "
+                             f"prior median {ebit_prior:.2%}{inside}")
+            if charge["ebit_move"] != "gain":
+                to_drop = EARNINGS_MULTIPLES + ("ev_ebitda",)
+            reason = (
+                f"the latest net margin {charge['latest']:.2%} is under a quarter of its prior "
+                f"median {charge['prior_median']:.2%}, and {ebit_text}")
+    if reason is not None:
+        dropped = [m for m in to_drop if implied.get(m) is not None]
+        for m in dropped:
+            implied[m] = None
+        if dropped:
+            names = [_MULTIPLE_NAMES[m] for m in dropped]
+            which = (f"{names[0]} gives" if len(names) == 1 else
+                     f"{', '.join(names[:-1])} and {names[-1]} give")
+            basis = "EPS or EBITDA" if "ev_ebitda" in dropped else "EPS"
+            notes.append(
+                f"{EARNINGS_COLLAPSE_NOTE_PREFIX}: {reason}, so {which} no implied price: a "
+                f"peer multiple of that {basis} would price the charge, not the business.")
+
     # --- Flag EV multiples whose bridge yields a non-positive equity value ----- #
     # These are dropped from the summary below; explain why so net-debt-heavy
     # targets are not silently excluded.
-    for m in ("ev_ebitda", "ev_sales"):
+    for m in EV_MULTIPLES:
         p = implied.get(m)
         if is_num(p) and p <= 0:
             notes.append(
