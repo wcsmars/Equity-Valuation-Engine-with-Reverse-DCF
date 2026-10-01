@@ -124,17 +124,17 @@ class AssumptionError(ValueError):
 
 
 def _num(key: str, value: Any) -> Optional[float]:
-    """Coerce one payload value to float. Unparseable values count as 'not
-    given' (the engine default applies); NaN/Infinity and booleans are
-    rejected so they can neither 500 nor silently corrupt the model."""
-    if value is None:
+    """Coerce a number or numeric string. Empty fields use the default;
+    malformed values fail visibly instead of silently replacing an assumption.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
     if isinstance(value, bool):
         raise AssumptionError(f"{key} must be a number, not a boolean.")
     try:
         f = float(value)
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AssumptionError(f"{key} must be a finite number.") from exc
     if not math.isfinite(f):
         raise AssumptionError(f"{key} must be a finite number (got {value!r}).")
     return f
@@ -147,9 +147,9 @@ def _f(payload: dict, *keys) -> Optional[float]:
     return None
 
 
-def _flag(payload: dict, key: str) -> bool:
+def _flag(payload: dict, key: str, default: bool = True) -> bool:
     """Strict-ish boolean toggle: 'false'/'0'/'no'/'off' (any case) are False."""
-    v = payload.get(key, True)
+    v = payload.get(key, default)
     if isinstance(v, str):
         return v.strip().lower() not in ("false", "0", "no", "off", "")
     return bool(v)
@@ -260,7 +260,7 @@ def run_valuation_report(ticker: str, payload: Optional[dict] = None):
     (write_excel / write_html bind to it) rather than the serialized dict."""
     payload = payload or {}
     macro, dcf, ddm, peers, toggles, echo = parse_assumptions(payload)
-    provider = _get_provider(ticker, refresh=bool(payload.get("refresh")))
+    provider = _get_provider(ticker, refresh=_flag(payload, "refresh", default=False))
 
     report = value_company(
         ticker,
@@ -276,7 +276,9 @@ def run_valuation_report(ticker: str, payload: Optional[dict] = None):
 
 def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
     """Solve for the year-1 revenue growth the market price implies, holding
-    every other assumption fixed (growth fades to terminal as usual).
+    other assumptions fixed. Adjust the resolved growth path by a first-year
+    delta that fades to zero in the final explicit year. A linear base path
+    stays linear; a custom schedule keeps its shape and final-year endpoint.
 
     This is the 'what do I have to believe?' number: if the market-implied
     growth looks heroic vs history, the price embeds optimism — and vice versa.
@@ -296,11 +298,11 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
 
         company = report.company
         price = report.current_price
-        base = {
-            "current_assumption_y1": (dcf_assumptions.revenue_growth or [None])[0]
-            if dcf_assumptions.revenue_growth
-            else None,
-        }
+        resolved = getattr(report.dcf, "assumptions", {}) or {}
+        if resolved.get("valuation_available") is False:
+            return None
+        current_path = resolved.get("revenue_growth_path") or dcf_assumptions.revenue_growth
+        base = {"current_assumption_y1": current_path[0] if current_path else None}
         if not is_num(price) or price <= 0:
             return {
                 **base,
@@ -309,10 +311,17 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
                 "note": "No valid market price to solve against.",
             }
 
+        def growth_path(g1: float) -> list[float]:
+            if current_path:
+                n = len(current_path)
+                delta = g1 - current_path[0]
+                return [g + delta * (1 - i / (n - 1) if n > 1 else 1)
+                        for i, g in enumerate(current_path)]
+            return _revenue_growth_path(
+                g1, dcf_assumptions.terminal_growth, dcf_assumptions.forecast_years)
+
         def implied(g1: float) -> Optional[float]:
-            path = _revenue_growth_path(
-                g1, dcf_assumptions.terminal_growth, dcf_assumptions.forecast_years
-            )
+            path = growth_path(g1)
             a = _dc.replace(dcf_assumptions, revenue_growth=path)
             try:
                 p = _run_dcf(company, macro, a, price).implied_price
@@ -329,15 +338,30 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
         tol = 1e-9 * price      # stop bisecting once this close
         accept = 1e-6 * price   # report converged only within 0.0001%
 
-        bracket = None
-        crossings = 0
+        # A flat curve can match the price for every growth rate; that does
+        # not identify a market-implied assumption. Exact grid hits, including
+        # a tangency with no sign change, are otherwise valid solutions.
+        if len(known) == len(grid) and all(abs(v - price) <= tol for v in known):
+            return {**base, "converged": False, "implied_growth_y1": None,
+                    "note": "The model matches the market price throughout the tested "
+                    "growth range; growth cannot be uniquely inferred."}
+        hits = [(g, p) for g, p in zip(grid, vals)
+                if p is not None and abs(p - price) <= tol]
+        brackets = []
         for (g_a, p_a), (g_b, p_b) in zip(zip(grid, vals), zip(grid[1:], vals[1:])):
             if p_a is None or p_b is None:
                 continue
-            if (p_a - price) * (p_b - price) <= 0 and p_a != p_b:
-                crossings += 1
-                if bracket is None:
-                    bracket = (g_a, p_a, g_b)
+            if (abs(p_a - price) > tol and abs(p_b - price) > tol
+                    and (p_a - price) * (p_b - price) < 0):
+                brackets.append((g_a, p_a, g_b))
+        crossings = len(hits) + len(brackets)
+        bracket = brackets[0] if brackets else None
+        if hits and (bracket is None or hits[0][0] < bracket[0]):
+            out = {**base, "converged": True, "implied_growth_y1": hits[0][0],
+                   "implied_revenue_growth": growth_path(hits[0][0])}
+            if crossings > 1:
+                out["note"] = "More than one growth rate reproduces the market price with these assumptions; showing the lowest."
+            return out
         if bracket is None:
             return {
                 **base,
@@ -373,7 +397,8 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
                 "note": "The implied price jumps across the market price "
                 "instead of passing through it; no growth rate reproduces it.",
             }
-        out = {**base, "converged": True, "implied_growth_y1": mid}
+        out = {**base, "converged": True, "implied_growth_y1": mid,
+               "implied_revenue_growth": growth_path(mid)}
         if crossings > 1:
             out["note"] = (
                 "More than one growth rate reproduces the market price "

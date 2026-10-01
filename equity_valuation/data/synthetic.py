@@ -94,6 +94,6 @@ class SyntheticProvider(DataProvider):
     def get_peer_comp_rows(self, tickers: list[str]) -> list[CompRow]:
         return [
             CompRow(ticker=tk, name=tk, market_cap=5e10, enterprise_value=5.2e10,
-                    ev_ebitda=eve, ev_sales=evs, pe=pe, pb=pb, peg=peg)
+                    ev_ebitda=eve, ev_sales=evs, pe=pe, pb=pb, peg=peg, currency="USD")
             for tk, (eve, evs, pe, pb, peg) in zip(tickers, _PEER_MULTIPLES)
         ]

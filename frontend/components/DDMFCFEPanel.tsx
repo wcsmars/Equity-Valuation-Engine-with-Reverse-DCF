@@ -37,7 +37,7 @@ function fmtDetailValue(key: string, value: unknown, cur: string): string {
       /(growth|rate|margin|yield|return|wacc|cost|premium|payout|retention|pct|equity_w|weight)/.test(
         k
       ) || k === "ke";
-    if (rateLike && Math.abs(value) <= 1.5) return fmtPct(value);
+    if (rateLike) return fmtPct(value);
     const moneyLike =
       /(price|value|pv|dividend|revenue|equity)/.test(k) || k === "d0";
     if (moneyLike)
@@ -121,8 +121,8 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
       >
         {ddm == null ? (
           <EmptyState
-            title="DDM not applicable"
-            hint="Company pays no (or negligible) dividend."
+            title="DDM unavailable"
+            hint="No valid dividend valuation was produced. Check the report warnings and dividend assumptions."
           />
         ) : (
           <>

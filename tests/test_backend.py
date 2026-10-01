@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -136,6 +137,22 @@ def _asgi(app, chunks, *, path="/echo", headers=(), scope_type="http", unread=No
 #  Assumption parsing
 # --------------------------------------------------------------------------- #
 class ParseAssumptionTests(unittest.TestCase):
+    def test_malformed_assumptions_are_not_silently_defaulted(self):
+        for bad in ("4 percent", "typo", {}, [0.04], 10 ** 400):
+            with self.subTest(value=bad):
+                with self.assertRaises(vs.AssumptionError):
+                    vs.parse_assumptions({"rf": bad})
+        with patch.object(vs, "_get_provider") as provider:
+            r = _client().post("/api/valuation", json={"ticker": "SYNT", "rf": "oops"})
+            self.assertEqual(r.status_code, 400)
+            provider.assert_not_called()
+
+    def test_refresh_false_values_keep_the_cache(self):
+        for value in (False, "false", "0", "off", 0, None):
+            with self.subTest(value=value), patch.object(vs, "_get_provider", return_value=SyntheticProvider()) as get:
+                vs.run_valuation_report(DEMO_TICKER, {"refresh": value, "run_sensitivity": False})
+                get.assert_called_once_with(DEMO_TICKER, refresh=False)
+
     def test_one_year_horizon_keeps_year1_growth(self):
         self.assertEqual(vs._revenue_growth_path(0.15, 0.025, 1), [0.15])
         for n in range(2, 16):
@@ -214,6 +231,46 @@ def _solve_fake(fn, price, n=5):
 
 
 class ReverseDCFTests(unittest.TestCase):
+    def test_reverse_preserves_the_computed_growth_path(self):
+        # When the market price equals the computed DCF value, solving must
+        # recover that same first-year growth, even after a terminal clamp or
+        # with a non-linear explicit schedule.
+        for payload in ({"terminal_growth": 0.2},
+                        {"revenue_growth": [0.1, 0.2, 0.15, 0.1, 0.05]}):
+            with self.subTest(payload=payload):
+                rep, macro, dcf_a = _report(SyntheticProvider(), payload)
+                rep.current_price = rep.dcf.implied_price
+                original = rep.dcf.assumptions["revenue_growth_path"]
+                r = vs._reverse_dcf(rep, dcf_a, macro)
+                self.assertTrue(r["converged"])
+                self.assertAlmostEqual(r["implied_growth_y1"], original[0], delta=1e-6)
+                for expected, actual in zip(original, r["implied_revenue_growth"]):
+                    self.assertAlmostEqual(expected, actual, delta=1e-6)
+                a = dataclasses.replace(dcf_a, revenue_growth=r["implied_revenue_growth"])
+                self.assertAlmostEqual(run_dcf(rep.company, macro, a, rep.current_price).implied_price,
+                                       rep.current_price, delta=rep.current_price * 1e-6)
+
+    def test_unavailable_dcf_does_not_produce_reverse_diagnostic(self):
+        rep = SimpleNamespace(dcf=SimpleNamespace(assumptions={"valuation_available": False}),
+                              company=None, current_price=40)
+        self.assertIsNone(vs._reverse_dcf(rep, DCFAssumptions(), None))
+
+    def test_auto_growth_is_reported_as_current_assumption(self):
+        rep, macro, dcf_a = _report(SyntheticProvider())
+        r = vs._reverse_dcf(rep, dcf_a, macro)
+        self.assertEqual(r["current_assumption_y1"], rep.dcf.assumptions["revenue_growth_path"][0])
+
+    def test_tangent_grid_hit_is_a_solution(self):
+        r = _solve_fake(lambda g: 40 + (g - 0.2) ** 2, price=40)
+        self.assertTrue(r["converged"])
+        self.assertAlmostEqual(r["implied_growth_y1"], 0.2)
+
+    def test_flat_matching_curve_does_not_identify_growth(self):
+        r = _solve_fake(lambda g: 40.0, price=40)
+        self.assertFalse(r["converged"])
+        self.assertIsNone(r["implied_growth_y1"])
+        self.assertIn("uniquely", r["note"])
+
     def test_solution_does_not_depend_on_share_count(self):
         results = []
         for mult in (1.0, 1_000.0, 100_000.0):
@@ -261,9 +318,9 @@ class ReverseDCFTests(unittest.TestCase):
         self.assertTrue(r["converged"])
         self.assertAlmostEqual(_reprice(rep, macro, dcf_a, r["implied_growth_y1"]), 30.0,
                                delta=30.0 * 1e-6)
-        # Default synthetic price is above what one year of growth can reach:
+        # A very high market price is above what one year of growth can reach:
         # the note says so with the model's actual price range.
-        rep, macro, dcf_a = _report(SyntheticProvider(), payload)
+        rep, macro, dcf_a = _report(_PricedProvider(price=1000.0), payload)
         r = vs._reverse_dcf(rep, dcf_a, macro)
         self.assertFalse(r["converged"])
         self.assertIn("only spans", r["note"])
@@ -630,6 +687,36 @@ class BodyLimitTests(_StoreSandbox):
 # --------------------------------------------------------------------------- #
 #  .env persistence
 # --------------------------------------------------------------------------- #
+class LauncherTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires Bash process groups")
+    def test_server_failure_stops_the_other_server_and_preserves_exit_code(self):
+        for failed in ("backend", "frontend"):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                shutil.copyfile(Path(__file__).resolve().parents[1] / "run_dev.sh", root / "run_dev.sh")
+                (root / ".venv/bin").mkdir(parents=True)
+                (root / "frontend/node_modules").mkdir(parents=True)
+                (root / "bin").mkdir()
+                # A long-lived sibling records that the launcher's EXIT trap
+                # terminated its process group. No servers or installers run.
+                survivor = "trap 'touch stopped; exit 0' TERM\ntouch ready\nwhile :; do sleep 1; done\n"
+                failure = "while [ ! -f ready ]; do sleep 0.05; done\nexit 23\n"
+                python = root / ".venv/bin/python"
+                python.write_text("#!/bin/bash\ncd \"$(dirname \"$0\")/../..\"\n"
+                                  "if [ \"$2\" = pip ]; then exit 0; fi\n"
+                                  + (failure if failed == "backend" else survivor))
+                npm = root / "bin/npm"
+                npm.write_text("#!/bin/bash\ncd \"$(dirname \"$0\")/..\"\n"
+                               + (failure if failed == "frontend" else survivor))
+                for p in (python, npm):
+                    p.chmod(0o700)
+                env = {**os.environ, "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"]}
+                result = subprocess.run(["bash", "run_dev.sh"], cwd=root, env=env,
+                                        capture_output=True, text=True, timeout=8)
+                self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+                self.assertTrue((root / "stopped").exists(), result.stdout + result.stderr)
+
+
 class EnvFileTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -646,6 +733,43 @@ class EnvFileTests(unittest.TestCase):
         self.assertEqual(self.env.read_text(), "FMP_API_KEY=your-new-fmp-key\n")
         self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
         self.assertEqual(os.listdir(self.tmp.name), [".env"])
+
+    def test_concurrent_settings_preserve_both_keys_and_live_values(self):
+        first_inside = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        second_inside = threading.Event()
+        real_save = backend._upsert_env_file
+
+        def save(updates):
+            if "ANTHROPIC_API_KEY" in updates:
+                first_inside.set()
+                if not release_first.wait(5):
+                    raise RuntimeError("settings test timed out")
+            else:
+                second_inside.set()
+            real_save(updates)
+
+        def second():
+            second_started.set()
+            return backend.settings(backend.SettingsRequest(fmp_api_key="your-fmp-key"))
+
+        with patch.object(backend, "_upsert_env_file", save), \
+                patch.dict(backend.os.environ, {}, clear=True), patch.object(backend, "_fmp"), \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            one = pool.submit(backend.settings, backend.SettingsRequest(anthropic_api_key="your-anthropic-key"))
+            self.assertTrue(first_inside.wait(2))
+            two = pool.submit(second)
+            try:
+                self.assertTrue(second_started.wait(2))
+                self.assertFalse(second_inside.wait(0.1))
+            finally:
+                release_first.set()
+            one.result(timeout=3)
+            two.result(timeout=3)
+            self.assertIn("ANTHROPIC_API_KEY=your-anthropic-key", self.env.read_text())
+            self.assertIn("FMP_API_KEY=your-fmp-key", self.env.read_text())
+            self.assertEqual(backend.os.environ["FMP_API_KEY"], "your-fmp-key")
 
     def test_every_assignment_replaced_once(self):
         self.env.write_text(
@@ -696,6 +820,26 @@ def _post_raw(client, path, body):
 
 
 class StoreTests(_StoreSandbox):
+    def test_null_clears_saved_fields_but_omitted_fields_survive(self):
+        store.save_research("SYNT", {"notes": "keep", "note": {"title": "old"},
+                                     "assumptions": {"rf": 0.04}})
+        c = _client()
+        r = c.post("/api/research_state/SYNT", json={"note": None})
+        self.assertEqual(r.status_code, 200)
+        saved = c.get("/api/research_state/SYNT").json()
+        self.assertIsNone(saved["note"])
+        self.assertEqual(saved["notes"], "keep")
+        self.assertEqual(saved["assumptions"], {"rf": 0.04})
+
+    def test_overflowed_json_exponents_do_not_break_store_responses(self):
+        self.path.write_text('{"watchlist": [{"ticker": "X", "price": 1e400}], '
+                             '"research": {"X": {"assumptions": {"rf": -1e400}}}}')
+        c = _client()
+        self.assertIsNone(c.get("/api/watchlist").json()["watchlist"][0]["price"])
+        self.assertIsNone(c.get("/api/research_state/X").json()["assumptions"]["rf"])
+        store.save_research("X", {"notes": "still usable"})
+        _strict_json(self.path.read_text())
+
     def backups(self):
         return sorted(p for p in self.path.parent.iterdir() if ".corrupt" in p.name)
 

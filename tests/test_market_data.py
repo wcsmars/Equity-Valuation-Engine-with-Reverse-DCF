@@ -32,6 +32,9 @@ import datetime
 import unittest
 from unittest import mock
 
+from backend.fmp_client import FMPClient
+from equity_valuation.data.synthetic import make_company
+
 import numpy as np
 import pandas as pd
 
@@ -657,12 +660,10 @@ class StatementFallbackTests(unittest.TestCase):
         self.assertTrue(fin._source_notes[0].startswith(
             "Fundamentals converted from TWD to USD at spot 0.03125"))
 
-    def test_missing_fx_rate_leaves_statements_unconverted_with_warning(self) -> None:
+    def test_missing_fx_rate_stops_unit_mixed_valuation(self) -> None:
         info = {"currency": "USD", "financialCurrency": "TWD"}
-        fin, _bs = self._fallback(info=info, fin=income(32), cf=cashflow(32), bs=balance(32))
-        self.assertEqual(fin.revenue[-1], 32000.0)
-        self.assertTrue(fin._source_notes[0].startswith("WARNING: financial statements are in TWD"))
-        self.assertIn("not comparable", fin._source_notes[0])
+        with self.assertRaisesRegex(DataError, "no TWD->USD exchange rate.*retry"):
+            self._fallback(info=info, fin=income(32), cf=cashflow(32), bs=balance(32))
 
     def test_pence_quote_with_pound_statements_needs_no_fx(self) -> None:
         fin, _bs = self._fallback(info={"currency": "GBp", "financialCurrency": "GBP"})
@@ -758,12 +759,12 @@ class HybridProviderMarketTests(unittest.TestCase):
         self.assertIn(StatementFallbackTests.VALE_NOTE, cd.source_notes)
         self.assertFalse(any("converted" in n for n in cd.source_notes))
 
-    def test_unconverted_currencies_warning_leads_the_notes(self) -> None:
+    def test_unconverted_currencies_stop_hybrid_valuation(self) -> None:
         info = {"currency": "USD", "financialCurrency": "TWD", "currentPrice": 200.0,
                 "sharesOutstanding": 10.0, "marketCap": 2000.0}
         c = client({"TSM": ticker(info, fin=income(32), cf=cashflow(32), bs=balance(32))})
-        cd = HybridProvider(edgar=self._edgar_fails(), market=c).get_company_data("TSM")
-        self.assertTrue(cd.source_notes[2].startswith("WARNING: financial statements are in TWD"))
+        with self.assertRaisesRegex(DataError, "No usable fundamentals.*no TWD->USD exchange rate"):
+            HybridProvider(edgar=self._edgar_fails(), market=c).get_company_data("TSM")
 
     def test_info_outage_backfills_shares_cap_and_dps_from_statements(self) -> None:
         fin = AnnualFinancials(
@@ -1838,6 +1839,75 @@ class SuggestPeersTests(unittest.TestCase):
         c = client({})
         self.assertEqual(c.suggest_peers("AAPL"), [])
         c._ticker.assert_not_called()
+
+
+class YahooBoundaryTests(unittest.TestCase):
+    def test_common_income_precedes_parent_income(self):
+        fin = income(**{"Net Income Common Stockholders": [120, 110, 100, 90, NaN]})
+        c = client({"T": ticker(fin=fin, cf=cashflow(), bs=balance())})
+        normalized, _bs = c.get_annual_financials_fallback("T")
+        self.assertEqual(normalized.net_income, [90, 100, 110, 120])
+        self.assertTrue(normalized._income_attribution_adjusted)
+
+    def test_missing_common_income_subtracts_reported_preferred_adjustments(self):
+        fin = income(**{"Preferred Stock Dividends": [5] * 5,
+                        "Otherunder Preferred Stock Dividend": [2] * 5})
+        c = client({"T": ticker(fin=fin, cf=cashflow(), bs=balance())})
+        normalized, _bs = c.get_annual_financials_fallback("T")
+        self.assertEqual(normalized.net_income[-1], 161)
+        self.assertTrue(normalized._income_attribution_adjusted)
+
+    def test_edgar_conversion_failure_stops_valuation(self):
+        company = make_company()
+        company.market.currency = "GBP"
+        provider = HybridProvider(edgar=mock.Mock(), market=mock.Mock())
+        provider.market.get_fx_rate.return_value = None
+        with self.assertRaisesRegex(DataError, "no USD->GBP exchange rate.*retry"):
+            provider._edgar_to_quote_currency(
+                company.financials, company.balance_sheet, company.market, [])
+
+    def test_numeric_coercion_rejects_boolean_and_overflow(self):
+        self.assertIsNone(market_mod._num(True))
+        self.assertIsNone(market_mod._num(10 ** 1000))
+
+    def test_common_equity_is_used_without_subtracting_preferred_twice(self):
+        frame = balance(**{"Preferred Stock": [100] * 5})
+        bs = YFinanceClient()._build_balance_sheet(frame)
+        self.assertEqual(bs.total_equity, 800.0)
+        self.assertEqual(bs.preferred_equity, 100.0)
+
+    def test_parent_equity_excludes_preferred_in_fundamentals_and_comps(self):
+        frame = balance(drop=("Common Stock Equity",), **{"Preferred Stock": [100] * 5})
+        c = YFinanceClient()
+        self.assertEqual(c._build_balance_sheet(frame).total_equity, 700.0)
+        self.assertEqual(c._comp_balance_items(ticker(bs=frame))["equity"], 700.0)
+
+    def test_preferred_outside_equity_is_not_subtracted_from_parent(self):
+        frame = balance(drop=("Common Stock Equity",),
+                        **{"Preferred Securities Outside Stock Equity": [100] * 5})
+        bs = YFinanceClient()._build_balance_sheet(frame)
+        self.assertEqual(bs.total_equity, 800.0)
+        self.assertEqual(bs.preferred_equity, 100.0)
+
+    def test_comp_rows_report_major_quote_currency(self):
+        tk = ticker(info={"currency": "GBp", "financialCurrency": "GBP", "marketCap": 10000,
+                          "currentPrice": 100, "sharesOutstanding": 100, "trailingPE": 12})
+        row = client({"T.L": tk}).get_comp_row("T.L")
+        self.assertEqual(row.currency, "GBP")
+        self.assertEqual(row.market_cap, 100.0)
+
+class FmpBoundaryTests(unittest.TestCase):
+    def test_first_rejects_non_mapping_rows(self):
+        self.assertIsNone(FMPClient._first(["upstream service unavailable"]))
+        self.assertIsNone(FMPClient._first([None]))
+
+    def test_enrichment_lists_drop_non_records(self):
+        client = FMPClient(api_key="test-token")
+        payload = [None, "error", {"title": "A news item"}]
+        with mock.patch.object(client, "_get", return_value=payload):
+            self.assertEqual(client.news("T"), [{"title": "A news item"}])
+            self.assertEqual(client.analyst_estimates("T"), [{"title": "A news item"}])
+            self.assertEqual(client.peers("T"), [])
 
 
 if __name__ == "__main__":

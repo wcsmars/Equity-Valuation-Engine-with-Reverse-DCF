@@ -23,7 +23,7 @@ Currencies
   (``info['financialCurrency']``), e.g. TWD for the USD-quoted TSM ADR. The
   fallback converts them into the quote currency at one spot FX rate (a Yahoo
   ``XXXYYY=X`` quote) so price and fundamentals are comparable; if no rate can
-  be fetched it leaves them unconverted and adds a prominent WARNING note.
+  be fetched it raises DataError, preventing valuations across mixed units.
   Exception: for some 20-F filers the statement tables hold the USD 20-F
   figures while ``financialCurrency`` and the ``.info`` amounts stay local
   (VALE and PBR, also on their Sao Paulo lines: BRL; YPF: ARS). Comparing a
@@ -73,10 +73,11 @@ Design notes
   are absent for any given ticker, ETFs, or non-US listings. EVERY access goes
   through `.get(...)` with a default and `_num()` coercion so a missing/`NaN`/
   string field degrades to `None` instead of crashing.
-* `get_market_data` is the only method that raises (a `DataError`) — and only when
-  a price is genuinely unobtainable, since price underpins the whole valuation.
-  Everything else returns `None` / `[]` on failure so peer enrichment never aborts
-  a run.
+* `get_market_data` raises `DataError` when a price is genuinely unobtainable,
+  since price underpins the whole valuation.
+  The fundamentals fallback also raises DataError if its known reporting
+  currency cannot be converted to the quote currency. Optional peer enrichment
+  returns `None` / `[]` on failure.
 """
 
 from __future__ import annotations
@@ -210,11 +211,11 @@ def _num(x: object) -> Optional[float]:
     yfinance frequently returns strings ('Infinity'), NaNs, None, or sentinel
     zeros for missing fields. We accept only genuinely finite real numbers.
     """
-    if x is None:
+    if x is None or isinstance(x, bool):
         return None
     try:
         v = float(x)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return v if is_num(v) else None
 
@@ -419,15 +420,16 @@ def scale_fundamentals(
 
     Used for FX conversion: all flow series and balance-sheet amounts are
     scaled; fiscal years and share counts are not. Of the dynamic attributes
-    only the ``_financial_kind`` marker is carried over (the models choose
-    methods by it); ``_source_notes`` are not.
+    the financial-kind and income-attribution markers are carried over (the
+    models use them); ``_source_notes`` are handled by the caller.
     """
     fin = dataclasses.replace(
         financials,
         **{k: [v * rate for v in getattr(financials, k)] for k in _MONEY_SERIES},
     )
-    if hasattr(financials, "_financial_kind"):
-        fin._financial_kind = financials._financial_kind  # type: ignore[attr-defined]
+    for marker in ("_financial_kind", "_income_attribution_adjusted"):
+        if hasattr(financials, marker):
+            setattr(fin, marker, getattr(financials, marker))
     bs = dataclasses.replace(
         balance_sheet,
         **{k: getattr(balance_sheet, k) * rate for k in _MONEY_BALANCE},
@@ -921,6 +923,7 @@ class YFinanceClient:
             pe=_num(info.get("trailingPE")),
             pb=pb,
             peg=peg,
+            currency=major_currency(self._quote_currency(tk, info))[0],
         )
         if notes:
             row._source_notes = notes  # type: ignore[attr-defined]
@@ -1118,14 +1121,17 @@ class YFinanceClient:
                 continue
             dated = [c for c in frame.columns if self._col_date(c) is not None]
             for col in sorted(dated, key=self._col_date, reverse=True):
-                equity = self._cell(frame, ("Common Stock Equity", "CommonStockEquity",
-                                            "Stockholders Equity", "StockholdersEquity"), col)
+                preferred = self._cell(frame, ("Preferred Stock", "PreferredStock"), col)
+                equity = self._cell(frame, ("Common Stock Equity", "CommonStockEquity"), col)
+                if equity is None:
+                    parent = self._cell(frame, ("Stockholders Equity", "StockholdersEquity"), col)
+                    equity = parent - (preferred or 0.0) if parent is not None else None
                 minority = self._cell(frame, ("Minority Interest", "MinorityInterest"), col)
                 if equity is None and minority is None:
                     continue  # a sparse column
                 out.update(
                     as_of=self._col_date(col).isoformat(), equity=equity, minority=minority,
-                    preferred=self._cell(frame, ("Preferred Stock", "PreferredStock"), col),
+                    preferred=preferred,
                     debt=self._cell(frame, ("Total Debt", "TotalDebt"), col),
                 )
                 return out
@@ -1257,13 +1263,13 @@ class YFinanceClient:
         shows them to be in another (VALE, PBR: USD tables under a BRL
         financialCurrency; noted); when that differs from the quote
         currency they are converted at one spot FX rate (see
-        :meth:`get_fx_rate`), or left unconverted with a WARNING note if no rate
-        is available. Notes ride on the returned financials as
+        :meth:`get_fx_rate`), or raise DataError if no rate is available.
+        Notes ride on the returned financials as
         ``_source_notes``.
 
         Used by the hybrid provider to backfill non-US issuers that EDGAR cannot
-        serve. Returns ``None`` on any failure (missing dep, empty frames, no
-        revenue), so the caller can decide how to proceed.
+        serve. Returns ``None`` for missing dependencies, empty statements or no
+        revenue; raises ``DataError`` for a missing required FX conversion.
         """
         try:
             import pandas as pd  # noqa: F401  (lazy; only needed on this path)
@@ -1281,7 +1287,8 @@ class YFinanceClient:
 
         notes: list[str] = []
         rev_names = ("Total Revenue", "TotalRevenue", "Operating Revenue", "OperatingRevenue")
-        ni_names = ("Net Income", "NetIncome", "Net Income Common Stockholders")
+        ni_names = ("Net Income Common Stockholders", "NetIncomeCommonStockholders",
+                    "Net Income", "NetIncome")
 
         # Period-end columns, oldest -> newest. yfinance gives newest-first.
         cols = list(income.columns)
@@ -1361,6 +1368,31 @@ class YFinanceClient:
             label="EBIT (operating income)",
         )
         net_income = series([(income, ni_names)])
+        attribution_adjusted = False
+        common_derived: list[int] = []
+        for i, (col, year) in enumerate(zip(cols, fiscal_years)):
+            common = self._cell(income, ni_names[:2], col)
+            parent = self._cell(income, ni_names[2:], col)
+            gross = self._cell(income, ("Net Income Including Noncontrolling Interests",), col)
+            if common is not None:
+                references = [v for v in (parent, gross) if v is not None]
+                if not references or any(common != v for v in references):
+                    attribution_adjusted = True
+            elif parent is not None:
+                preferred = self._cell(income, ("Preferred Stock Dividends",), col) or 0.0
+                other = self._cell(income, ("Otherunder Preferred Stock Dividend",), col) or 0.0
+                if preferred or other:
+                    net_income[i] = parent - preferred - other
+                    common_derived.append(year)
+                    attribution_adjusted = True
+                if gross is not None and parent != gross:
+                    attribution_adjusted = True
+        if common_derived:
+            notes.append(
+                "yfinance fallback: common net income derived from parent net income less "
+                "preferred dividends and other preferred adjustments for "
+                + ", ".join(f"FY{y}" for y in common_derived)
+            )
         pretax_income = series(
             [(income, ("Pretax Income", "PretaxIncome", "Income Before Tax"))],
             label="pretax income",
@@ -1471,6 +1503,7 @@ class YFinanceClient:
                 notes.append(note)
         financials._source_notes = lead + fx_notes + notes  # type: ignore[attr-defined]
         financials._financial_kind = kind  # type: ignore[attr-defined]
+        financials._income_attribution_adjusted = attribution_adjusted  # type: ignore[attr-defined]
         return financials, balance_sheet
 
     # ----------------------------------------------------------------- #
@@ -1722,8 +1755,8 @@ class YFinanceClient:
         One spot rate for every year: the DCF, FCFE and comps are linear in the
         monetary inputs, so this equals valuing in the reporting currency and
         converting at spot, and the WACC weights need debt and market cap in the
-        same currency. If no rate can be fetched the statements are returned
-        unconverted with a WARNING note (currencies are never mixed silently).
+        same currency. If no rate can be fetched, DataError prevents statements
+        and the quote from entering valuation models with different units.
         `balance` and `income` are the statement tables the fallback read;
         they show when the tables are not in financialCurrency (see
         :meth:`_tables_currency`), in which case the tables' own currency is
@@ -1753,13 +1786,12 @@ class YFinanceClient:
             return financials, balance_sheet
         fx = self.get_fx_rate(fin_ccy, quote_ccy)
         if fx is None:
-            notes.append(
-                f"WARNING: financial statements are in {fin_ccy} but the share "
+            raise DataError(
+                f"Financial statements are in {fin_ccy} but the share "
                 f"price is in {quote_ccy}, and no {fin_ccy}->{quote_ccy} exchange "
-                "rate could be fetched; statements were NOT converted, so DCF, "
-                "FCFE and comps per-share values are not comparable with the price"
+                "rate could be fetched. Valuation stopped to avoid mixing currencies; "
+                "retry when exchange-rate data is available."
             )
-            return financials, balance_sheet
         rate, how = fx
         notes.append(
             f"Fundamentals converted from {fin_ccy} to {quote_ccy} at spot "
@@ -1824,15 +1856,20 @@ class YFinanceClient:
             cash_and_investments = (cash or 0.0) + (sti or 0.0)
 
         minority = val(("Minority Interest", "MinorityInterest")) or 0.0
+        preferred_book = val(("Preferred Stock", "PreferredStock")) or 0.0
         preferred = val(("Preferred Stock", "PreferredStock", "Preferred Securities Outside Stock Equity")) or 0.0
 
-        # Book equity attributable to the parent (as on EDGAR). The gross line
-        # includes noncontrolling interests, so strip them if it is all we have.
-        total_equity = val(("Stockholders Equity", "StockholdersEquity", "Common Stock Equity"))
+        # Book equity for common shareholders, matching the P/B and ROE models.
+        # A common-equity line already excludes preferred stock. Parent equity
+        # does not, and consolidated equity also includes minority interests.
+        total_equity = val(("Common Stock Equity", "CommonStockEquity"))
         if total_equity is None:
+            parent = val(("Stockholders Equity", "StockholdersEquity"))
             gross = val(("Total Equity Gross Minority Interest",))
-            if gross is not None:
-                total_equity = gross - minority
+            if parent is not None:
+                total_equity = parent - preferred_book
+            elif gross is not None:
+                total_equity = gross - minority - preferred_book
             else:
                 notes.append("yfinance fallback: total equity unavailable; set to 0.0")
 

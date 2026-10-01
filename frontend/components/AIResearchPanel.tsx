@@ -168,6 +168,10 @@ export default function AIResearchPanel({
   const [material, setMaterial] = useState<string>("");
   const [pdfs, setPdfs] = useState<PdfAttachment[]>([]);
   const [digesting, setDigesting] = useState<boolean>(false);
+  const [readingPdfs, setReadingPdfs] = useState(false);
+  const readInProgress = useRef(false);
+  const digestInProgress = useRef(false);
+  const chatInProgress = useRef(false);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [chatInput, setChatInput] = useState<string>("");
   const [chatting, setChatting] = useState<boolean>(false);
@@ -190,6 +194,8 @@ export default function AIResearchPanel({
   }, [digests.length]);
 
   async function runDigest(): Promise<void> {
+    if (!aiEnabled || digestInProgress.current || readInProgress.current) return;
+    digestInProgress.current = true;
     setDigesting(true);
     setErr(null);
     try {
@@ -210,6 +216,7 @@ export default function AIResearchPanel({
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
+      digestInProgress.current = false;
       setDigesting(false);
     }
   }
@@ -217,10 +224,13 @@ export default function AIResearchPanel({
   async function onPickPdfs(
     e: React.ChangeEvent<HTMLInputElement>
   ): Promise<void> {
+    if (readInProgress.current || digestInProgress.current) return;
     const files = Array.from(e.target.files ?? []);
     // Reset so re-selecting the same file fires onChange again.
     e.target.value = "";
     setErr(null);
+    readInProgress.current = true;
+    setReadingPdfs(true);
 
     // The digest request carries the model, the research log, the pasted text
     // and every PDF (base64, about 4/3 of the file size) and is capped at
@@ -250,6 +260,9 @@ export default function AIResearchPanel({
       if (refused.length > 0) setErr(refused.join(" "));
     } catch (e2) {
       setErr(e2 instanceof Error ? e2.message : String(e2));
+    } finally {
+      readInProgress.current = false;
+      setReadingPdfs(false);
     }
   }
 
@@ -261,7 +274,8 @@ export default function AIResearchPanel({
 
   async function send(): Promise<void> {
     const q = chatInput.trim();
-    if (!q) return;
+    if (!q || !aiEnabled || chatInProgress.current) return;
+    chatInProgress.current = true;
     const nextTurns: ChatTurn[] = [...turns, { role: "user" as const, content: q }];
     setTurns(nextTurns);
     setChatInput("");
@@ -280,20 +294,18 @@ export default function AIResearchPanel({
     } catch (e) {
       const m = e instanceof Error ? e.message : String(e);
       setErr(m);
-      // Don't swallow the user's message: surface the failure in the thread
-      // and put the question back in the input so it can be resent.
-      setTurns((t: ChatTurn[]) => [
-        ...t,
-        { role: "assistant" as const, content: `⚠ Couldn't answer: ${m}` },
-      ]);
-      setChatInput(q);
+      // Keep transport errors out of the model's conversation history, and
+      // preserve a new draft typed while this request was in progress.
+      setTurns(turns);
+      setChatInput((current) => current || q);
     } finally {
+      chatInProgress.current = false;
       setChatting(false);
     }
   }
 
   const canDigest =
-    aiEnabled && !digesting && (material.trim() !== "" || pdfs.length > 0);
+    aiEnabled && !digesting && !readingPdfs && (material.trim() !== "" || pdfs.length > 0);
   const redFlags = note?.red_flags ?? [];
   const citations = note?.citations ?? [];
 
@@ -421,6 +433,7 @@ export default function AIResearchPanel({
           <div className="space-y-3">
             <textarea
               value={material}
+              disabled={digesting || readingPdfs}
               onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
                 setMaterial(e.target.value)
               }
@@ -439,6 +452,7 @@ export default function AIResearchPanel({
                   type="file"
                   accept="application/pdf"
                   multiple
+                  disabled={digesting || readingPdfs}
                   onChange={onPickPdfs}
                   className="mt-1 block w-full text-xs text-ink-dim file:mr-3 file:rounded-md file:border file:border-line file:bg-surface-raised file:px-2 file:py-1 file:text-xs file:text-ink-dim hover:file:text-ink"
                 />
@@ -451,6 +465,7 @@ export default function AIResearchPanel({
                       <button
                         type="button"
                         onClick={() => removePdf(i)}
+                        disabled={digesting || readingPdfs}
                         aria-label={`Remove ${p.name}`}
                         className="ml-1.5 text-ink-faint hover:text-down"
                       >
@@ -467,6 +482,8 @@ export default function AIResearchPanel({
                 <>
                   <Spinner /> Reading…
                 </>
+              ) : readingPdfs ? (
+                <><Spinner /> Loading PDFs…</>
               ) : (
                 "Digest material"
               )}

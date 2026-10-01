@@ -90,10 +90,10 @@ def cost_of_equity(company: CompanyData, macro: MacroAssumptions) -> float:
     falls back to ``config.DEFAULT_BETA``. Risk-free rate and equity-risk-premium
     come from the macro assumptions (both decimals).
     """
-    rf = macro.risk_free_rate if is_num(macro.risk_free_rate) else config.DEFAULT_RISK_FREE_RATE
+    rf = macro.risk_free_rate if (macro is not None and is_num(macro.risk_free_rate)) else config.DEFAULT_RISK_FREE_RATE
     erp = (
         macro.equity_risk_premium
-        if is_num(macro.equity_risk_premium)
+        if macro is not None and is_num(macro.equity_risk_premium)
         else config.DEFAULT_EQUITY_RISK_PREMIUM
     )
 
@@ -202,6 +202,9 @@ def _latest_net_margin(
         margin actually used.
     A loss year that the EBIT margin shares (a charge year in operating
     profit) is kept here; ``run_fcfe`` fades it (``_charge_year_net_target``).
+    When the provider marks a common-earnings attribution adjustment, only
+    like-for-like historical net margins are compared: consolidated EBIT and
+    pretax income cannot reconstruct cash flow belonging to common holders.
     """
     ni = getattr(fin, "net_income", None) or []
     rev = getattr(fin, "revenue", None) or []
@@ -219,7 +222,8 @@ def _latest_net_margin(
         rate_label = "the marginal rate"
     notes = notes if notes is not None else []
     margin = latest
-    if thin_history and is_num(pretax) and pretax > 0:
+    attributed = bool(getattr(fin, "_income_attribution_adjusted", False))
+    if thin_history and not attributed and is_num(pretax) and pretax > 0:
         margin = pretax * (1.0 - tax) / rev[-1]
         if abs(margin - latest) > 1e-9:
             notes.append(
@@ -233,6 +237,13 @@ def _latest_net_margin(
                 f"median {spike['prior_median']:.1%} (likely a one-off gain or charge); "
                 f"projecting from the {spike['years']}-year median {spike['median']:.1%}.")
             return robust
+    if attributed:
+        # The provider has established (or warned about) a distinct common-
+        # earnings basis. Consolidated EBIT/pretax would put preferred holders'
+        # or noncontrolling shareholders' income back into common FCFE.
+        notes.append("Common earnings attribution retained; consolidated pretax income "
+                     "and EBIT are not used to rebuild the net margin.")
+        return margin
     ebit = getattr(fin, "ebit", None) or []
     op_spike = None
     if ebit and is_num(ebit[-1]) and ebit[-1] != 0:
@@ -300,7 +311,11 @@ def net_margin_collapse(
     (the median net margin of the prior years in the window, or None). A year
     whose EBIT margin is itself out of line is screened for the comps by
     ``ebit_charge_collapse``.
+    A provider-marked common-income attribution difference disables this
+    consolidated-profit comparison.
     """
+    if getattr(fin, "_income_attribution_adjusted", False):
+        return None
     ni = getattr(fin, "net_income", None) or []
     rev = getattr(fin, "revenue", None) or []
     ebit = getattr(fin, "ebit", None) or []
@@ -471,8 +486,10 @@ def _sustainable_growth(
 
 
 def _dividend_cagr(fin: AnnualFinancials, notes: Optional[list[str]] = None) -> Optional[float]:
-    """CAGR of total dividends paid over the continuous paying run that ends in
-    the latest year, else None.
+    """Per-share dividend CAGR over the continuous paying run ending in the
+    latest year, else None. Annual DPS is approximated as common dividends paid
+    divided by diluted weighted-average shares; when aligned share history is
+    unavailable, total dividends are a disclosed growth proxy.
 
     The run goes back from the latest year and stops at a break: a zero or
     missing year between paying years (a suspension, or a year the provider
@@ -502,6 +519,14 @@ def _dividend_cagr(fin: AnnualFinancials, notes: Optional[list[str]] = None) -> 
     note says which. Periods are fiscal-year differences.
     """
     divs = list(getattr(fin, "dividends_paid", None) or [])
+    shares = list(getattr(fin, "diluted_shares", None) or [])
+    per_share = len(shares) == len(divs) and all(is_num(s) and s > 0 for s in shares)
+    if per_share:
+        divs = [d / s if is_num(d) else d for d, s in zip(divs, shares)]
+    elif notes is not None and any(is_num(d) and d > 0 for d in divs):
+        notes.append("Aligned diluted-share history unavailable; dividend growth uses "
+                     "total dividends paid as a proxy for per-share growth.")
+    label = "Dividends paid per share" if per_share else "Dividends paid"
     years = list(getattr(fin, "fiscal_years", None) or [])
     if len(years) != len(divs):
         years = []
@@ -546,14 +571,14 @@ def _dividend_cagr(fin: AnnualFinancials, notes: Optional[list[str]] = None) -> 
     run_years = [years[k] for k in pos] if years else None
     if skipped and notes is not None and (why is None or len(run) >= MIN_DIVIDEND_RUN_YEARS):
         notes.append(
-            f"Dividends paid in {fiscal_year_labels(years, sorted(skipped))} were more than "
+            f"{label} in {fiscal_year_labels(years, sorted(skipped))} were more than "
             "double both neighbouring years (a special dividend); left out of the dividend "
             "CAGR as one-offs, not read as breaks in the paying run.")
     if why is None:
         return series_cagr(run, run_years)
     enough = len(run) >= MIN_DIVIDEND_RUN_YEARS
     if notes is not None:
-        text = (f"Dividends paid {why} (a cut, suspension, restart, special dividend or step "
+        text = (f"{label} {why} (a cut, suspension, restart, special dividend or step "
                 "change), so a dividend CAGR across it would measure that break; ")
         if enough:
             span = fiscal_year_labels(years, [pos[0], last]).replace(", ", "-")
@@ -592,13 +617,17 @@ def run_ddm(
     d0 = getattr(market, "dividend_per_share", None) if market is not None else None
 
     # Non-dividend payer -> DDM is inapplicable. Return None per the contract.
-    if not is_num(d0) or d0 == 0:
+    if not is_num(d0) or d0 <= 0:
         return None
     d0 = float(d0)
 
     ke = cost_of_equity(company, macro)
+    if not is_num(ke) or ke <= 0:
+        raise ValueError("DDM requires a positive finite cost of equity")
     g_terminal = assumptions.terminal_growth if is_num(assumptions.terminal_growth) else 0.0
-    method = (assumptions.method or "two_stage").lower()
+    if g_terminal <= -1.0:
+        raise ValueError("terminal_growth must be greater than -1")
+    method = str(assumptions.method or "two_stage").strip().lower()
     fin = getattr(company, "financials", None)
 
     detail: dict = {
@@ -635,9 +664,9 @@ def run_ddm(
     if method == "h_model":
         # Closed-form H-model: P = [D0*(1+g) + D0*H_half*(gh - g)] / (ke - g)
         # where H_half = high_growth_years / 2 is the half-life of the linear fade.
-        gh = _initial_high_growth(assumptions, fin, company, ke, notes)
+        gh = _initial_high_growth(assumptions, fin, company, notes)
         g = _clamp_terminal_g(g_terminal, "H-model terminal")
-        if (assumptions.high_growth_years or 0) > 0:
+        if is_num(assumptions.high_growth_years) and assumptions.high_growth_years > 0:
             h_years = assumptions.high_growth_years
         else:
             h_years = 5
@@ -660,7 +689,7 @@ def run_ddm(
         method = "two_stage"
         detail["method"] = method
 
-    gh = _initial_high_growth(assumptions, fin, company, ke, notes)
+    gh = _initial_high_growth(assumptions, fin, company, notes)
     hgy = assumptions.high_growth_years
     h_years = max(1, int(hgy)) if (is_num(hgy) and hgy > 0) else 5
     g = _clamp_terminal_g(g_terminal, "Two-stage terminal")
@@ -713,7 +742,6 @@ def _initial_high_growth(
     assumptions: DDMAssumptions,
     fin: Optional[AnnualFinancials],
     company: CompanyData,
-    ke: float,
     notes: list[str],
 ) -> float:
     """Resolve the stage-1 (high) growth rate for two-stage / H-model DDM.
@@ -726,9 +754,9 @@ def _initial_high_growth(
          change, with a one-year special dividend skipped; ``_dividend_cagr``).
       3. else fall back to the terminal growth (a conservative flat assumption).
 
-    The result is always clamped to strictly below the cost of equity (a high
-    growth rate >= ke would make the dividend stream out-explode the discount and
-    is economically implausible for a mature company).
+    Finite-stage growth may exceed the cost of equity: these dividends are an
+    explicitly summed finite stream. Only the perpetual terminal rate must be
+    below ke. Rates at or below -100% cannot describe a positive dividend.
     """
     gh = assumptions.high_growth_rate
     if not is_num(gh):
@@ -751,11 +779,8 @@ def _initial_high_growth(
     if not is_num(gh):
         gh = 0.0
 
-    # Clamp strictly below ke so the stage-1 stream stays well-behaved.
-    cap = ke - _MIN_KE_G_SPREAD
-    if gh >= cap:
-        notes.append(f"High growth {gh:.4f} >= ke margin; clamped to {cap:.4f}.")
-        gh = cap
+    if gh <= -1.0:
+        raise ValueError("high_growth_rate must be greater than -1")
     return gh
 
 
@@ -815,18 +840,23 @@ def run_fcfe(
     """
     notes: list[str] = []
     ke = cost_of_equity(company, macro)
+    if not is_num(ke) or ke <= 0:
+        raise ValueError("FCFE requires a positive finite cost of equity")
     fin = getattr(company, "financials", None)
     bs = getattr(company, "balance_sheet", None)
 
     fy = assumptions.forecast_years
     years_out = max(1, int(fy)) if (is_num(fy) and fy > 0) else 5
     g_terminal = assumptions.terminal_growth if is_num(assumptions.terminal_growth) else 0.0
+    if g_terminal <= -1.0:
+        raise ValueError("terminal_growth must be greater than -1")
     shares = _shares(company)
 
     detail: dict = {
         "cost_of_equity": ke,
         "terminal_growth": g_terminal,
         "delta_debt_policy": "constant debt/revenue ratio (debt grows with revenue)",
+        "valuation_available": False,
         "notes": notes,
     }
 
@@ -914,9 +944,9 @@ def run_fcfe(
 
     # Current debt balance for the ΔDebt (debt grows with revenue) policy.
     total_debt = getattr(bs, "total_debt", None) if bs is not None else None
-    if not is_num(total_debt):
+    if not is_num(total_debt) or total_debt < 0:
         total_debt = 0.0
-        notes.append("Total debt unavailable; ΔDebt set to 0 (no re-levering).")
+        notes.append("Total debt unavailable or negative; ΔDebt set to 0 (no re-levering).")
 
     # Terminal growth used consistently as BOTH the fade endpoint of the growth
     # path AND the perpetuity growth, so FCFE_N and the Gordon terminal share one g.
@@ -1002,6 +1032,7 @@ def run_fcfe(
 
     equity_value = sum(pv_fcfe) + pv_terminal
     implied_price = safe_div(equity_value, shares)
+    detail["valuation_available"] = is_num(implied_price)
     if not is_num(implied_price):
         implied_price = 0.0
         notes.append("Share count unavailable; implied price set to 0.")

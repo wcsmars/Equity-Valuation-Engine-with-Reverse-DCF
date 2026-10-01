@@ -593,7 +593,8 @@ def research_get(ticker: str) -> dict:
 
 @app.post("/api/research_state/{ticker}")
 def research_post(ticker: str, req: ResearchStateRequest) -> dict:
-    return store.save_research(ticker, req.model_dump())
+    # Omitted fields are unchanged; an explicit null clears a saved field.
+    return store.save_research(ticker, req.model_dump(exclude_unset=True))
 
 
 # --------------------------------------------------------------------------- #
@@ -602,6 +603,7 @@ def research_post(ticker: str, req: ResearchStateRequest) -> dict:
 #  this process's environment, taking effect immediately.
 # --------------------------------------------------------------------------- #
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+_settings_lock = threading.Lock()
 
 
 def _upsert_env_file(updates: dict[str, str]) -> None:
@@ -661,13 +663,16 @@ def settings(req: SettingsRequest) -> dict:
                 status_code=400,
                 detail=f"{key} must contain only letters, digits, dots, underscores, or hyphens.",
             )
-    try:
-        _upsert_env_file(updates)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Could not write .env: {exc}"
-        ) from exc
-    os.environ.update(updates)
-    if "FMP_API_KEY" in updates:
-        _fmp = FMPClient()  # picks up the new key
-    return health()
+    # Atomic replacement alone cannot prevent two read/modify/write requests
+    # from losing each other's keys. Keep file and live configuration ordered.
+    with _settings_lock:
+        try:
+            _upsert_env_file(updates)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Could not write .env: {exc}"
+            ) from exc
+        os.environ.update(updates)
+        if "FMP_API_KEY" in updates:
+            _fmp = FMPClient()  # picks up the new key
+        return health()

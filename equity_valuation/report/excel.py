@@ -134,13 +134,18 @@ def _num(value: object) -> Optional[float]:
 
 def _set(ws: Worksheet, row: int, col: int, value: object,
          *, fmt: Optional[str] = None, font: Optional[Font] = None,
-         align: Optional[Alignment] = None) -> "Cell":  # type: ignore[name-defined]
+         align: Optional[Alignment] = None, formula: bool = False) -> "Cell":  # type: ignore[name-defined]
     """Write a value into (row, col) and apply optional number format / style."""
     if isinstance(value, str):
         # Control characters (e.g. from exception text in a warning) are illegal
         # in XLSX XML and would make openpyxl refuse to write the whole file.
         value = ILLEGAL_CHARACTERS_RE.sub("", value)
     cell = ws.cell(row=row, column=col, value=value)
+    # Company names, tickers and model notes come from external providers.
+    # Preserve them as text even when they start with '='; only formulas built
+    # here opt into Excel evaluation.
+    if isinstance(value, str) and not formula:
+        cell.data_type = "s"
     if fmt is not None:
         cell.number_format = fmt
     if font is not None:
@@ -148,6 +153,11 @@ def _set(ws: Worksheet, row: int, col: int, value: object,
     if align is not None:
         cell.alignment = align
     return cell
+
+
+def _formula(ws: Worksheet, row: int, col: int, value: str, **style):
+    """Write an internally constructed formula, never provider-supplied text."""
+    return _set(ws, row, col, value, formula=True, **style)
 
 
 def _title(ws: Worksheet, text: str) -> None:
@@ -288,7 +298,7 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
         _set(ws, row, 2, imp, fmt=money_fmt, align=_RIGHT)
         if imp is not None and cur_price:
             # Live upside formula referencing the implied-price cell and current price.
-            up_cell = _set(ws, row, 3, f"=B{row}/{current_price_cell}-1",
+            up_cell = _formula(ws, row, 3, f"=B{row}/{current_price_cell}-1",
                            fmt=PERCENT_FMT, align=_RIGHT)
             # Best-effort sign coloring (Excel won't recolor on edit; this is the
             # value as-computed now -- a "plus", per the contract). None for a
@@ -339,7 +349,7 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     # a blend that rests on the DDM alone: the target stays, the upside is n/a.
     withheld = "blended_upside" in summary and _num(summary.get("blended_upside")) is None
     if blended is not None and cur_price and not withheld:
-        up_cell = _set(ws, row, 3, f"=B{row}/{current_price_cell}-1",
+        up_cell = _formula(ws, row, 3, f"=B{row}/{current_price_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
         # Prefer the engine-computed blended_upside for sign-coloring (keeps the
         # Excel/HTML headline consistent); fall back to the local computation.
@@ -524,7 +534,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
             prev = get_column_letter(col - 1)
             cur = get_column_letter(col)
             # Guarded: the model projects zero revenue when it has no base.
-            _set(ws, r_growth, col,
+            _formula(ws, r_growth, col,
                  f'=IF({prev}{r_rev}=0,"",{cur}{r_rev}/{prev}{r_rev}-1)',
                  fmt=PERCENT_FMT, align=_RIGHT)
 
@@ -535,7 +545,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, r_margin, 1, "  EBIT margin %", font=_LABEL_FONT)
     for j in range(n):
         col = get_column_letter(first_year_col + j)
-        _set(ws, r_margin, first_year_col + j,
+        _formula(ws, r_margin, first_year_col + j,
              f'=IF({col}{r_rev}=0,"",{col}{r_ebit}/{col}{r_rev})',
              fmt=PERCENT_FMT, align=_RIGHT)
 
@@ -570,7 +580,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
         # If we have both inputs in-sheet, use a formula; else fall back to value.
         if j < len(fcff) and j < len(dfs) and _num(fcff[j]) is not None \
                 and _num(dfs[j]) is not None:
-            _set(ws, r_pv, first_year_col + j, f"={col}{r_fcff}*{col}{r_df}",
+            _formula(ws, r_pv, first_year_col + j, f"={col}{r_fcff}*{col}{r_df}",
                  fmt=money_fmt, align=_RIGHT)
         else:
             val = _num(pv_fcff[j]) if j < len(pv_fcff) else None
@@ -591,7 +601,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, row, 1, "Σ PV of explicit FCFF", font=_LABEL_FONT)
     if n:
         sum_pv_formula = f"=SUM({first_year_col_letter}{r_pv}:{last_year_col}{r_pv})"
-        _set(ws, row, 2, sum_pv_formula, fmt=money_fmt, align=_RIGHT)
+        _formula(ws, row, 2, sum_pv_formula, fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, None, fmt=money_fmt, align=_RIGHT)
     sum_pv_cell = f"B{row}"
@@ -610,7 +620,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
 
     # Enterprise value = Σ PV explicit + PV terminal  (LIVE formula).
     _set(ws, row, 1, "Enterprise value", font=_LABEL_FONT)
-    _set(ws, row, 2, f"={sum_pv_cell}+{pv_terminal_cell}", fmt=money_fmt, align=_RIGHT)
+    _formula(ws, row, 2, f"={sum_pv_cell}+{pv_terminal_cell}", fmt=money_fmt, align=_RIGHT)
     ev_cell = f"B{row}"
     row += 1
 
@@ -633,7 +643,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
 
     # Equity value = EV - net debt - minority - preferred  (LIVE formula).
     _set(ws, row, 1, "Equity value", font=_LABEL_FONT)
-    _set(ws, row, 2, f"={ev_cell}-{net_debt_cell}-" + "-".join(claim_cells),
+    _formula(ws, row, 2, f"={ev_cell}-{net_debt_cell}-" + "-".join(claim_cells),
          fmt=money_fmt, align=_RIGHT)
     equity_cell = f"B{row}"
     row += 1
@@ -647,7 +657,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, row, 1, "Implied price / share", font=_LABEL_FONT)
     shares_val = _num(getattr(dcf, "shares", None))
     if shares_val:
-        _set(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
+        _formula(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, _num(getattr(dcf, "implied_price", None)),
              fmt=money_fmt, align=_RIGHT)
@@ -665,7 +675,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     up_val = _num(getattr(dcf, "upside", None))
     cur_p = _num(getattr(dcf, "current_price", None))
     if cur_p:
-        up_cell = _set(ws, row, 2, f"={implied_cell}/{current_cell}-1",
+        up_cell = _formula(ws, row, 2, f"={implied_cell}/{current_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
     else:
         up_cell = _set(ws, row, 2, up_val, fmt=PERCENT_FMT, align=_RIGHT)
@@ -689,6 +699,7 @@ _COMP_COLS = [
     ("pe", "P/E", MULTIPLE_FMT),
     ("pb", "P/B", MULTIPLE_FMT),
     ("peg", "PEG", "0.00"),
+    ("currency", "Currency", None),
 ]
 # Multiples that participate in the stats / implied tables.
 _STAT_MULTIPLES = ["ev_ebitda", "ev_sales", "pe", "pb", "peg"]
@@ -717,7 +728,7 @@ def _write_comps(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None
     def _write_comp_row(r: int, comp_row, *, bold: bool = False) -> None:
         for j, (attr, _label, fmt) in enumerate(_COMP_COLS):
             val = getattr(comp_row, attr, None)
-            if attr in ("ticker", "name"):
+            if attr in ("ticker", "name", "currency"):
                 cell = _set(ws, r, j + 1, val or "")
             else:
                 cell = _set(ws, r, j + 1, _num(val), fmt=fmt, align=_RIGHT)
@@ -778,7 +789,7 @@ def _write_comps(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None
             row += 1
 
     _set_widths(ws, {1: 22, 2: 26, 3: 16, 4: 16, 5: 12, 6: 12,
-                     7: 12, 8: 12, 9: 12})
+                     7: 12, 8: 12, 9: 12, 10: 12})
 
 
 # --------------------------------------------------------------------------- #
@@ -881,7 +892,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     first_col_letter = get_column_letter(first_col)
     _set(ws, row, 1, "Σ PV of explicit FCFE", font=_LABEL_FONT)
     if n:
-        _set(ws, row, 2, f"=SUM({first_col_letter}{r_pv}:{last_col}{r_pv})",
+        _formula(ws, row, 2, f"=SUM({first_col_letter}{r_pv}:{last_col}{r_pv})",
              fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, None, fmt=money_fmt, align=_RIGHT)
@@ -901,7 +912,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
 
     # Equity value = Σ PV + PV terminal  (LIVE formula).
     _set(ws, row, 1, "Equity value", font=_LABEL_FONT)
-    _set(ws, row, 2, f"={sum_pv_cell}+{pv_term_cell}", fmt=money_fmt, align=_RIGHT)
+    _formula(ws, row, 2, f"={sum_pv_cell}+{pv_term_cell}", fmt=money_fmt, align=_RIGHT)
     equity_cell = f"B{row}"
     row += 1
 
@@ -913,7 +924,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     # Implied price = equity / shares  (LIVE formula).
     _set(ws, row, 1, "Implied price / share", font=_LABEL_FONT)
     if _num(getattr(fcfe, "shares", None)):
-        _set(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
+        _formula(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, _num(getattr(fcfe, "implied_price", None)),
              fmt=money_fmt, align=_RIGHT)
@@ -931,7 +942,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     cur_p = _num(getattr(fcfe, "current_price", None))
     imp = _num(getattr(fcfe, "implied_price", None))
     if cur_p:
-        up_cell = _set(ws, row, 2, f"={implied_cell}/{current_cell}-1",
+        up_cell = _formula(ws, row, 2, f"={implied_cell}/{current_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
         # Uncoloured for a reference-only FCFE or when the engine gives no verdict.
         if imp is not None and method_upside_toned(report.summary, "FCFE"):

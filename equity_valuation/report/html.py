@@ -577,17 +577,20 @@ def _comps_table(report: ValuationReport, symbol: str) -> str:
         "pb": "P/B",
         "peg": "PEG",
     }
-    headers = ["Company", "Market cap", "EV"] + [mult_labels.get(k, k) for k in mult_keys]
+    headers = ["Company", "Currency", "Market cap", "EV"] + [mult_labels.get(k, k) for k in mult_keys]
     head_html = "".join(f"<th>{_esc(h)}</th>" for h in headers)
 
     def row_cells(row, highlight: bool = False) -> str:
         if row is None:
             return ""
         name = _esc(getattr(row, "ticker", None) or getattr(row, "name", "?"))
+        currency = getattr(row, "currency", None)
+        row_symbol = _currency_symbol(currency) if currency else ""
         cells = [
             f"<td class='rowhead'>{name}</td>",
-            f"<td>{_fmt_big(getattr(row, 'market_cap', None), symbol)}</td>",
-            f"<td>{_fmt_big(getattr(row, 'enterprise_value', None), symbol)}</td>",
+            f"<td>{_esc(currency or 'n/a')}</td>",
+            f"<td>{_fmt_big(getattr(row, 'market_cap', None), row_symbol)}</td>",
+            f"<td>{_fmt_big(getattr(row, 'enterprise_value', None), row_symbol)}</td>",
         ]
         for k in mult_keys:
             # PEG is a dimensionless ratio, not a turns multiple -> plain number.
@@ -610,7 +613,7 @@ def _comps_table(report: ValuationReport, symbol: str) -> str:
     # Without peers there are no statistics; skip the footer instead of
     # rendering rows of n/a under the target.
     for sk in (stat_keys if peers else ()):
-        cells = [f"<td class='rowhead'>{stat_labels[sk]}</td><td></td><td></td>"]
+        cells = [f"<td class='rowhead'>{stat_labels[sk]}</td><td></td><td></td><td></td>"]
         for mk in mult_keys:
             sub = stats.get(mk) or {}
             # PEG is a dimensionless ratio, not a turns multiple -> plain number.

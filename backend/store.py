@@ -98,7 +98,9 @@ def _load() -> dict:
         return {"watchlist": [], "research": {}}
     data.setdefault("watchlist", [])
     data.setdefault("research", {})
-    return data
+    # Valid JSON exponents such as 1e400 also overflow to infinity; unlike bare
+    # NaN/Infinity, json's parse_constant hook never sees them.
+    return _finite(data)
 
 
 def _stored_size() -> int:
@@ -226,6 +228,7 @@ def get_research(ticker: str) -> dict:
 
 def save_research(ticker: str, state: dict) -> dict:
     """Persist {notes, digests, note, assumptions} for a ticker (partial ok).
+    Omitted fields stay unchanged; explicit null clears a field.
     NaN/Infinity anywhere in the state are saved as null. An empty or overlong
     ticker, or a state over _MAX_RESEARCH_BYTES, is refused whole
     (StoreLimitError), never truncated, so the last good save survives."""
@@ -234,7 +237,7 @@ def save_research(ticker: str, state: dict) -> dict:
         data = _load()
         cur = data["research"].get(ticker, {})
         for key in ("notes", "digests", "note", "assumptions"):
-            if key in state and state[key] is not None:
+            if key in state:
                 cur[key] = _finite(state[key])
         digests = cur.get("digests")
         if isinstance(digests, list) and len(digests) > _MAX_DIGESTS_PER_TICKER:

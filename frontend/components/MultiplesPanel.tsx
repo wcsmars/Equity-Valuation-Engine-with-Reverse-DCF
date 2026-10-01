@@ -11,6 +11,7 @@ import React from "react";
 import type { CompRow, Enrichment, Report } from "@/lib/types";
 import {
   fmtBig,
+  fmtCount,
   fmtMoney,
   fmtMult,
   fmtNum,
@@ -166,11 +167,14 @@ export default function MultiplesPanel({
           <Stat label="EV/EBITDA" value={fmtMult(target?.ev_ebitda)} />
           <Stat label="EV/Sales" value={fmtMult(target?.ev_sales)} />
           <Stat label="P/B" value={fmtMult(target?.pb)} />
-          <Stat label="PEG" value={fmtMult(target?.peg)} />
-          <Stat label="Market cap" value={fmtBig(target?.market_cap, cur)} />
+          <Stat label="PEG (reference)" value={fmtMult(target?.peg)}
+            title="Informational only; mixed peer earnings-growth horizons make PEG unsuitable for deriving the target price." />
+          <Stat label="Market cap" value={target?.currency ? fmtBig(target.market_cap, target.currency) : fmtCount(target?.market_cap)}
+            sub={target && !target.currency ? "Currency unavailable" : undefined} />
           <Stat
             label="EV"
-            value={fmtBig(target?.enterprise_value, cur)}
+            value={target?.currency ? fmtBig(target.enterprise_value, target.currency) : fmtCount(target?.enterprise_value)}
+            sub={target && !target.currency ? "Currency unavailable" : undefined}
           />
         </div>
         {!report.comps && (

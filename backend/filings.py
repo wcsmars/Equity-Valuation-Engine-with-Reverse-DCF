@@ -110,24 +110,41 @@ def list_filings(ticker: str, limit: int = 40) -> dict:
     if r.status_code != 200:
         raise DataError(f"EDGAR submissions returned HTTP {r.status_code}")
     data = r.json()
-    recent = (data.get("filings") or {}).get("recent") or {}
+    if not isinstance(data, dict) or not isinstance(data.get("filings"), dict):
+        raise DataError("EDGAR submissions returned an unexpected payload")
+    recent = data["filings"].get("recent") or {}
+    if not isinstance(recent, dict):
+        raise DataError("EDGAR submissions returned an unexpected recent-filings payload")
+
+    def field(name: str, index: int) -> str:
+        values = recent.get(name)
+        if not isinstance(values, list) or index >= len(values):
+            return ""
+        value = values[index]
+        return value if isinstance(value, str) else ""
 
     forms = recent.get("form") or []
     out: list[dict] = []
+    if limit <= 0:
+        return {"ticker": ticker.upper(), "cik": cik, "name": name, "filings": out}
     for i, form in enumerate(forms):
+        if not isinstance(form, str):
+            continue
         base = form.split("/")[0]
         if not any(base.startswith(f) for f in _INTERESTING_FORMS):
             continue
-        acc = (recent.get("accessionNumber") or [""])[i]
-        doc = (recent.get("primaryDocument") or [""])[i]
+        acc = field("accessionNumber", i)
+        doc = field("primaryDocument", i)
+        if not acc or not doc:
+            continue  # no retrievable primary document for this row
         out.append(
             {
                 "form": form,
-                "filed": (recent.get("filingDate") or [""])[i],
-                "report_date": (recent.get("reportDate") or [""])[i],
+                "filed": field("filingDate", i),
+                "report_date": field("reportDate", i),
                 "accession_number": acc,
                 "primary_document": doc,
-                "description": (recent.get("primaryDocDescription") or [""])[i],
+                "description": field("primaryDocDescription", i),
                 "url": _DOC_URL.format(
                     cik_int=int(cik), acc_nodash=acc.replace("-", ""), doc=doc
                 ),
@@ -179,8 +196,8 @@ _ITEM_PATTERNS = {
 def _at_line_start(text: str, pos: int) -> bool:
     """True if a heading match at `pos` begins a line (only whitespace before
     it on that line). Mid-sentence cross-references ("see Item 1A ...") fail."""
-    before = text[max(0, pos - 2) : pos]
-    return pos == 0 or before.rstrip(" \t") == "" or "\n" in before
+    before = text[text.rfind("\n", 0, pos) + 1 : pos]
+    return not before.strip()
 
 
 def extract_sections(text: str, form: str) -> dict[str, str]:
@@ -246,12 +263,13 @@ def build_filing_material(ticker: str, form: str, filed: str,
              f"(accession {accession_number})"]
     total = len(parts[0])
     for key, chunk in sections.items():
-        room = _TOTAL_CAP - total
+        heading = f"\n\n===== {titles.get(key, key.upper())} =====\n\n"
+        room = _TOTAL_CAP - total - len(heading)
         if room <= 0:
             break
         piece = chunk[:room]
-        parts.append(f"\n\n===== {titles.get(key, key.upper())} =====\n\n{piece}")
-        total += len(piece)
+        parts.append(heading + piece)
+        total += len(heading) + len(piece)
 
     meta = {
         "form": form,

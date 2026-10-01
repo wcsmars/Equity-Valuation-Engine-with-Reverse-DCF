@@ -17,16 +17,17 @@ import sys
 
 from . import config
 from .schemas import DCFAssumptions, DDMAssumptions, MacroAssumptions
+from .utils import is_num
 
 
 def _fmt_money(x, sym="$"):
-    if x is None:
+    if not is_num(x):
         return "n/a"
     return f"{sym}{x:,.2f}"
 
 
 def _fmt_pct(x):
-    if x is None:
+    if not is_num(x):
         return "n/a"
     return f"{x * 100:+.1f}%"
 
@@ -163,7 +164,10 @@ def _print_summary(report) -> None:
     print("  Method" + " " * (17 + extra) + "Implied price      Upside")
     print("  " + "-" * (50 + extra))
     for name, price in s["methods"].items():
-        up = (price / s["current_price"] - 1.0) if (price and s["current_price"]) else None
+        available = excluded.get(name) not in ("no valuation (0.00)", "non-finite implied price")
+        up = (price / s["current_price"] - 1.0) if (
+            available and is_num(price) and is_num(s["current_price"]) and s["current_price"] > 0
+        ) else None
         print(f"  {labels[name]:<{width}} {_fmt_money(price, sym):>14}   {_fmt_pct(up):>8}")
     print("  " + "-" * (50 + extra))
     print(f"  {'Blended target':<{width}} {_fmt_money(s['blended_target'], sym):>14}   "

@@ -99,6 +99,7 @@ export interface DCF {
 export interface CompRow {
   ticker: string;
   name: string;
+  currency?: string | null;
   market_cap: number | null;
   enterprise_value: number | null;
   ev_ebitda: number | null;
@@ -199,6 +200,7 @@ export interface ReverseDCF {
   converged: boolean;
   implied_growth_y1: number | null;
   current_assumption_y1?: number | null;
+  implied_revenue_growth?: number[];
   note?: string;
 }
 
@@ -247,12 +249,14 @@ export interface Assumptions {
   rf?: number; // risk-free rate (decimal)
   erp?: number; // equity risk premium (decimal)
   tax_rate?: number; // decimal; null => engine derives effective
+  cost_of_debt?: number;
   forecast_years?: number;
   terminal_growth?: number; // decimal
   terminal_method?: "gordon" | "exit_multiple";
   exit_ev_ebitda?: number; // multiple
   target_ebit_margin?: number; // decimal
   revenue_growth_y1?: number; // decimal; near-term growth, fades to terminal
+  revenue_growth?: number[]; // explicit path restored from saved research
   peers?: string; // comma-separated tickers
 }
 

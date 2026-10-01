@@ -11,17 +11,18 @@ Valuation methods:
     non-equity claims (net debt + minority interest + preferred) are stripped to
     get equity value, then divided by shares.
   * Equity multiples (pe, pb) apply directly to per-share earnings / book value.
-  * peg is display-only for the target unless a clean earnings-growth figure is
-    available to back out an implied P/E.
+  * PEG is display-only: the target uses historical diluted EPS growth, while
+    provider peer PEGs may use forward growth over an unspecified horizon.
+    Those figures cannot support a comparable implied P/E or target price.
   * For a bank, insurer, lender/BDC, a company with a consolidated captive
     finance arm or a debt-funded operating lessor
     (``utils.financial_institution_detail``), the EV multiples give no implied
     price: its debt funds its lending or its lease fleet, so it is not a
     financing claim to strip out of EV (JPM: EV/Sales implied $106 against
     $277 from P/E and $200 from P/B). The implied price uses P/E and P/B
-    only, with a note; PEG is left out too (a volatile earnings CAGR), and
-    peer EV multiples and PEG are still shown. Equity REITs keep every
-    multiple: their debt finances property like an operating company's, and
+    only, with a note; peer EV multiples and the reference-only PEG are still
+    shown. Equity REITs keep the EV and equity multiples: their debt finances
+    property like an operating company's, and
     EV/EBITDA is the usual REIT multiple (P/E is distorted by property
     depreciation). A mortgage REIT (AGNC, NLY, STWD) is classed as a lender:
     its repo and warehouse borrowing funds a book of loans and mortgage
@@ -30,7 +31,7 @@ Valuation methods:
     (the FCFE's screen, ``ddm_fcfe.net_margin_collapse``: under a quarter of
     what its EBIT implies after interest and tax, with the EBIT margin
     positive and not a one-off) and is also under a quarter of its prior
-    median, the P/E (and PEG) implied price is left out, with a note: a peer
+    median, the P/E implied price is left out, with a note: a peer
     P/E applied to that EPS prices the impairment or tax charge, not the
     business (BP FY2025: a P/E-implied GBP 0.04 took the comps median from
     9.15 to 6.97). The same happens when the net margin is under a quarter of
@@ -42,7 +43,7 @@ Valuation methods:
     FY2025: EBIT margin 1.6% against 6.7%, net 1.46% against 6.1%, a
     P/E-implied 25.48 against 79.91 from P/B, so the comps median was 52.70,
     'Overvalued -35%'). Next to a one-off rise in the EBIT margin the charge
-    is below operating profit, and only P/E and PEG are left out.
+    is below operating profit, and only P/E is left out.
 
 All monetary inputs are absolute units (not millions); multiples are pure ratios.
 The provider is touched ONLY through the DataProvider interface
@@ -79,8 +80,7 @@ EV_MULTIPLES = ("ev_ebitda", "ev_sales")
 EQUITY_MULTIPLES_ONLY_KINDS = ("bank", "insurer", "lender", "financial", "captive_finance",
                                "lessor")
 # Multiples that give such a company no implied price: the EV multiples, and
-# PEG (it rests on a net-income CAGR that provisions, reserve releases and
-# mark-to-market swings make volatile; P/E and P/B are the usual multiples).
+# PEG (reference-only for every issuer because growth horizons do not align).
 EQUITY_ONLY_DROPPED = EV_MULTIPLES + ("peg",)
 # Start of the note that says so; the engine also lists it among the warnings.
 EQUITY_MULTIPLES_NOTE_PREFIX = "Equity multiples only"
@@ -131,8 +131,8 @@ def _latest(series: Optional[list]) -> Optional[float]:
     return float(v) if is_num(v) else None
 
 
-def _net_income_cagr(fin) -> Optional[float]:
-    """Net-income CAGR across the available history (oldest->newest).
+def _eps_cagr(fin) -> Optional[float]:
+    """Diluted EPS CAGR across the available history (oldest->newest).
 
     Returns None if fewer than two positive endpoints exist (a sign change makes
     growth meaningless for a PEG). The result is a decimal (0.12 == 12%).
@@ -140,10 +140,17 @@ def _net_income_cagr(fin) -> Optional[float]:
     if fin is None:
         return None
     ni = getattr(fin, "net_income", None)
+    shares = getattr(fin, "diluted_shares", None) or []
     if not ni or len(ni) < 2:
         return None
-    first, last = ni[0], ni[-1]
+    if len(shares) != len(ni) or not all(is_num(s) and s > 0 for s in (shares[0], shares[-1])):
+        return None
+    first, last = safe_div(ni[0], shares[0]), safe_div(ni[-1], shares[-1])
     periods = len(ni) - 1
+    years = getattr(fin, "fiscal_years", None) or []
+    if (len(years) == len(ni) and is_num(years[0]) and is_num(years[-1])
+            and years[-1] > years[0]):
+        periods = years[-1] - years[0]
     return cagr(first, last, periods)
 
 
@@ -217,7 +224,7 @@ def _build_target_row(
 
     # PEG = P/E divided by the earnings growth expressed in percentage points.
     peg = None
-    growth = _net_income_cagr(fin)
+    growth = _eps_cagr(fin)
     if pe is not None and is_num(growth) and growth > 0:
         peg = safe_div(pe, growth * 100.0)
 
@@ -234,6 +241,7 @@ def _build_target_row(
         pe=pe,
         pb=pb,
         peg=peg,
+        currency=getattr(market, "currency", None),
     )
 
 
@@ -269,15 +277,19 @@ def _collect_peer_rows(
 
     target_upper = (target_ticker or "").upper()
     kept: list[CompRow] = []
+    seen: set[str] = set()
     for row in raw_rows:
         if row is None:
             continue
-        rt = (getattr(row, "ticker", "") or "").upper()
+        rt = (getattr(row, "ticker", "") or "").strip().upper()
         if rt and rt == target_upper:
             # Exclude the target if the provider returned it among the peers.
             continue
         if not _row_has_usable_multiple(row):
             continue
+        if rt and rt in seen:
+            continue  # one issuer must have one vote in the peer distribution
+        seen.add(rt)
         kept.append(row)
     return kept
 
@@ -297,8 +309,6 @@ def _implied_from_multiple(
     revenue_latest: Optional[float],
     ni_latest: Optional[float],
     total_equity: Optional[float],
-    target_peg: Optional[float],
-    earnings_growth: Optional[float],
 ) -> Optional[float]:
     """Apply a peer-median multiple to the target's own metric -> implied price.
 
@@ -340,17 +350,7 @@ def _implied_from_multiple(
         return med * bvps
 
     if multiple == "peg":
-        # Display-only unless a clean earnings-growth figure lets us back out an
-        # implied P/E: pe_implied = median_peg * (growth% in points); price = pe*eps.
-        if not (is_num(earnings_growth) and earnings_growth > 0):
-            return None
-        if not (is_num(ni_latest) and ni_latest > 0 and shares):
-            return None
-        eps = safe_div(ni_latest, shares)
-        if eps is None:
-            return None
-        pe_implied = med * (earnings_growth * 100.0)
-        return pe_implied * eps
+        return None  # provider growth horizons are not aligned with the target
 
     return None
 
@@ -436,7 +436,10 @@ def run_comps(
 
     # Drop the target itself from the requested set (case-insensitive).
     target_upper = ticker.upper()
-    peer_tickers = [t for t in peer_tickers if t.upper() != target_upper]
+    peer_tickers = list(dict.fromkeys(
+        t.strip().upper() for t in peer_tickers
+        if t.strip() and t.strip().upper() != target_upper
+    ))
 
     if not peer_tickers:
         notes.append("No peer tickers available; comps could not be computed.")
@@ -482,7 +485,6 @@ def run_comps(
     if bs is not None:
         te = getattr(bs, "total_equity", None)
         total_equity = float(te) if is_num(te) else None
-    earnings_growth = _net_income_cagr(fin)
 
     # --- Implied price per multiple -------------------------------------------- #
     implied: dict = {}
@@ -498,8 +500,12 @@ def run_comps(
             revenue_latest=revenue_latest,
             ni_latest=ni_latest,
             total_equity=total_equity,
-            target_peg=getattr(target_row, "peg", None),
-            earnings_growth=earnings_growth,
+        )
+    if is_num(target_row.peg) or is_num(medians.get("peg")):
+        notes.append(
+            "PEG is shown for reference only and gives no implied price: the target uses "
+            "historical diluted EPS growth, while provider peer PEGs may use forward "
+            "growth over an unspecified horizon. Their growth bases are not comparable."
         )
 
     # --- A lender's EV multiples give no implied price ------------------------ #
@@ -516,7 +522,7 @@ def run_comps(
             f"{EQUITY_MULTIPLES_NOTE_PREFIX} ({flag[0]}): EV/EBITDA and EV/Sales give no "
             f"implied price, because most of the target's debt funds {funds} and is not a "
             "financing claim to strip out of enterprise value; the implied price uses P/E "
-            "and P/B (PEG, which rests on a volatile earnings CAGR, and the peer EV "
+            "and P/B (PEG, whose growth horizon is not comparable, and the peer EV "
             "multiples are shown for reference only).")
 
     # --- A collapsed latest net margin gives no earnings-based price ---------- #

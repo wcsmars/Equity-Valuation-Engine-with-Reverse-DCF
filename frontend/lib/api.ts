@@ -25,7 +25,9 @@ import { fmtBytes } from "./format";
 export function apiBase(): string {
   if (typeof window !== "undefined") {
     const p = new URLSearchParams(window.location.search).get("api");
-    if (p && /^\d+$/.test(p)) return `http://127.0.0.1:${p}`;
+    const local = ["127.0.0.1", "localhost", "[::1]"].includes(window.location.hostname);
+    if (local && p && /^\d+$/.test(p) && +p > 0 && +p <= 65535)
+      return `http://127.0.0.1:${Number(p)}`;
   }
   return "";
 }
@@ -134,13 +136,14 @@ function checkRequestSize(path: string, bytes: number): void {
   );
 }
 
-async function postJSON<T>(path: string, body: unknown): Promise<T> {
+async function postJSON<T>(path: string, body: unknown, timeoutMs?: number): Promise<T> {
   const payload = JSON.stringify(body);
   checkRequestSize(path, new TextEncoder().encode(payload).length);
   const res = await fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: payload,
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
   return res.json() as Promise<T>;
@@ -342,7 +345,7 @@ export async function saveResearchState(
   ticker: string,
   state: ResearchState
 ): Promise<void> {
-  await postJSON(`/api/research_state/${encodeURIComponent(ticker)}`, state);
+  await postJSON(`/api/research_state/${encodeURIComponent(ticker)}`, state, 15_000);
 }
 
 // Read a File into base64 (strips the data: URL prefix) for PDF upload.

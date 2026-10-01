@@ -30,27 +30,39 @@ async function isSettled(p) {
   return done;
 }
 
-test("the chain waits for an older save that is still in flight", async () => {
-  // A note merge-save (older) is still running when an autosave (newer)
-  // finishes: a load must keep waiting for the older one.
+test("writes are dispatched in edit order so a slow older save cannot overwrite newer research", async () => {
   const older = deferred();
   const newer = deferred();
-  let chain = chainSave(null, older.promise);
-  chain = chainSave(chain, newer.promise);
-  newer.resolve();
+  const calls = [];
+  let persisted = "";
+  let chain = chainSave(null, async () => {
+    calls.push("older");
+    await older.promise;
+    persisted = "older";
+  });
+  chain = chainSave(chain, async () => {
+    calls.push("newer");
+    await newer.promise;
+    persisted = "newer";
+  });
   assert.equal(await isSettled(chain), false);
+  assert.deepEqual(calls, ["older"]);
   older.resolve();
+  assert.equal(await isSettled(chain), false);
+  assert.deepEqual(calls, ["older", "newer"]);
+  newer.resolve();
   assert.equal(await isSettled(chain), true);
+  assert.equal(persisted, "newer");
 });
 
-test("a failed save settles the chain instead of rejecting it", async () => {
-  const failed = deferred();
-  const ok = deferred();
-  const chain = chainSave(chainSave(null, failed.promise), ok.promise);
-  failed.reject(new Error("413"));
-  ok.resolve();
-  await chain; // must not throw
+test("failed saves are visible but a retry can still succeed", async () => {
+  const failed = chainSave(null, async () => { throw new Error("413"); });
+  await assert.rejects(failed, /413/);
+  assert.equal(await settledWithin(failed, 1000), false);
+  const chain = chainSave(failed, async () => {});
+  await chain;
   assert.equal(await isSettled(chain), true);
+  assert.equal(await settledWithin(chain, 1000), true);
 });
 
 test("a load waits for the saves, but not forever", async () => {
@@ -63,7 +75,7 @@ test("a load waits for the saves, but not forever", async () => {
   // A save that never answers stops holding up the load after the bound.
   const hung = new Promise(() => {});
   const t0 = Date.now();
-  await settledWithin(hung, 30);
+  assert.equal(await settledWithin(hung, 30), false);
   assert.ok(Date.now() - t0 >= 25);
 });
 

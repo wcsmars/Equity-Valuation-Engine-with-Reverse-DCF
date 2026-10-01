@@ -28,6 +28,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+from backend import filings
+
 from equity_valuation.data.base import DataError
 from equity_valuation.data.edgar import _TAGS_REVENUE, EdgarClient
 from equity_valuation.data.provider import HybridProvider, _missing_debt_warning
@@ -1742,12 +1744,10 @@ class HybridProviderEdgarTests(unittest.TestCase):
         self.assertTrue(any("converted from USD to CAD at spot 1.3" in n
                             for n in cd.source_notes), cd.source_notes)
 
-    def test_missing_fx_rate_gives_a_leading_warning(self) -> None:
+    def test_missing_fx_rate_stops_unit_mixed_valuation(self) -> None:
         market = self._market(currency="CAD", price=13.0, market_cap=5200.0)
-        cd = self._provider(_base_usd(), market, fx=None).get_company_data("FIX")
-        self.assertEqual(cd.financials.revenue[-1], 1500.0)
-        self.assertTrue(cd.source_notes[1].startswith("WARNING: EDGAR statements are in USD"),
-                        cd.source_notes)
+        with self.assertRaisesRegex(DataError, "no USD->CAD exchange rate.*retry"):
+            self._provider(_base_usd(), market, fx=None).get_company_data("FIX")
 
 
 class FilingsListTests(unittest.TestCase):
@@ -1791,6 +1791,129 @@ class FilingsListTests(unittest.TestCase):
     def test_limit_counts_only_the_listed_forms(self) -> None:
         forms = ["424B2"] * 10 + ["8-K"] * 5
         self.assertEqual(self._list(forms, limit=3), ["8-K"] * 3)
+
+
+class EdgarBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.client = EdgarClient(user_agent="audit tests@example.com")
+
+    def test_balance_sheet_ignores_future_and_malformed_instant_facts(self):
+        usd = _base_usd()
+        usd["StockholdersEquity"] += [
+            _inst("2199-12-31", 99e12, filed="2025-02-01"),
+            _inst("2025-13-40", 99e12, filed="2026-02-01"),
+        ]
+        bs = self.client._build_balance_sheet(_company(usd), [])
+        self.assertEqual(bs.as_of, "2024-12-31")
+        self.assertEqual(bs.total_equity, 1000.0)
+
+    def test_flow_cannot_end_after_its_filing(self):
+        fact = {"start": "2030-01-01", "end": "2030-12-31", "filed": "2025-02-01",
+                "val": 100, "form": "10-K", "fp": "FY"}
+        self.assertIsNone(self.client._annual_fact(fact))
+
+    def test_gross_equity_excludes_noncontrolling_interest(self):
+        usd = _base_usd()
+        del usd["StockholdersEquity"]
+        usd["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = [
+            _inst("2024-12-31", 1200)]
+        usd["MinorityInterest"] = [_inst("2024-12-31", 200)]
+        bs = self.client._build_balance_sheet(_company(usd), [])
+        self.assertEqual(bs.total_equity, 1000.0)
+        self.assertEqual(bs.minority_interest, 200.0)
+
+    def test_parent_equity_excludes_preferred_book_value_only(self):
+        usd = _base_usd()
+        usd["PreferredStockValue"] = [_inst("2024-12-31", 100)]
+        usd["PreferredStockLiquidationPreferenceValue"] = [_inst("2024-12-31", 150)]
+        bs = self.client._build_balance_sheet(_company(usd), [])
+        self.assertEqual(bs.total_equity, 900.0)
+        self.assertEqual(bs.preferred_equity, 100.0)
+        del usd["PreferredStockValue"]
+        bs = self.client._build_balance_sheet(_company(usd), [])
+        self.assertEqual(bs.total_equity, 1000.0)  # a liquidation claim is not book value
+        self.assertEqual(bs.preferred_equity, 150.0)
+
+    def test_preferred_capital_includes_additional_paid_in_capital(self):
+        usd = _base_usd()
+        usd["PreferredStockValue"] = [_inst("2024-12-31", 1)]
+        usd["PreferredStockIncludingAdditionalPaidInCapitalNetOfDiscount"] = [
+            _inst("2024-12-31", 100)]
+        bs = self.client._build_balance_sheet(_company(usd), [])
+        self.assertEqual(bs.total_equity, 900.0)
+        self.assertEqual(bs.preferred_equity, 100.0)
+
+    def test_common_income_precedes_parent_and_consolidated_income(self):
+        usd = _base_usd()
+        usd["NetIncomeLossAvailableToCommonStockholdersBasic"] = [_fy(2024, 90)]
+        usd["ProfitLoss"] = [_fy(2024, 160)]
+        usd["NetIncomeLossAttributableToNoncontrollingInterest"] = [_fy(2024, 10)]
+        usd["PreferredStockDividendsAndOtherAdjustments"] = [_fy(2024, 5)]
+        fin, _bs, _notes = _parse(usd)
+        self.assertEqual(fin.net_income[-1], 90)
+        self.assertTrue(fin._income_attribution_adjusted)
+
+    def test_parent_income_only_subtracts_preferred_adjustments(self):
+        facts = _facts(NetIncomeLoss=[_fy(2024, 100)],
+                       NetIncomeLossAttributableToNoncontrollingInterest=[_fy(2024, 20)],
+                       PreferredStockDividendsAndOtherAdjustments=[_fy(2024, 5)])
+        self.assertEqual(self.client._common_net_income(facts, []), {2024: 95})
+
+    def test_consolidated_income_subtracts_signed_minority_earnings(self):
+        for minority, expected in ((20, 75), (-20, 115)):
+            with self.subTest(minority=minority):
+                facts = _facts(ProfitLoss=[_fy(2024, 100)],
+                               NetIncomeLossAttributableToNoncontrollingInterest=[_fy(2024, minority)],
+                               PreferredStockDividendsAndOtherAdjustments=[_fy(2024, 5)])
+                self.assertEqual(self.client._common_net_income(facts, []), {2024: expected})
+
+    def test_unresolved_gross_income_prevents_consolidated_profit_rebuild(self):
+        facts = _facts(ProfitLoss=[_fy(2024, 100)])
+        common = self.client._common_net_income(facts, [])
+        self.assertTrue(self.client._income_attribution_adjusted(facts, common, [2024]))
+
+    def test_fx_scaling_preserves_common_income_attribution(self):
+        from equity_valuation.data.market import scale_fundamentals
+
+        usd = _base_usd()
+        usd["NetIncomeLossAvailableToCommonStockholdersBasic"] = [_fy(2024, 90)]
+        fin, bs, _notes = _parse(usd)
+        converted, _bs = scale_fundamentals(fin, bs, 1.3)
+        self.assertEqual(converted.net_income[-1], 117)
+        self.assertTrue(converted._income_attribution_adjusted)
+
+class FilingsBoundaryTests(unittest.TestCase):
+    def test_line_start_checks_entire_prefix(self):
+        text = "Cross reference:  Item 1A. Risk Factors"
+        self.assertFalse(filings._at_line_start(text, text.index("Item")))
+        text = "Prior line\n    Item 1A. Risk Factors"
+        self.assertTrue(filings._at_line_start(text, text.index("Item")))
+
+    def test_sparse_optional_submissions_columns_do_not_crash(self):
+        recent = {"form": ["10-K", "8-K", "10-Q"],
+                  "accessionNumber": ["0000000001-25-000001", "0000000001-25-000002"],
+                  "primaryDocument": ["annual.htm", "current.htm"],
+                  "filingDate": ["2025-02-01"]}
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"filings": {"recent": recent}}
+        with mock.patch.object(filings._edgar, "resolve_cik", return_value=("0000000001", "Test")), \
+                mock.patch.object(filings.requests, "get", return_value=response):
+            result = filings.list_filings("TEST")
+        self.assertEqual(len(result["filings"]), 2)
+        self.assertEqual(result["filings"][1]["filed"], "")
+        self.assertEqual(result["filings"][0]["description"], "")
+
+    def test_material_cap_counts_section_headings(self):
+        sections = {"business": "b" * 20, "risk_factors": "r" * 20, "mdna": "m" * 20}
+        with mock.patch.object(filings, "fetch_filing_text", return_value="source"), \
+                mock.patch.object(filings, "extract_sections", return_value=sections), \
+                mock.patch.object(filings, "_TOTAL_CAP", 140):
+            material, meta = filings.build_filing_material("T", "10-K", "2025-01-01", "acc", "doc")
+        self.assertLessEqual(len(material), 140)
+        self.assertEqual(meta["material_chars"], len(material))
+
+    def test_self_closing_skip_tag_does_not_hide_filing(self):
+        self.assertEqual(filings._html_to_text('<head/><p>Operating results</p>'), "Operating results")
 
 
 if __name__ == "__main__":

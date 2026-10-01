@@ -99,6 +99,8 @@ def _safe_implied_price(
             realized_wacc = float(w)
 
     a = getattr(result, "assumptions", None) or {}
+    if a.get("valuation_available") is False:
+        price = float("nan")
     g_req, g_used = a.get("terminal_growth"), a.get("terminal_growth_used")
     if is_num(g_req) and is_num(g_used) and g_used != g_req:
         price = float("nan")  # g clamped to WACC - gap: not the column's growth
@@ -420,7 +422,7 @@ def build_football_field(report) -> list[FootballFieldRow]:
     # ----------------------------------------------------------------------- #
     # DCF — prefer the WACC x growth sensitivity spread, else +/-15% band
     # ----------------------------------------------------------------------- #
-    if dcf is not None:
+    if dcf is not None and (getattr(dcf, "assumptions", None) or {}).get("valuation_available") is not False:
         dcf_implied = getattr(dcf, "implied_price", None)
         grid_obj = _find_wacc_growth_grid(sensitivities)
         grid_vals = (
@@ -468,7 +470,7 @@ def build_football_field(report) -> list[FootballFieldRow]:
                 FootballFieldRow(method="DDM" + ddm_mark, low=low, base=base, high=high)
             )
 
-    if fcfe is not None:
+    if fcfe is not None and (getattr(fcfe, "detail", None) or {}).get("valuation_available") is not False:
         fcfe_price = getattr(fcfe, "implied_price", None)
         if is_num(fcfe_price):
             low, base, high = _band(float(fcfe_price), 0.10)

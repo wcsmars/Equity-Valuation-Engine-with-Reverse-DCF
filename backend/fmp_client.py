@@ -54,7 +54,7 @@ class FMPClient:
     @staticmethod
     def _first(data: Any) -> Optional[dict]:
         if isinstance(data, list) and data:
-            return data[0]
+            return data[0] if isinstance(data[0], dict) else None
         if isinstance(data, dict):
             return data
         return None
@@ -88,13 +88,13 @@ class FMPClient:
 
     def news(self, ticker: str, limit: int = 30) -> list[dict]:
         data = self._get("/api/v3/stock_news", {"tickers": ticker, "limit": limit})
-        return data if isinstance(data, list) else []
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def analyst_estimates(self, ticker: str, limit: int = 6) -> list[dict]:
         data = self._get(
             f"/api/v3/analyst-estimates/{ticker}", {"limit": limit, "period": "annual"}
         )
-        return data if isinstance(data, list) else []
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def transcripts_list(self, ticker: str, limit: int = 12) -> list[dict]:
         """Available earnings-call transcripts as [{quarter, year, date}]."""

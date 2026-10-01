@@ -53,4 +53,18 @@ echo "  Backend : http://127.0.0.1:8000  (docs at /docs)"
 echo "  Frontend: http://127.0.0.1:3000"
 echo "  Ctrl-C to stop both."
 echo ""
-wait
+# `wait` with no arguments waits for both servers. If one dies (for example
+# because its port is occupied), that leaves a half-working app running.
+# macOS ships Bash 3.2, so avoid the newer `wait -n` option.
+while kill -0 "$BACK" 2>/dev/null && kill -0 "$FRONT" 2>/dev/null; do
+  sleep 1
+done
+status=0
+if ! kill -0 "$BACK" 2>/dev/null; then
+  wait "$BACK" || status=$?
+  echo "Backend stopped; shutting down the frontend." >&2
+else
+  wait "$FRONT" || status=$?
+  echo "Frontend stopped; shutting down the backend." >&2
+fi
+exit "$status"

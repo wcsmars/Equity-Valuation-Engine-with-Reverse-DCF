@@ -13,10 +13,11 @@ UNIT CONVENTIONS (read carefully):
   * Share counts are absolute (e.g. 15_300_000_000.0 shares), never millions.
   * Per-share values are in currency units per share.
   * Rates / percentages are decimals: 8% -> 0.08, never 8.0.
-  * `capex`, `dep_amort`, `change_in_nwc`, `dividends_paid`, `interest_expense`
+  * `capex`, `dep_amort`, `dividends_paid`, `interest_expense`
     are stored as POSITIVE magnitudes (a cash outflow for capex is stored as +X,
     the models apply the sign). `tax_expense` keeps its sign: a tax benefit is
-    negative.
+    negative. `change_in_nwc` is signed: an increase is a positive cash use,
+    and a decrease is a negative cash use (a cash release).
   * Annual series (lists) are ordered OLDEST -> NEWEST. The last element is the
     most recent fiscal year and aligns with `BalanceSheetSnapshot`.
 """
@@ -200,6 +201,9 @@ class CompRow:
     pe: Optional[float] = None
     pb: Optional[float] = None
     peg: Optional[float] = None
+    # Currency of this issuer's market cap / enterprise value. Multiples are
+    # dimensionless; peer monetary amounts need not use the target's currency.
+    currency: Optional[str] = None
 
 
 @dataclass

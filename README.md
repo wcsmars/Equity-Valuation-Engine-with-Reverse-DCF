@@ -23,6 +23,8 @@ reproducible offline example is under [Results](#results).*
 - **Reverse DCF** (dashboard, `backend/valuation_service.py`): bisection on
   year-1 revenue growth to back out what the current share price implies, so the
   model answers "what do I have to believe?" as well as "what is it worth?".
+  The growth change fades to zero by the last explicit year, preserving the
+  computed path's shape and endpoint; the API returns the solved path too.
 - **EDGAR data layer**: XBRL company facts are normalized into annual statements
   keyed by reporting period rather than the XBRL fiscal-year field, so restated
   figures win and companies that switched tags still get a complete series.
@@ -34,8 +36,9 @@ reproducible offline example is under [Results](#results).*
   whose FCFF models are shown for reference only. Statements reported in another
   currency are converted, multi-class share counts are reconciled, and stale or
   missing EDGAR lines are filled from Yahoo with a note.
-- **Fails soft**: a missing input becomes a note that reaches the dashboard and the
-  exports instead of a crash, and every fallback the models take is recorded.
+- **Data-quality checks**: missing model inputs produce notes in the dashboard
+  and exports. A required exchange rate that cannot be obtained stops the run
+  with a clear error; amounts in different currencies are never mixed in a valuation.
 - **Stack**: Python 3.11 with pandas, requests, openpyxl, plotly, python-docx, and
   python-pptx; FastAPI; Next.js 15, React 19, TypeScript, and Tailwind; Electron;
   optional Anthropic API for the research assistant.
@@ -47,12 +50,12 @@ reproducible offline example is under [Results](#results).*
 | Data | EDGAR annual financials, yfinance prices and peer multiples; yfinance fundamentals (converted to the quote currency) when EDGAR has no usable or current US-dollar statements |
 | DCF | Forecast FCFF, CAPM/WACC on a Blume-adjusted beta, Gordon-growth or exit-multiple terminal value, enterprise-to-equity bridge |
 | Reverse DCF | Dashboard only: bisection on year-1 revenue growth to back out the growth rate implied by the current price |
-| Comparables | Peer multiples (EV/EBITDA, EV/Sales, P/E, P/B, PEG), outlier trimming, median-based implied prices; P/E and P/B only for financial companies |
+| Comparables | Peer multiples (EV/EBITDA, EV/Sales, P/E, P/B), outlier trimming, median-based implied prices; P/E and P/B only for financial companies. PEG is informational because growth horizons differ |
 | DDM / FCFE | Dividend and equity cash-flow valuations discounted at cost of equity |
 | Sensitivity | WACC/growth and margin/growth grids, plus valuation-range comparisons |
 | Decision | Blended target = median of the implied prices from the methods that apply to the company (a method that could not value it is left out, and a negative equity value counts as zero); verdict is Undervalued at +15% upside or more, Overvalued at -15% or less, otherwise Fairly valued. When only the DDM is left, its price is shown without a verdict |
 | Research | Filing retrieval, notes, watchlist, optional source-linked AI summaries and assumption suggestions |
-| Exports | Excel model, interactive HTML report, Word memo, PowerPoint briefing |
+| Exports | Excel model, interactive HTML report, Word memo, PowerPoint briefing with paginated peer tables, research sections, sources, and model notes |
 
 The median keeps one outlying method, such as a DDM on a low-payout stock, from
 dragging the blended target. For banks, insurers, REITs, BDCs, lenders,
@@ -169,7 +172,7 @@ price set at 20x trailing earnings.
 | Method | Implied price | vs. $40.84 price |
 | --- | ---: | ---: |
 | DCF (FCFF, WACC 9.5%) | $33.38 | -18.3% |
-| Comps (median of five peer multiples) | $42.88 | +5.0% |
+| Comps (median of four peer multiples) | $46.96 | +15.0% |
 | DDM | $10.99 | -73.1% |
 | FCFE | $31.41 | -23.1% |
 | **Blended target (median)** | **$32.40** | **-20.7%, Overvalued** |
@@ -193,6 +196,8 @@ npm ci
 npm run typecheck
 npm test
 npm run build
+cd ..
+npm --prefix desktop test
 ```
 
 The synthetic script checks WACC bounds, valuation identities, sensitivity
@@ -212,7 +217,9 @@ The EDGAR tests use hand-built filing payloads shaped like real filers (split
 or partial D&A and capex tags, restricted cash, debt under several tags, foreign
 reporting currencies, banks, insurers, lessors, and captive finance arms). The
 frontend tests cover the sensitivity-grid helpers, request ordering on ticker
-switches, upload limits, and number formatting. These checks do not establish
+switches, upload limits, recovery controls, peer currencies, and number formatting.
+Desktop tests cover startup failures, readiness timeouts, and unique export paths.
+These checks do not establish
 live data accuracy or investment performance.
 
 ## Project layout
@@ -234,7 +241,11 @@ request sizes.
 - **Data coverage.** Live data can be missing, stale, or rate-limited. Filers
   whose EDGAR US-dollar statements are missing, out of date, or only partial
   convenience translations (for example companies reporting in yuan or yen) use
-  yfinance statements converted to the quote currency at one spot rate. When
+  yfinance statements converted to the quote currency at one spot rate. If a
+  required exchange rate is unavailable, valuation stops with a retry message.
+  Peer market caps and enterprise values retain each peer's quote currency,
+  labeled on the row. Common book equity excludes reported noncontrolling
+  interests and preferred book capital. When
   EDGAR tags miss them, debt comes from Yahoo's balance sheet nearest the filing
   date and capex from Yahoo's annual cash flow; Yahoo covers about four years, so
   older gaps stay empty. D&A and capex are the largest figures tagged for each
@@ -259,9 +270,11 @@ request sizes.
 - **Other methods.** The DDM counts regular dividends only and ignores buybacks,
   which understates banks and heavy repurchasers. Peers are not discovered
   automatically; comps apply peers' trailing multiples to the target's latest
-  fiscal-year earnings, and P/E and PEG are dropped when the latest earnings are
-  depressed by a one-off charge. Margin history can span a spin-off or a change
-  of business.
+  fiscal-year earnings. P/E is dropped when the latest earnings are depressed
+  by a one-off charge. PEG is shown for context only: Yahoo's peer growth horizon
+  is not consistently comparable with the target's historical diluted-EPS CAGR,
+  so PEG produces no implied price and carries no weight in the blended target.
+  Margin history can span a spin-off or a change of business.
 
 Use the rate, growth, and exit-multiple flags and the sensitivity grid to explore
 the range. Review source data, peer selection, and assumptions before relying on

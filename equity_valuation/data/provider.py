@@ -34,8 +34,8 @@ Data selection:
      never replaced, and nothing is filled for a bank, insurer, BDC or
      REIT, or when Yahoo's capex does not match EDGAR's where both report.
   5. Put fundamentals and price in one currency: EDGAR statements are USD, the
-     yfinance fallback converts to the quote currency itself; a missing FX rate
-     yields a WARNING note rather than silently mixed currencies.
+     yfinance fallback converts to the quote currency itself; a missing required
+     FX rate stops valuation with DataError rather than mixing currencies.
   6. Backfill market fields yfinance could not supply (shares outstanding,
      market cap, dividend per share) from the statements, with a note each.
   7. Assemble and return ``CompanyData``. ``source_notes`` records which
@@ -316,8 +316,10 @@ class HybridProvider(DataProvider):
 
         # --- 4) If both sources failed, we cannot value the company. -------------
         if financials is None or balance_sheet is None:
+            detail = " ".join(source_notes)
             raise DataError(
                 f"No usable fundamentals for {symbol!r} from SEC EDGAR or yfinance."
+                + (f" {detail}" if detail else "")
             )
 
         # --- 5) Data-quality notes, currency alignment and market backfills. ------
@@ -681,13 +683,12 @@ class HybridProvider(DataProvider):
             except Exception:  # noqa: BLE001 -- best-effort
                 fx = None
         if not (isinstance(fx, tuple) and len(fx) == 2 and is_num(fx[0]) and fx[0] > 0):
-            notes.append(
-                f"WARNING: EDGAR statements are in USD but the share price is in "
+            raise DataError(
+                f"EDGAR statements are in USD but the share price is in "
                 f"{quote_ccy}, and no USD->{quote_ccy} exchange rate could be "
-                "fetched; statements were NOT converted, so DCF, FCFE and comps "
-                "per-share values are not comparable with the price"
+                "fetched. Valuation stopped to avoid mixing currencies; retry when "
+                "exchange-rate data is available."
             )
-            return financials, balance_sheet
         rate, how = fx
         notes.append(
             f"Fundamentals converted from USD to {quote_ccy} at spot {rate:.6g} "

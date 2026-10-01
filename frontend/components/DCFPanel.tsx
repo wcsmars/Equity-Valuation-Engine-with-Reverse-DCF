@@ -45,28 +45,17 @@ export default function DCFPanel({
   const dcf = report.dcf;
   const cur = report.summary.currency;
 
-  if (!dcf) {
-    return (
-      <Card title="DCF">
-        <EmptyState
-          title="DCF unavailable"
-          hint={(report.warnings || []).join(" · ")}
-        />
-      </Card>
-    );
-  }
-
   // --- Display defaults derived from the report --------------------------- //
   const fin = report.company.financials;
   const lastRev = fin.revenue?.at(-1) ?? 0;
   const lastEbit = fin.ebit?.at(-1) ?? 0;
-  const dcfA = dcf.assumptions as Record<string, unknown>;
+  const dcfA = (dcf?.assumptions || {}) as Record<string, unknown>;
   // Left out of the blended target (e.g. a bank, a captive-finance group or a
   // lessor): the DCF is then shown for reference only.
   const notInBlend = excludedReason(report.summary, "DCF");
-  const waccDetail = (dcf.wacc?.detail || {}) as Record<string, unknown>;
+  const waccDetail = (dcf?.wacc?.detail || {}) as Record<string, unknown>;
   const beta = betaStat(
-    dcf.wacc?.beta,
+    dcf?.wacc?.beta,
     waccDetail.beta_raw as number | null | undefined,
     waccDetail.beta_source
   );
@@ -97,14 +86,14 @@ export default function DCFPanel({
   const terminalMethod = assumptions.terminal_method ?? "gordon";
   const exitEvEbitda = assumptions.exit_ev_ebitda ?? 12;
 
-  // --- Projection series (all aligned to dcf.years) ----------------------- //
-  const years = dcf.years || [];
-  const rev = dcf.revenue || [];
-  const ebit = dcf.ebit || [];
-  const nopat = dcf.nopat || [];
-  const fcff = dcf.fcff || [];
-  const dfac = dcf.discount_factors || [];
-  const pvf = dcf.pv_fcff || [];
+  // --- Projection series (all aligned to dcf?.years) ----------------------- //
+  const years = dcf?.years || [];
+  const rev = dcf?.revenue || [];
+  const ebit = dcf?.ebit || [];
+  const nopat = dcf?.nopat || [];
+  const fcff = dcf?.fcff || [];
+  const dfac = dcf?.discount_factors || [];
+  const pvf = dcf?.pv_fcff || [];
   const sumPvFcff = pvf.reduce<number>(
     (acc, v) => acc + (typeof v === "number" && Number.isFinite(v) ? v : 0),
     0
@@ -135,19 +124,19 @@ export default function DCFPanel({
 
   const bridge: { label: string; value: React.ReactNode; strong?: boolean }[] = [
     { label: "Sum PV(FCFF)", value: fmtBig(sumPvFcff, cur) },
-    { label: "Terminal value", value: fmtBig(dcf.terminal_value, cur) },
-    { label: "PV of terminal", value: fmtBig(dcf.pv_terminal, cur) },
-    { label: "Enterprise value", value: fmtBig(dcf.enterprise_value, cur), strong: true },
-    { label: "(−) Net debt", value: fmtBig(dcf.net_debt, cur) },
+    { label: "Terminal value", value: fmtBig(dcf?.terminal_value, cur) },
+    { label: "PV of terminal", value: fmtBig(dcf?.pv_terminal, cur) },
+    { label: "Enterprise value", value: fmtBig(dcf?.enterprise_value, cur), strong: true },
+    { label: "(−) Net debt", value: fmtBig(dcf?.net_debt, cur) },
     ...(minority != null
       ? [{ label: "(−) Minority interest", value: fmtBig(minority, cur) }]
       : []),
     ...(preferred != null
       ? [{ label: "(−) Preferred equity", value: fmtBig(preferred, cur) }]
       : []),
-    { label: "Equity value", value: fmtBig(dcf.equity_value, cur), strong: true },
-    { label: "Shares", value: fmtCount(dcf.shares) },
-    { label: "Implied price", value: fmtMoney(dcf.implied_price, cur), strong: true },
+    { label: "Equity value", value: fmtBig(dcf?.equity_value, cur), strong: true },
+    { label: "Shares", value: fmtCount(dcf?.shares) },
+    { label: "Implied price", value: fmtMoney(dcf?.implied_price, cur), strong: true },
   ];
 
   return (
@@ -191,7 +180,7 @@ export default function DCFPanel({
             format={(v) => fmtPct(v)}
             hint="Year-1 revenue growth; fades to terminal"
             onChange={(v) =>
-              setAssumptions({ ...assumptions, revenue_growth_y1: v })
+              setAssumptions({ ...assumptions, revenue_growth_y1: v, revenue_growth: undefined })
             }
           />
           <AssumptionSlider
@@ -284,6 +273,10 @@ export default function DCFPanel({
                 "Recompute"
               )}
             </Button>
+            <Button variant="ghost" className="ml-2" disabled={recomputing} onClick={() => {
+              setAssumptions({});
+              onRecompute({});
+            }}>Reset defaults</Button>
             <p className="mt-2 text-[11px] text-ink-faint">
               Adjust drivers, then recompute (re-uses cached data — instant).
             </p>
@@ -292,7 +285,7 @@ export default function DCFPanel({
       </Card>
 
       {/* --- Results --------------------------------------------------- */}
-      <Card
+      {dcf ? <Card
         title="DCF output"
         subtitle={
           notInBlend
@@ -304,18 +297,18 @@ export default function DCFPanel({
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
           <Stat
             label={notInBlend ? "Implied price (ref.)" : "Implied price"}
-            value={fmtMoney(dcf.implied_price, cur)}
-            tone={toneForMethodUpside(report.summary, "DCF", dcf.upside)}
-            sub={fmtPct(dcf.upside, { signed: true })}
+            value={fmtMoney(dcf?.implied_price, cur)}
+            tone={toneForMethodUpside(report.summary, "DCF", dcf?.upside)}
+            sub={fmtPct(dcf?.upside, { signed: true })}
           />
-          <Stat label="WACC" value={fmtPct(dcf.wacc?.wacc)} />
+          <Stat label="WACC" value={fmtPct(dcf?.wacc?.wacc)} />
           <Stat
             label="Cost of equity"
-            value={fmtPct(dcf.wacc?.cost_of_equity)}
+            value={fmtPct(dcf?.wacc?.cost_of_equity)}
           />
           <Stat
             label="After-tax cost of debt"
-            value={fmtPct(dcf.wacc?.after_tax_cost_of_debt)}
+            value={fmtPct(dcf?.wacc?.after_tax_cost_of_debt)}
           />
           <Stat
             label={beta.label}
@@ -325,7 +318,7 @@ export default function DCFPanel({
           />
           <Stat
             label="Equity weight"
-            value={fmtPct(dcf.wacc?.weight_equity)}
+            value={fmtPct(dcf?.wacc?.weight_equity)}
           />
         </div>
 
@@ -335,12 +328,12 @@ export default function DCFPanel({
             <div className="text-[11px] font-semibold uppercase tracking-wider text-brand">
               Reverse DCF — what&apos;s priced in
             </div>
-            {report.reverse_dcf.converged &&
-            report.reverse_dcf.implied_growth_y1 != null ? (
+            {report.reverse_dcf?.converged &&
+            report.reverse_dcf?.implied_growth_y1 != null ? (
               <div className="mt-1 flex flex-wrap items-baseline gap-x-6 gap-y-1">
                 <div>
                   <span className="num text-lg font-semibold text-ink">
-                    {fmtPct(report.reverse_dcf.implied_growth_y1)}
+                    {fmtPct(report.reverse_dcf?.implied_growth_y1)}
                   </span>
                   <span className="ml-2 text-xs text-ink-dim">
                     year-1 revenue growth implied by the market price
@@ -349,18 +342,22 @@ export default function DCFPanel({
                 <div className="text-xs text-ink-dim">
                   vs{" "}
                   <span className="num font-medium text-ink">
-                    {fmtPct(revenueGrowthY1)}
+                    {fmtPct(report.reverse_dcf.current_assumption_y1 ??
+                      (dcfA.revenue_growth_path as number[] | undefined)?.[0])}
                   </span>{" "}
-                  in your model — the gap is what you&apos;d have to believe to
+                  in the computed model — the gap is what you&apos;d have to believe to
                   own it at this price.
                 </div>
               </div>
             ) : (
               <p className="mt-1 text-xs text-ink-dim">
-                {report.reverse_dcf.note ||
+                {report.reverse_dcf?.note ||
                   "No growth rate in a plausible range reproduces the market price with the current assumptions."}
               </p>
             )}
+            <p className="mt-2 text-[11px] text-ink-faint">
+              The near-term growth shift fades to zero by the final forecast year.
+            </p>
           </div>
         )}
 
@@ -424,7 +421,12 @@ export default function DCFPanel({
             ))}
           </div>
         </div>
-      </Card>
+      </Card> : (
+        <Card title="DCF unavailable" className="lg:col-span-2">
+          <EmptyState title="No valid DCF at the current inputs"
+            hint={(report.warnings || []).join(" · ") || "Adjust the assumptions and recompute."} />
+        </Card>
+      )}
     </div>
   );
 }

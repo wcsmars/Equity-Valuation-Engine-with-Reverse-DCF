@@ -24,7 +24,7 @@ from equity_valuation.engine import (
     _fallback_football_field,
     _recommendation,
 )
-from equity_valuation.models.comps import EARNINGS_COLLAPSE_NOTE_PREFIX, run_comps
+from equity_valuation.models.comps import EARNINGS_COLLAPSE_NOTE_PREFIX, _eps_cagr, run_comps
 from equity_valuation.models.dcf import margin_fade_target, run_dcf
 from equity_valuation.models.ddm_fcfe import (
     _dividend_cagr,
@@ -306,6 +306,22 @@ class DDMFixTests(unittest.TestCase):
         self.assertEqual(run_fcfe(self.company, self.macro, a, self.price).implied_price,
                          run_fcfe(self.company, self.macro, DDMAssumptions(), self.price).implied_price)
 
+    def test_dividend_growth_tracks_each_share_not_total_payout(self):
+        fin = replace(self.company.financials, dividends_paid=[100.0] * 5,
+                      diluted_shares=[100.0 * 0.9 ** i for i in range(5)])
+        self.assertAlmostEqual(_dividend_cagr(fin), 1.0 / 0.9 - 1.0)
+        # Issuing more shares at an unchanged dividend per share is not a
+        # dividend restart or step-change in the investor's cash distribution.
+        fin = replace(fin, dividends_paid=[10, 10, 30, 30, 30],
+                      diluted_shares=[100, 100, 300, 300, 300])
+        self.assertEqual(_dividend_cagr(fin), 0.0)
+
+    def test_missing_dividend_share_history_discloses_proxy(self):
+        fin = replace(self.company.financials, diluted_shares=[])
+        notes = []
+        self.assertAlmostEqual(_dividend_cagr(fin, notes), 0.08)
+        self.assertTrue(any("proxy for per-share growth" in n for n in notes))
+
 
 class FCFEFixTests(unittest.TestCase):
     def setUp(self):
@@ -335,6 +351,18 @@ class FCFEFixTests(unittest.TestCase):
             debt += fcfe_t - operating  # ΔDebt_t
             self.assertAlmostEqual(debt / rev_t, ratio, places=9)
             prev_rev = rev_t
+
+    def test_common_earnings_are_not_rebuilt_from_consolidated_profit(self):
+        fin = _company_from_revenue([100.0, 100.0], net_income=[1.0, 1.0],
+                                    pretax_income=[10.0, 10.0],
+                                    tax_expense=[2.0, 2.0]).financials
+        fin._income_attribution_adjusted = True
+        c = replace(self.company, financials=fin)
+        result = run_fcfe(c, self.macro, DDMAssumptions(), self.price)
+        self.assertEqual(result.detail["net_margin"], 0.01)
+        self.assertIsNone(net_margin_collapse(fin))
+        self.assertTrue(any("Common earnings attribution retained" in n
+                            for n in result.detail["notes"]))
 
 
 class SensitivityFixTests(unittest.TestCase):
@@ -462,6 +490,36 @@ class BlendedTargetZeroTests(unittest.TestCase):
         self.assertIsNone(s["blended_target"])
         self.assertIsNone(s["blended_upside"])
         self.assertEqual(s["recommendation"], "N/A")
+
+    def test_completed_zero_value_is_distinct_from_missing_data(self):
+        base = make_company()
+        c = _with_bs(base, total_debt=0.0, cash_and_investments=0.0)
+        c = _with_fin(c, net_income=[0.0] * 5, ebit=[0.0] * 5,
+                      pretax_income=[0.0] * 5, interest_expense=[0.0] * 5,
+                      change_in_nwc=[0.0] * 5, capex=base.financials.dep_amort)
+        for dcf_enabled in (True, False):
+            with self.subTest(model="DCF" if dcf_enabled else "FCFE"):
+                report = value_company("SYNT", provider=_OneCompanyProvider(c),
+                                       run_dcf=dcf_enabled, run_fcfe=not dcf_enabled,
+                                       run_comps=False, run_ddm=False, run_sensitivity=False)
+                self.assertEqual(report.summary["blended_target"], 0.0)
+                self.assertEqual(report.summary["blended_upside"], -1.0)
+                self.assertEqual(report.summary["excluded_from_blend"], {})
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    _print_summary(report)
+                method = "DCF" if dcf_enabled else "FCFE"
+                line = next(line for line in out.getvalue().splitlines() if line.strip().startswith(method))
+                self.assertIn("-100.0%", line)
+
+    def test_missing_shares_do_not_make_zero_sensitivity_prices(self):
+        c = _with_market(make_company(), shares_outstanding=0.0)
+        c = _with_fin(c, diluted_shares=[0.0] * 5)
+        report = value_company("SYNT", provider=_OneCompanyProvider(c), run_comps=False,
+                               run_ddm=False, run_fcfe=False)
+        self.assertFalse(report.dcf.assumptions["valuation_available"])
+        self.assertTrue(all(math.isnan(v) for grid in report.sensitivities for row in grid.grid for v in row))
+        self.assertNotIn("DCF", [r.method for r in report.football_field])
+        self.assertNotIn("DCF", [r.method for r in _fallback_football_field(report)])
 
     def test_recommendation_needs_a_target_and_a_positive_price(self):
         self.assertEqual(_recommendation(0.0, 10.0), "Overvalued")
@@ -654,7 +712,7 @@ class CapexIntensityTests(unittest.TestCase):
         self.assertTrue(any("growth-phase" in n for n in dcf.assumptions["notes"]))
         flat = run_dcf(c, self.macro, DCFAssumptions(capex_pct_revenue=0.15), self.price)
         self.assertLess(flat.fcff[-1], 0)
-        self.assertTrue(any("final-year FCFF is negative" in n for n in flat.assumptions["notes"]))
+        self.assertTrue(any("stable-year FCFF is negative" in n for n in flat.assumptions["notes"]))
         fcfe = run_fcfe(c, self.macro, DDMAssumptions(), self.price)
         self.assertAlmostEqual(fcfe.detail["capex_pct_path"][-1], path[-1], places=9)
         self.assertTrue(any("growth-phase" in n for n in fcfe.detail["notes"]))
@@ -1382,7 +1440,7 @@ class FinancialCompsTests(unittest.TestCase):
                             sector="Financial Services")
         full = self._comps(make_company())
         comps = self._comps(bank)
-        for m in ("ev_ebitda", "ev_sales", "peg"):
+        for m in ("ev_ebitda", "ev_sales"):
             self.assertIsNone(comps.implied[m], m)
             self.assertIsNotNone(full.implied[m], m)
         self.assertAlmostEqual(comps.implied["pe"], full.implied["pe"], places=9)
@@ -1402,15 +1460,16 @@ class FinancialCompsTests(unittest.TestCase):
             self.assertIsNone(comps.implied["ev_ebitda"])
             self.assertIsNotNone(comps.implied["pb"])
 
-    def test_reits_and_operating_companies_keep_every_multiple(self):
+    def test_reits_and_operating_companies_keep_standard_multiples(self):
         reit = _with_market(make_company(), industry="REIT - Retail", sector="Real Estate")
         for company in (make_company(), reit):
             comps = self._comps(company)
             self.assertTrue(all(comps.implied[m] is not None
-                                for m in ("ev_ebitda", "ev_sales", "pe", "pb", "peg")))
+                                for m in ("ev_ebitda", "ev_sales", "pe", "pb")))
+            self.assertIsNone(comps.implied["peg"])
             self.assertFalse(any(n.startswith("Equity multiples only") for n in comps.notes))
         report = value_company("SYNT", provider=SyntheticProvider(), peers=DEMO_PEERS)
-        self.assertAlmostEqual(report.summary["methods"]["Comps (median)"], 42.88, places=2)
+        self.assertAlmostEqual(report.summary["methods"]["Comps (median)"], 46.96, places=2)
 
     def test_mortgage_reits_are_lenders(self):
         # AGNC, NLY, STWD: repo and warehouse debt funds a loan book, not property.
@@ -1631,7 +1690,7 @@ class DividendRunTests(unittest.TestCase):
     def test_gm_shaped_suspension_falls_back_to_sustainable_growth(self):
         notes: list[str] = []
         self.assertIsNone(_dividend_cagr(self._fin(self.GM), notes))
-        self.assertTrue(any(n.startswith("Dividends paid more than doubled in FY2022")
+        self.assertTrue(any(n.startswith("Dividends paid per share more than doubled in FY2022")
                             and "no dividend CAGR" in n for n in notes))
         c = _with_bs(_company_from_revenue([100e9] * 8, dividends_paid=list(self.GM)),
                      total_equity=400e9)  # ROE ~4.7%, as for GM
@@ -1644,7 +1703,7 @@ class DividendRunTests(unittest.TestCase):
         divs = [2.0, 0.9] + [1.0 * 1.05 ** i for i in range(6)]
         notes: list[str] = []
         self.assertAlmostEqual(_dividend_cagr(self._fin(divs), notes), 0.05, places=12)
-        self.assertTrue(any(n.startswith("Dividends paid fell by more than half in FY2019")
+        self.assertTrue(any(n.startswith("Dividends paid per share fell by more than half in FY2019")
                             for n in notes))
 
     def test_one_year_specials_are_skipped_not_breaks(self):
@@ -1654,7 +1713,7 @@ class DividendRunTests(unittest.TestCase):
         notes: list[str] = []
         got = _dividend_cagr(self._fin([v * 1e6 for v in cost]), notes)
         self.assertAlmostEqual(got, (2183 / 689) ** (1 / 7) - 1, places=12)
-        self.assertEqual(notes, ["Dividends paid in FY2021, FY2024 were more than double both "
+        self.assertEqual(notes, ["Dividends paid per share in FY2021, FY2024 were more than double both "
                                  "neighbouring years (a special dividend); left out of the "
                                  "dividend CAGR as one-offs, not read as breaks in the paying "
                                  "run."])
@@ -1667,23 +1726,23 @@ class DividendRunTests(unittest.TestCase):
         notes = []
         divs = [5.0, 0.9, 1.0, 1.05, 3.0, 1.157625, 1.21550625]
         self.assertAlmostEqual(_dividend_cagr(self._fin(divs), notes), 0.05, places=12)
-        self.assertTrue(notes[0].startswith("Dividends paid in FY2023 were more than double"))
-        self.assertTrue(notes[1].startswith("Dividends paid fell by more than half in FY2020")
+        self.assertTrue(notes[0].startswith("Dividends paid per share in FY2023 were more than double"))
+        self.assertTrue(notes[1].startswith("Dividends paid per share fell by more than half in FY2020")
                         and "the CAGR covers the 4 paying years since (FY2021-FY2025)" in notes[1])
 
     def test_what_still_breaks_the_run(self):
         # AGCO: specials over four years in a row, then a normal FY2025.
         notes: list[str] = []
         self.assertIsNone(_dividend_cagr(self._fin([47, 48, 48, 358, 404, 457, 273, 86]), notes))
-        self.assertTrue(notes[0].startswith("Dividends paid fell by more than half in FY2025"))
+        self.assertTrue(notes[0].startswith("Dividends paid per share fell by more than half in FY2025"))
         # A special in the latest year: one neighbour cannot show it is a one-off.
         notes = []
         self.assertIsNone(_dividend_cagr(self._fin([1.0, 1.05, 1.1, 1.15, 3.5]), notes))
-        self.assertTrue(notes[0].startswith("Dividends paid more than doubled in FY2025"))
+        self.assertTrue(notes[0].startswith("Dividends paid per share more than doubled in FY2025"))
         # A spike whose neighbours are not in line with each other is a break.
         notes = []
         self.assertIsNone(_dividend_cagr(self._fin([1.0, 1.0, 1.0, 5.0, 2.2, 2.3]), notes))
-        self.assertTrue(notes[0].startswith("Dividends paid fell by more than half in FY2024"))
+        self.assertTrue(notes[0].startswith("Dividends paid per share fell by more than half in FY2024"))
         # The trough of a suspension is not a one-year dip to skip (GM).
         notes = []
         self.assertIsNone(_dividend_cagr(self._fin(self.GM), notes))
@@ -2201,11 +2260,11 @@ class CompsEarningsCollapseTests(unittest.TestCase):
     def test_peg_on_the_same_eps_goes_too(self):
         c = self._company([0.0001, 0.0700, 0.0700, 0.0003])  # a positive earnings CAGR
         full = self._comps(c, tax_rate=0.99)  # a 99% tax leaves no collapse to screen
-        self.assertIsNotNone(full.implied["peg"])
+        self.assertIsNone(full.implied["peg"])
         comps = self._comps(c)
         self.assertIsNone(comps.implied["pe"])
         self.assertIsNone(comps.implied["peg"])
-        self.assertTrue(any("so P/E and PEG give no implied price" in n for n in comps.notes))
+        self.assertTrue(any("so P/E gives no implied price" in n for n in comps.notes))
 
     def test_what_keeps_the_pe(self):
         # A net margin that has always been thin (under a quarter of what EBIT
@@ -2227,7 +2286,7 @@ class CompsEarningsCollapseTests(unittest.TestCase):
         # SYNT comps are unchanged.
         self.assertAlmostEqual(value_company("SYNT", provider=SyntheticProvider(),
                                              peers=DEMO_PEERS).summary["methods"]["Comps (median)"],
-                               42.88, places=2)
+                               46.96, places=2)
 
 
 class CompsChargeInsideEBITTests(unittest.TestCase):
@@ -2455,6 +2514,140 @@ class WarningPrefixTests(unittest.TestCase):
         _add_notes(report, "DCF", ["WARNING: charge year", "plain note", "WARNING: charge year"])
         self.assertEqual(report.warnings, ["WARNING: DCF: charge year", "DCF: plain note"])
 
+
+
+class TerminalCashFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.company = make_company()
+        self.macro = MacroAssumptions()
+
+    def dcf(self, assumptions, company=None):
+        return run_dcf(company or self.company, self.macro, assumptions, self.company.market.price)
+
+    def test_clamped_terminal_growth_also_ends_automatic_fade(self):
+        result = self.dcf(DCFAssumptions(terminal_growth=0.20))
+        self.assertAlmostEqual(result.assumptions["revenue_growth_path"][-1],
+                               result.assumptions["terminal_growth_used"])
+        self.assertLess(result.assumptions["terminal_growth_used"], 0.20)
+
+    def test_terminal_working_capital_uses_stable_revenue_change(self):
+        a = DCFAssumptions(revenue_growth=[0.20] * 3, forecast_years=3,
+                           nwc_pct_revenue=0.40, capex_pct_revenue=0.05,
+                           da_pct_revenue=0.04, tax_rate=0.21, terminal_growth=0.025)
+        result = self.dcf(a)
+        self.assertEqual(result.assumptions["revenue_growth_path"], [0.20] * 3)
+        stable_revenue = result.revenue[-1] * 1.025
+        stable_ebit = stable_revenue * result.assumptions["ebit_margin_path"][-1]
+        stable_fcff = stable_ebit * 0.79 + stable_revenue * (0.04 - 0.05) \
+            - result.revenue[-1] * 0.025 * 0.40
+        self.assertAlmostEqual(result.assumptions["terminal_fcff"] / stable_fcff, 1.0)
+        self.assertAlmostEqual(result.terminal_value * (result.wacc.wacc - 0.025)
+                               / stable_fcff, 1.0)
+
+    def test_moving_one_stable_year_into_forecast_preserves_value(self):
+        # This identity checks the boundary between explicit and perpetual
+        # periods, including a growth-capex fade and working capital.
+        c = replace(self.company, financials=replace(
+            self.company.financials,
+            capex=[r * 0.20 for r in self.company.financials.revenue],
+        ))
+        a = DCFAssumptions(forecast_years=2, revenue_growth=[0.20, 0.20],
+                           terminal_growth=0.025, mid_year_convention=False,
+                           nwc_pct_revenue=0.40)
+        short = self.dcf(a, c)
+        longer = self.dcf(replace(a, forecast_years=3, revenue_growth=[0.20, 0.20, 0.025]), c)
+        self.assertAlmostEqual(short.enterprise_value / longer.enterprise_value, 1.0, places=12)
+
+    def test_invalid_explicit_growth_is_not_silently_removed(self):
+        for growth in ([0.10, float("nan"), 0.02], [-1.0], [-1.5]):
+            with self.subTest(growth=growth), self.assertRaises(ValueError):
+                self.dcf(DCFAssumptions(revenue_growth=growth))
+
+    def test_invalid_exit_multiple_and_terminal_growth_fail(self):
+        for multiple in (0.0, -2.0):
+            with self.subTest(multiple=multiple), self.assertRaises(ValueError):
+                self.dcf(DCFAssumptions(terminal_method="exit_multiple", exit_ev_ebitda=multiple))
+        with self.assertRaises(ValueError):
+            self.dcf(DCFAssumptions(terminal_growth=-1.0))
+
+    def test_negative_share_fallback_does_not_reverse_equity_value(self):
+        c = replace(self.company,
+                    market=replace(self.company.market, shares_outstanding=0.0),
+                    financials=replace(self.company.financials, diluted_shares=[-100.0]))
+        result = self.dcf(DCFAssumptions(), c)
+        self.assertGreater(result.equity_value, 0)
+        self.assertEqual(result.implied_price, 0.0)
+        self.assertEqual(result.shares, 0.0)
+
+class DividendDomainTests(unittest.TestCase):
+    def setUp(self):
+        self.company = make_company()
+        self.macro = MacroAssumptions()
+
+    def test_finite_high_growth_can_exceed_discount_rate(self):
+        a = DDMAssumptions(high_growth_rate=0.25, high_growth_years=3, terminal_growth=0.025)
+        result = run_ddm(self.company, self.macro, a, self.company.market.price)
+        ke, d0 = result.cost_of_equity, self.company.market.dividend_per_share
+        self.assertLess(ke, 0.25)
+        expected = sum(d0 * 1.25 ** t / (1.0 + ke) ** t for t in range(1, 4))
+        expected += d0 * 1.25 ** 3 * 1.025 / (ke - 0.025) / (1.0 + ke) ** 3
+        self.assertAlmostEqual(result.implied_price, expected)
+        self.assertEqual(result.detail["high_growth"], 0.25)
+
+    def test_h_model_keeps_finite_high_growth(self):
+        a = DDMAssumptions(method=" H_Model ", high_growth_rate=0.25,
+                           high_growth_years=4, terminal_growth=0.025)
+        result = run_ddm(self.company, self.macro, a, self.company.market.price)
+        d0 = self.company.market.dividend_per_share
+        expected = d0 * (1.025 + 2 * (0.25 - 0.025)) / (result.cost_of_equity - 0.025)
+        self.assertAlmostEqual(result.implied_price, expected)
+
+    def test_nonpositive_discount_rate_is_unavailable(self):
+        macro = MacroAssumptions(risk_free_rate=-0.20, equity_risk_premium=0.01)
+        for model in (run_ddm, run_fcfe):
+            with self.subTest(model=model.__name__), self.assertRaises(ValueError):
+                model(self.company, macro, DDMAssumptions(), self.company.market.price)
+
+    def test_impossible_growth_and_negative_dividend_are_unavailable(self):
+        for model in (run_ddm, run_fcfe):
+            with self.subTest(model=model.__name__), self.assertRaises(ValueError):
+                model(self.company, self.macro, DDMAssumptions(terminal_growth=-1.0), 30)
+        with self.assertRaises(ValueError):
+            run_ddm(self.company, self.macro, DDMAssumptions(high_growth_rate=-1.0), 30)
+        c = replace(self.company, market=replace(self.company.market, dividend_per_share=-1.0))
+        self.assertIsNone(run_ddm(c, self.macro, DDMAssumptions(), 30))
+
+class PeerWeightingTests(unittest.TestCase):
+    def test_duplicate_peer_requests_and_rows_get_one_vote(self):
+        class Provider:
+            def get_peer_comp_rows(self, tickers):
+                self.requested = tickers
+                return [CompRow("P1", "One", pe=10), CompRow(" p1 ", "One", pe=10),
+                        CompRow("P2", "Two", pe=20), CompRow("P3", "Three", pe=30)]
+
+        provider = Provider()
+        company = make_company()
+        result = run_comps(company, provider, [" p1 ", "P1", "P2", "P3", " synt "], 30)
+        self.assertEqual(provider.requested, ["P1", "P2", "P3"])
+        self.assertEqual(len(result.peers), 3)
+        self.assertEqual(result.stats["pe"]["median"], 20)
+
+    def test_earnings_cagr_uses_elapsed_fiscal_years(self):
+        fin = replace(make_company().financials, fiscal_years=[2019, 2022, 2025],
+                      net_income=[100, 133.1, 177.1561], diluted_shares=[10, 10, 10])
+        self.assertAlmostEqual(_eps_cagr(fin), 0.10)
+
+    def test_eps_growth_accounts_for_dilution_and_peg_stays_reference_only(self):
+        company = make_company()
+        fin = replace(company.financials, fiscal_years=[2020, 2025],
+                      net_income=[100.0, 200.0], diluted_shares=[10.0, 20.0])
+        self.assertEqual(_eps_cagr(fin), 0.0)
+        comps = run_comps(company, SyntheticProvider(), DEMO_PEERS, company.market.price)
+        self.assertIsNotNone(comps.target.peg)
+        self.assertIsNone(comps.implied["peg"])
+        self.assertEqual(comps.implied_price_summary["median"],
+                         median([v for v in comps.implied.values() if v is not None]))
+        self.assertTrue(any("growth bases are not comparable" in n for n in comps.notes))
 
 if __name__ == "__main__":
     unittest.main()

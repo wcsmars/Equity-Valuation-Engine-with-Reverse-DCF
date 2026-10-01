@@ -265,10 +265,27 @@ def run_dcf(
     n = assumptions.forecast_years if (assumptions and is_num(assumptions.forecast_years)
                                        and assumptions.forecast_years > 0) \
         else config.DEFAULT_FORECAST_YEARS
-    n = int(n)
+    n = max(1, int(n))
 
     terminal_growth = assumptions.terminal_growth if (assumptions and is_num(assumptions.terminal_growth)) \
         else config.DEFAULT_TERMINAL_GROWTH
+    if terminal_growth <= -1.0:
+        raise ValueError("terminal_growth must be greater than -1")
+
+    terminal_method, method_note = resolve_terminal_method(assumptions)
+    if method_note:
+        notes.append(method_note)
+    if terminal_method == "exit_multiple" and assumptions.exit_ev_ebitda <= 0:
+        raise ValueError("exit_ev_ebitda must be positive")
+    # Resolve the sustainable growth rate before projecting. Otherwise the
+    # operating forecast can fade to a rate the terminal denominator rejects.
+    g_used = terminal_growth
+    if terminal_method == "gordon" and w - g_used < config.MAX_TERMINAL_GROWTH_VS_WACC:
+        g_used = w - config.MAX_TERMINAL_GROWTH_VS_WACC
+        notes.append(
+            f"terminal growth {terminal_growth:.4f} too close to WACC {w:.4f}; "
+            f"clamped to {g_used:.4f} (used in both fade path and terminal value)"
+        )
 
     # ----- 2) revenue growth path ----------------------------------------- #
     hist_revenue = list(getattr(fin, "revenue", None) or []) if fin is not None else []
@@ -280,7 +297,9 @@ def run_dcf(
 
     growth_path = None
     if assumptions and assumptions.revenue_growth:
-        gp = [g for g in assumptions.revenue_growth if is_num(g)]
+        gp = list(assumptions.revenue_growth)
+        if any(not is_num(g) or g <= -1.0 for g in gp):
+            raise ValueError("revenue_growth entries must be finite and greater than -1")
         if len(gp) >= n:
             growth_path = gp[:n]
         elif gp:
@@ -292,12 +311,12 @@ def run_dcf(
         # (zero-filled years are skipped as endpoints but still count as periods).
         base_growth = series_cagr(hist_revenue, getattr(fin, "fiscal_years", None))
         if base_growth is None:
-            base_growth = terminal_growth
+            base_growth = g_used
             notes.append("historical revenue CAGR unavailable; starting growth at terminal_growth")
         # Clamp the near-term growth into a sane band before fading.
         base_growth = max(config.DEFAULT_REVENUE_GROWTH_FLOOR,
                           min(config.DEFAULT_REVENUE_GROWTH_CAP, base_growth))
-        growth_path = fade_path(base_growth, terminal_growth, n)
+        growth_path = fade_path(base_growth, g_used, n)
 
     # Project the revenue series (length n).
     revenue: list[float] = []
@@ -479,33 +498,32 @@ def run_dcf(
     # ----- 7) terminal value ---------------------------------------------- #
     # An unknown method, or exit_multiple without a multiple, falls back to Gordon
     # (with a note) so we still produce a number.
-    terminal_method, method_note = resolve_terminal_method(assumptions)
-    if method_note:
-        notes.append(method_note)
-    fcff_n = fcff[-1] if fcff else 0.0
     ebitda_n = (ebit[-1] + da[-1]) if (ebit and da) else 0.0
 
-    g_used = terminal_growth
+    terminal_fcff = None
+    terminal_capex_pct = capex_pcts[-1]
     if terminal_method == "exit_multiple":
         terminal_value = ebitda_n * assumptions.exit_ev_ebitda
     else:
-        # Require WACC - g >= MAX_TERMINAL_GROWTH_VS_WACC; clamp g if violated.
-        if w - g_used < config.MAX_TERMINAL_GROWTH_VS_WACC:
-            clamped = w - config.MAX_TERMINAL_GROWTH_VS_WACC
-            notes.append(
-                f"terminal growth {g_used:.4f} too close to WACC {w:.4f}; "
-                f"clamped to {clamped:.4f}"
-            )
-            g_used = clamped
+        # Project the first stable year from its own growth. Scaling FCFF_N
+        # carries N's working-capital investment forever when an explicit
+        # growth path ends above/below g. Apply the same growth-capex rule at g.
+        if capex_path is not None:
+            terminal_capex_pct = growth_capex_path(capex_pct, da_pct, ref_growth, [g_used])[0]
+        terminal_revenue = revenue[-1] * (1.0 + g_used)
+        terminal_fcff = (
+            terminal_revenue * (margin_path[-1] * (1.0 - tax) + da_pct - terminal_capex_pct)
+            - revenue[-1] * g_used * nwc_pct
+        )
         denom = w - g_used
         if denom <= 0:
             # Should not happen after clamping, but guard divide-by-zero anyway.
             terminal_value = 0.0
             notes.append("WACC-g non-positive after clamp; terminal value set to 0")
         else:
-            terminal_value = fcff_n * (1.0 + g_used) / denom
-            if fcff_n < 0:
-                notes.append("final-year FCFF is negative, so the Gordon terminal value "
+            terminal_value = terminal_fcff / denom
+            if terminal_fcff < 0:
+                notes.append("first stable-year FCFF is negative, so the Gordon terminal value "
                              "capitalises a perpetual cash outflow; review the EBIT margin "
                              "and reinvestment drivers")
 
@@ -545,11 +563,13 @@ def run_dcf(
     # Shares: prefer live market shares outstanding, else latest diluted shares.
     shares = getattr(market, "shares_outstanding", None) if market is not None else None
     if not is_num(shares) or shares <= 0:
-        shares = _latest(getattr(fin, "diluted_shares", None) or [] if fin is not None else [])
+        diluted = getattr(fin, "diluted_shares", None) or [] if fin is not None else []
+        shares = next((s for s in reversed(diluted) if is_num(s) and s > 0), None)
         if is_num(shares) and shares > 0:
             notes.append("market shares_outstanding unavailable; using latest diluted_shares")
     implied_price = safe_div(equity_value, shares)
-    if implied_price is None:
+    valuation_available = is_num(implied_price)
+    if not valuation_available:
         implied_price = 0.0
         notes.append("share count unavailable; implied price set to 0")
         shares = shares if is_num(shares) else 0.0
@@ -577,6 +597,8 @@ def run_dcf(
         "terminal_method": terminal_method,
         "terminal_growth": terminal_growth,
         "terminal_growth_used": g_used,
+        "terminal_fcff": terminal_fcff,
+        "terminal_capex_pct_revenue": terminal_capex_pct,
         "exit_ev_ebitda": (assumptions.exit_ev_ebitda if assumptions else None),
         "ebitda_terminal": ebitda_n,
         "mid_year_convention": mid_year,
@@ -585,6 +607,7 @@ def run_dcf(
         "terminal_discount_exponent": tv_exponent,
         "terminal_discount_exponent_rationale": tv_exponent_rationale,
         "wacc": w,
+        "valuation_available": valuation_available,
         "notes": notes,
     }
 

@@ -1,23 +1,20 @@
 // Ordering helpers for saving research state and for research notes that
 // finish late (used by app/page.tsx and its tests).
 //
-// Saves run concurrently, and a note takes about a minute, so the page must
+// A note takes about a minute, so the page must
 // (a) wait for every save still in flight before it re-reads a ticker's saved
 // research, not only the latest one, and (b) never let an older note replace
 // a newer one for the same ticker.
 
-// The promise of every save so far plus `save`. Waiting on it waits for all of
-// them: a newer save does not make an older one still in flight forgotten. A
-// failed save counts as settled.
+// Dispatch writes in the same order as edits. Passing a thunk is essential:
+// accepting an already-started promise would let an older request land last
+// and overwrite newer research. A failed write remains visible to its caller
+// but does not prevent the next write from trying again.
 export function chainSave(
   prev: Promise<void> | null,
-  save: Promise<unknown>
+  save: () => Promise<unknown>
 ): Promise<void> {
-  const settled = save.then(
-    () => undefined,
-    () => undefined
-  );
-  return prev ? Promise.all([prev, settled]).then(() => undefined) : settled;
+  return (prev ?? Promise.resolve()).catch(() => undefined).then(save).then(() => undefined);
 }
 
 // Resolves once `p` settles or `ms` milliseconds have passed, whichever comes
@@ -25,15 +22,15 @@ export function chainSave(
 export function settledWithin(
   p: Promise<unknown> | null,
   ms: number
-): Promise<void> {
-  if (!p) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    const done = () => {
+): Promise<boolean> {
+  if (!p) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    const done = (ok: boolean) => {
       clearTimeout(timer);
-      resolve();
+      resolve(ok);
     };
-    p.then(done, done);
+    p.then(() => done(true), () => done(false));
   });
 }
 

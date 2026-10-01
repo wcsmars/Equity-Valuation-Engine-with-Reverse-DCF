@@ -31,7 +31,7 @@ from equity_valuation.data.synthetic import (
     make_company,
 )
 from equity_valuation.report.excel import write_excel
-from equity_valuation.report.html import write_html
+from equity_valuation.report.html import _comps_table, write_html
 from equity_valuation.schemas import CompRow, SensitivityResult
 
 MINORITY = 30e9
@@ -1416,6 +1416,43 @@ class CliTests(unittest.TestCase):
                                     "--out", _tmpdir(self)])
         self.assertEqual(code, 0, err)
 
+
+
+class ExternalDataExportTests(unittest.TestCase):
+    def test_external_text_cannot_become_an_excel_formula(self):
+        report = value_company("SYNT", provider=SyntheticProvider(), run_sensitivity=False)
+        hostile = '=HYPERLINK("https://invalid.example/","Name")'
+        report.comps.peers[0].name = hostile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.xlsx"
+            write_excel(report, str(path))
+            wb = load_workbook(path)
+            peers = wb["Comps"]
+            name_cells = [cell for row in peers for cell in row if cell.value == hostile]
+            self.assertEqual(len(name_cells), 1)
+            self.assertEqual(name_cells[0].data_type, "s")
+            formulas = [cell for row in wb["DCF"] for cell in row if cell.data_type == "f"]
+            self.assertTrue(any("SUM(" in cell.value for cell in formulas))
+            self.assertTrue(any("/" in cell.value for cell in formulas))
+            wb.close()
+
+    def test_peer_money_displays_its_own_currency(self):
+        report = value_company("SYNT", provider=SyntheticProvider(), run_sensitivity=False)
+        report.comps.peers[0] = CompRow("GBPPEER", "Peer", market_cap=1e9,
+                                      enterprise_value=2e9, pe=20, currency="GBP")
+        markup = _comps_table(report, "$")
+        row = markup.split("GBPPEER", 1)[1].split("</tr>", 1)[0]
+        self.assertIn("GBP", row)
+        self.assertIn("£", row)
+        self.assertNotIn("$", row)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.xlsx"
+            write_excel(report, str(path))
+            wb = load_workbook(path)
+            rows = list(wb["Comps"].values)
+            peer_row = next(r for r in rows if r[0] == "GBPPEER")
+            self.assertIn("GBP", peer_row)
+            wb.close()
 
 if __name__ == "__main__":
     unittest.main()

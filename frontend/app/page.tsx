@@ -10,6 +10,7 @@ import type {
   Enrichment,
   Report,
   ResearchNote,
+  ResearchState,
   WatchlistItem,
 } from "@/lib/types";
 import {
@@ -67,12 +68,14 @@ function assumptionsFromUsed(used?: AssumptionsUsed): Assumptions {
     rf: used.rf,
     erp: used.erp,
     tax_rate: used.tax_rate ?? undefined,
+    cost_of_debt: used.cost_of_debt ?? undefined,
     forecast_years: used.forecast_years,
     terminal_growth: used.terminal_growth,
     terminal_method: used.terminal_method,
     exit_ev_ebitda: used.exit_ev_ebitda ?? undefined,
     target_ebit_margin: used.target_ebit_margin ?? undefined,
     revenue_growth_y1: used.revenue_growth_y1 ?? undefined,
+    revenue_growth: used.revenue_growth_y1 == null ? used.revenue_growth ?? undefined : undefined,
     peers: used.peers ?? undefined,
   };
 }
@@ -116,6 +119,10 @@ export default function Home() {
   const [note, setNote] = useState<ResearchNote | null>(null);
   const [noteLoading, setNoteLoading] = useState(false);
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
+  const watchlistRef = useRef<WatchlistItem[]>([]);
+  const watchlistWrites = useRef<Promise<void> | null>(null);
+  const watchlistRevision = useRef(0);
+  const watchlistPending = useRef(new Set<string>());
   const [exporting, setExporting] = useState<ExportKind | null>(null);
   const [status, setStatus] = useState<{
     fmp_enabled: boolean;
@@ -127,6 +134,7 @@ export default function Home() {
   const [savingKeys, setSavingKeys] = useState(false);
   // Ticker whose saved research couldn't be read (autosave is paused for it).
   const [restoreFailedFor, setRestoreFailedFor] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const autoPeeredFor = useRef<string>("");
   // Autosave only runs for this ticker: set once its saved research has been
@@ -145,11 +153,44 @@ export default function Home() {
   // have landed.
   const pendingSave = useRef<(() => void) | null>(null);
   const lastSave = useRef<Promise<void> | null>(null);
+  const unsaved = useRef(false);
   // Per-ticker order of note requests, so an older note that finishes after
   // a newer one never replaces it.
   const noteOrder = useRef(new NoteOrder());
   const loadSeq = useRef(0); // guards against a stale load finishing late
   const recomputeSeq = useRef(0); // only the newest recompute may land
+
+  const queueResearchSave = useCallback((t: string, state: ResearchState) => {
+    const save = chainSave(lastSave.current, () => saveResearchState(t, state));
+    lastSave.current = save;
+    unsaved.current = true;
+    save.then(
+      () => {
+        if (lastSave.current === save) unsaved.current = false;
+        setSaveError(null);
+      },
+      (e) => setSaveError(`Couldn't save research for ${t}: ${e instanceof Error ? e.message : String(e)}`)
+    );
+  }, []);
+
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      pendingSave.current?.();
+      if (unsaved.current) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") pendingSave.current?.();
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    document.addEventListener("visibilitychange", visibilityChanged);
+    return () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, []);
 
   useEffect(() => {
     // Retry with backoff — in the desktop app the backend can still be
@@ -158,7 +199,10 @@ export default function Home() {
     let cancelled = false;
     const probe = (attempt: number) => {
       fetch(apiUrl("/api/health"))
-        .then((r) => r.json())
+        .then(async (r) => {
+          if (!r.ok) throw new Error(await errorDetail(r));
+          return r.json();
+        })
         .then((s) => {
           if (!cancelled) setStatus(s);
         })
@@ -168,17 +212,33 @@ export default function Home() {
         });
     };
     probe(0);
-    fetchWatchlist().then(setWatchlist).catch(() => {});
+    const revision = watchlistRevision.current;
+    fetchWatchlist().then((wl) => {
+      if (!cancelled && revision === watchlistRevision.current) {
+        watchlistRef.current = wl;
+        setWatchlist(wl);
+      }
+    }).catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Fresh watchlist for effects that fire from stale closures.
-  const watchlistRef = useRef<WatchlistItem[]>(watchlist);
-  useEffect(() => {
-    watchlistRef.current = watchlist;
-  }, [watchlist]);
+  // Server mutations and their full-list responses must stay ordered. A
+  // refresh queued behind a removal also rechecks membership when it runs.
+  const changeWatchlist = useCallback((action: "add" | "remove", t: string,
+    snapshot?: Partial<WatchlistItem>, refreshOnly = false) => {
+    watchlistRevision.current += 1;
+    const write = chainSave(watchlistWrites.current, async () => {
+      if (refreshOnly && !watchlistRef.current.some((w) => w.ticker === t)) return;
+      const wl = await updateWatchlist(action, t, snapshot);
+      watchlistRef.current = wl;
+      setWatchlist(wl);
+    });
+    watchlistWrites.current = write;
+    write.catch((e) => setError(`Couldn't update watchlist: ${e instanceof Error ? e.message : String(e)}`));
+    return write;
+  }, []);
   // Set synchronously by loadTicker (not only after render) so async work
   // started for the previous ticker can tell it has been superseded.
   const tickerRef = useRef("");
@@ -186,18 +246,27 @@ export default function Home() {
     tickerRef.current = ticker;
   }, [ticker]);
 
-  const loadTicker = useCallback(async (sym: string) => {
+  const loadTicker = useCallback(async (sym: string, resetAssumptions = false) => {
     const t = sym.trim().toUpperCase();
     if (!t) return;
     const seq = ++loadSeq.current;
     // Write any debounced edits of the ticker on screen before its state is
     // cleared (and before a reload of the same ticker re-reads it).
     pendingSave.current?.();
-    const flush = settledWithin(lastSave.current, SAVE_WAIT_MS);
+    // Preserve the visible edits if saving failed or timed out. Reading old
+    // server state and autosaving it would otherwise silently lose them.
     setLoading(true);
     setError(null);
+    const saved = await settledWithin(lastSave.current, SAVE_WAIT_MS);
+    if (seq !== loadSeq.current) return;
+    if (!saved) {
+      setError("Research has not finished saving. Your current edits are still here; retry saving before loading another ticker.");
+      setLoading(false);
+      return;
+    }
     setReport(null);
     setEnrichment(null);
+    setEnrichLoading(false);
     setAssumptions({});
     setResearchNotes("");
     setDigests([]);
@@ -211,8 +280,6 @@ export default function Home() {
     if (lateNote.current?.ticker !== t) lateNote.current = null;
     tickerRef.current = t;
     setTicker(t);
-    await flush;
-    if (seq !== loadSeq.current) return;
 
     // Restore persisted research FIRST so saved assumptions drive the first
     // valuation (and saved notes/digests/note come back with it). A never-seen
@@ -225,7 +292,7 @@ export default function Home() {
       setResearchNotes(st.notes ?? "");
       setDigests(st.digests ?? []);
       setNote(st.note ?? null);
-      if (st.assumptions && Object.keys(st.assumptions).length > 0) {
+      if (!resetAssumptions && st.assumptions && Object.keys(st.assumptions).length > 0) {
         savedAssumptions = st.assumptions;
       }
       setAssumptions(savedAssumptions);
@@ -283,7 +350,11 @@ export default function Home() {
       setError(null);
       try {
         const rep = await fetchValuation(ticker, a);
-        if (current()) setReport(rep);
+        if (current()) {
+          setReport(rep);
+          // Normalize clamped inputs without overwriting a newer unsent draft.
+          setAssumptions((draft) => draft === a ? assumptionsFromUsed(rep.assumptions_used) : draft);
+        }
       } catch (e) {
         if (current()) setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -311,18 +382,16 @@ export default function Home() {
   // was restored and its valuation loaded (see stateLoadedFor).
   useEffect(() => {
     if (!ticker || stateLoadedFor.current !== ticker) return;
+    unsaved.current = true;
     const save = () => {
       clearTimeout(id);
       if (pendingSave.current === save) pendingSave.current = null;
-      lastSave.current = chainSave(
-        lastSave.current,
-        saveResearchState(ticker, {
+      queueResearchSave(ticker, {
           notes: researchNotes,
           digests,
           note,
           assumptions,
-        })
-      );
+        });
     };
     const id = setTimeout(save, 1500);
     pendingSave.current = save;
@@ -330,7 +399,7 @@ export default function Home() {
       clearTimeout(id);
       if (pendingSave.current === save) pendingSave.current = null;
     };
-  }, [ticker, researchNotes, digests, note, assumptions]);
+  }, [ticker, researchNotes, digests, note, assumptions, queueResearchSave]);
 
   // Keep the watchlist snapshot fresh whenever a watched ticker reloads.
   // Reads through watchlistRef so a just-removed ticker isn't re-added by a
@@ -339,18 +408,13 @@ export default function Home() {
     if (!report || !ticker) return;
     if (!watchlistRef.current.some((w) => w.ticker === ticker)) return;
     const s = report.summary;
-    updateWatchlist("add", ticker, {
+    changeWatchlist("add", ticker, {
       name: s.name,
       currency: s.currency,
       price: s.current_price,
       blended_target: s.blended_target,
       recommendation: s.recommendation,
-    })
-      .then((wl) => {
-        if (watchlistRef.current.some((w) => w.ticker === ticker))
-          setWatchlist(wl);
-      })
-      .catch(() => {});
+    }, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [report]);
 
@@ -358,6 +422,7 @@ export default function Home() {
     (sug: AssumptionSuggestion) => {
       const key = FIELD_TO_KEY[sug.field];
       const next: Assumptions = { ...assumptions, [key]: sug.suggested_value };
+      if (sug.field === "revenue_growth_y1") next.revenue_growth = undefined;
       if (sug.field === "exit_ev_ebitda") next.terminal_method = "exit_multiple";
       setAssumptions(next);
       recompute(next);
@@ -370,9 +435,10 @@ export default function Home() {
   // one was in flight, drop the result instead of appending it to the wrong
   // company's research. Panels are keyed by ticker, so the closure's `ticker`
   // is the ticker the digest was started for.
+  const viewSequence = loadSeq.current;
   const onDigested = useCallback(
     (source: string, digest: Digest) => {
-      if (tickerRef.current !== ticker) return;
+      if (tickerRef.current !== ticker || loadSeq.current !== viewSequence) return;
       setDigests((prev) => [
         ...prev,
         { source, digest, at: new Date().toISOString() },
@@ -382,7 +448,7 @@ export default function Home() {
       );
       setTab("AI Research");
     },
-    [ticker]
+    [ticker, viewSequence]
   );
 
   // A note takes about a minute. If another load started meanwhile, never
@@ -408,10 +474,7 @@ export default function Home() {
       if (seq === loadSeq.current) {
         setNote(n);
       } else {
-        lastSave.current = chainSave(
-          lastSave.current,
-          saveResearchState(t, { note: n })
-        );
+        queueResearchSave(t, { note: n });
         if (tickerRef.current === t) {
           if (restoreDoneFor.current === t) setNote(n);
           else lateNote.current = { ticker: t, note: n };
@@ -423,7 +486,7 @@ export default function Home() {
     } finally {
       if (seq === loadSeq.current) setNoteLoading(false);
     }
-  }, [report, researchNotes, ticker]);
+  }, [report, researchNotes, ticker, queueResearchSave]);
 
   // Export the inputs of the valuation on screen, not slider moves that
   // haven't been recomputed yet, so the file matches the dashboard.
@@ -450,34 +513,35 @@ export default function Home() {
 
   const watching = watchlist.some((w) => w.ticker === ticker);
   const toggleWatch = useCallback(async () => {
-    if (!ticker) return;
+    if (!ticker || watchlistPending.current.has(ticker)) return;
+    watchlistPending.current.add(ticker);
     try {
-      if (watching) {
-        setWatchlist(await updateWatchlist("remove", ticker));
+      if (watchlistRef.current.some((w) => w.ticker === ticker)) {
+        await changeWatchlist("remove", ticker);
       } else {
         const s = report?.summary;
-        setWatchlist(
-          await updateWatchlist("add", ticker, {
+        await changeWatchlist("add", ticker, {
             name: s?.name ?? null,
             currency: s?.currency ?? null,
             price: s?.current_price ?? null,
             blended_target: s?.blended_target ?? null,
             recommendation: s?.recommendation ?? null,
-          })
-        );
+          });
       }
     } catch {
-      /* watchlist is best-effort */
+      /* changeWatchlist displays the error. */
+    } finally {
+      watchlistPending.current.delete(ticker);
     }
-  }, [ticker, watching, report]);
+  }, [ticker, report, changeWatchlist]);
 
   const removeFromWatchlist = useCallback(async (t: string) => {
     try {
-      setWatchlist(await updateWatchlist("remove", t));
+      await changeWatchlist("remove", t);
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [changeWatchlist]);
 
   const s = report?.summary;
 
@@ -516,13 +580,13 @@ export default function Home() {
           <span>Data: EDGAR + yfinance (free)</span>
           <span>·</span>
           <span className={status.fmp_enabled ? "text-up" : "text-ink-faint"}>
-            FMP {status.fmp_enabled ? "connected" : "off"}
+            FMP {status.fmp_enabled ? "configured" : "off"}
           </span>
           <span>·</span>
           <span
             className={status.anthropic_enabled ? "text-up" : "text-ink-faint"}
           >
-            AI {status.anthropic_enabled ? "connected" : "off"}
+            AI {status.anthropic_enabled ? "configured" : "off"}
           </span>
           {(!status.fmp_enabled || !status.anthropic_enabled) && (
             <button
@@ -556,10 +620,11 @@ export default function Home() {
               setKeyFmp("");
               setShowKeys(false);
               // FMP just connected: refresh enrichment for the loaded ticker.
-              if (ticker) {
+              const activeTicker = tickerRef.current;
+              if (activeTicker) {
                 const seq = loadSeq.current;
                 setEnrichLoading(true);
-                fetchEnrichment(ticker)
+                fetchEnrichment(activeTicker)
                   .then((en) => {
                     if (seq === loadSeq.current) setEnrichment(en);
                   })
@@ -604,7 +669,7 @@ export default function Home() {
             {savingKeys ? <Spinner /> : "Save keys"}
           </Button>
           <span className="text-[11px] text-ink-faint">
-            Stored locally in the project&apos;s .env — never leaves your Mac.
+            Stored in the server&apos;s local .env and sent only to the selected API provider.
           </span>
         </form>
       )}
@@ -612,6 +677,22 @@ export default function Home() {
       {error && (
         <div className="mt-4 rounded-lg border border-down/40 bg-down/10 px-4 py-3 text-sm text-down">
           {error}
+          {!report && !loading && ticker && (
+            <Button variant="ghost" className="ml-3" onClick={() => loadTicker(ticker, true)}>
+              Retry with default assumptions
+            </Button>
+          )}
+        </div>
+      )}
+
+      {saveError && (
+        <div role="alert" className="mt-3 rounded-lg border border-flat/40 bg-flat/10 px-4 py-3 text-sm text-flat">
+          {saveError}. Keep this page open until saving succeeds.
+          {ticker && stateLoadedFor.current === ticker && (
+            <Button variant="ghost" className="ml-3" onClick={() => queueResearchSave(ticker, {
+              notes: researchNotes, digests, note, assumptions,
+            })}>Retry save</Button>
+          )}
         </div>
       )}
 

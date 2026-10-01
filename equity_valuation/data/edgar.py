@@ -90,7 +90,12 @@ _TAGS_REVENUE = (
 _TAGS_EBIT = ("OperatingIncomeLoss",)
 # Total costs of sales and operating expenses; EBIT fallback = revenue - this.
 _TAGS_COSTS_AND_EXPENSES = ("CostsAndExpenses",)
-_TAGS_NET_INCOME = ("NetIncomeLoss", "ProfitLoss")
+_TAG_COMMON_INCOME = "NetIncomeLossAvailableToCommonStockholdersBasic"
+_TAG_NCI_INCOME = "NetIncomeLossAttributableToNoncontrollingInterest"
+_TAGS_PREFERRED_INCOME_ADJUSTMENTS = (
+    "PreferredStockDividendsAndOtherAdjustments",
+    "PreferredStockDividendsIncomeStatementImpact",
+)
 # D&A: each of these tags is either the filer's total D&A or one part of it,
 # and which one differs by filer (McDonald's DepreciationDepletionAndAmortization
 # is 0.46B against a 2.20B DepreciationAndAmortization total; United Rentals
@@ -270,7 +275,14 @@ _TAGS_EQUITY = (
     "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
 )
 _TAGS_MINORITY = ("MinorityInterest",)
-_TAGS_PREFERRED = ("PreferredStockValue", "PreferredStockLiquidationPreferenceValue")
+# Prefer full preferred book capital, including additional paid-in capital:
+# PreferredStockValue alone can be just par value (JPM stopped tagging it in
+# 2009, but still reports its full preferred capital under the first tag).
+_TAGS_PREFERRED_BOOK = (
+    "PreferredStockIncludingAdditionalPaidInCapitalNetOfDiscount",
+    "PreferredStockValue",
+)
+_TAGS_PREFERRED = _TAGS_PREFERRED_BOOK + ("PreferredStockLiquidationPreferenceValue",)
 
 # Financial filers. For banks, insurers, BDCs and REITs, borrowing, lending,
 # investing or buying property is the business itself, so the operating-
@@ -492,6 +504,21 @@ def _fiscal_year_label(end: str) -> Optional[int]:
     return y
 
 
+def _reported_period(end: object, filed: object) -> bool:
+    """Whether a fact has a real period end no later than its filing date.
+
+    SEC facts can include expected future amounts and mistyped dates. Neither
+    may determine a historical balance-sheet date or an annual flow. Missing
+    filing dates remain usable, but a supplied date must be a valid ISO date.
+    """
+    if not isinstance(end, str) or len(end) != 10 or _days_between(end, end) != 0:
+        return False
+    if not filed:
+        return True
+    return (isinstance(filed, str) and len(filed) == 10
+            and _days_between(filed, filed) == 0 and end <= filed)
+
+
 def _fy_list(years: list[int]) -> str:
     """Compact 'FY2019-2021, FY2024' rendering of a sorted year list for notes."""
     runs: list[list[int]] = []
@@ -678,12 +705,13 @@ class EdgarClient:
         if e.get("fp") != "FY" or e.get("form") not in _ANNUAL_FORMS:
             return None
         start, end, val = e.get("start"), e.get("end"), e.get("val")
-        if not start or not end or not is_num(val):
+        filed = e.get("filed") or ""
+        if not start or not _reported_period(end, filed) or not is_num(val):
             return None
         span = _days_between(start, end)
         if span is None or not (_MIN_PERIOD_DAYS <= span <= _MAX_PERIOD_DAYS):
             return None
-        return start, end, e.get("filed") or "", float(val)
+        return start, end, filed, float(val)
 
     def _fiscal_year_period(
         self, facts: dict, tags: tuple[str, ...], year: int
@@ -842,9 +870,10 @@ class EdgarClient:
                 continue
             end = e.get("end")
             val = e.get("val")
-            if not end or not is_num(val):
-                continue
             filed = e.get("filed") or ""
+            if (e.get("start") or not _reported_period(end, filed)
+                    or not is_num(val)):
+                continue
             prev = best.get(end)
             if prev is None or filed >= prev[0]:
                 best[end] = (filed, float(val))
@@ -1200,6 +1229,77 @@ class EdgarClient:
         )
 
     # ------------------------ public entry point -------------------------- #
+    def _common_net_income(self, facts: dict, notes: list[str]) -> dict[int, float]:
+        """Annual earnings attributable to common shareholders when tagged.
+
+        Parent earnings exclude NCI but precede preferred distributions.
+        ProfitLoss includes NCI: subtract its signed earnings (a subsidiary
+        loss is added back). Explicit common earnings already incorporate both
+        adjustments and must never be adjusted a second time.
+        """
+        common = self._annual_flow_by_fy(facts, (_TAG_COMMON_INCOME,))
+        parent = self._annual_flow_by_fy(facts, ("NetIncomeLoss",))
+        gross = self._annual_flow_by_fy(facts, ("ProfitLoss",))
+        minority = self._annual_flow_by_fy(facts, (_TAG_NCI_INCOME,))
+        preferred = self._annual_flow_by_fy(facts, _TAGS_PREFERRED_INCOME_ADJUSTMENTS)
+        result = dict(common)
+        adjusted: list[int] = []
+        unadjusted_gross: list[int] = []
+        for year in parent.keys() | gross.keys():
+            if year in result:
+                continue
+            value = parent.get(year, gross.get(year))
+            changed = False
+            if year not in parent:
+                if year in minority:
+                    value -= minority[year]
+                    changed = True
+                else:
+                    unadjusted_gross.append(year)
+            if year in preferred:
+                value -= preferred[year]
+                changed = True
+            result[year] = value
+            if changed:
+                adjusted.append(year)
+        if adjusted:
+            notes.append(
+                f"net income for {_fy_list(adjusted)} adjusted for reported noncontrolling "
+                "income and/or preferred distributions to obtain common-share earnings"
+            )
+        if unadjusted_gross:
+            notes.append(
+                f"net income for {_fy_list(unadjusted_gross)} uses consolidated ProfitLoss; "
+                "income attributable to noncontrolling interests is not tagged separately, "
+                "so earnings may include their share"
+            )
+        return result
+
+    def _income_attribution_adjusted(
+        self, facts: dict, common: dict[int, float], years: list[int]
+    ) -> bool:
+        """Whether rebuilding common profit from consolidated EBIT is unsafe.
+
+        Keep the reported common-income basis when minority/preferred claims
+        matter, or when only common or gross profit is tagged and their
+        attribution cannot be reconciled. The models use this marker to avoid
+        undoing the provider's common-income normalization.
+        """
+        parent = self._annual_flow_by_fy(facts, ("NetIncomeLoss",))
+        gross = self._annual_flow_by_fy(facts, ("ProfitLoss",))
+        minority = self._annual_flow_by_fy(facts, (_TAG_NCI_INCOME,))
+        preferred = self._annual_flow_by_fy(facts, _TAGS_PREFERRED_INCOME_ADJUSTMENTS)
+        for year in years:
+            if year not in common:
+                continue
+            if minority.get(year, 0.0) or preferred.get(year, 0.0):
+                return True
+            if any(year in series and common[year] != series[year] for series in (parent, gross)):
+                return True
+            if year not in parent and (year not in gross or year not in minority):
+                return True
+        return False
+
     def get_annual_financials(
         self, ticker: str
     ) -> tuple[AnnualFinancials, BalanceSheetSnapshot, str, str]:
@@ -1239,7 +1339,7 @@ class EdgarClient:
         # ---- pull each FLOW item as fy -> value -------------------------- #
         revenue_by_fy = self._annual_flow_by_fy(facts, _TAGS_REVENUE)
         ebit_by_fy = self._annual_flow_by_fy(facts, _TAGS_EBIT)
-        ni_by_fy = self._annual_flow_by_fy(facts, _TAGS_NET_INCOME)
+        ni_by_fy = self._common_net_income(facts, info_notes)
         da_by_fy, da_replaced = self._largest_flow_by_fy(facts, _TAGS_DA)
         capex_by_fy, capex_replaced = self._largest_flow_by_fy(
             facts, _TAGS_CAPEX, larger_every_year=True
@@ -1641,6 +1741,8 @@ class EdgarClient:
         try:
             setattr(financials, "_source_notes", notes + info_notes)
             setattr(financials, "_financial_kind", fin_kind)
+            setattr(financials, "_income_attribution_adjusted",
+                    self._income_attribution_adjusted(facts, ni_by_fy, years))
         except Exception:  # pragma: no cover - dataclasses allow attr set
             pass
 
@@ -1695,7 +1797,9 @@ class EdgarClient:
         )
 
         # Total common equity (book value).
-        equity = at(_TAGS_EQUITY, "stockholders' equity")
+        equity, equity_tag, equity_end = self._instant_fact(
+            facts, _TAGS_EQUITY, as_of, date_notes, "stockholders' equity", bs_dates
+        )
         if equity is None:
             notes.append("total equity unavailable on EDGAR; set to 0.0")
 
@@ -1703,6 +1807,21 @@ class EdgarClient:
         # default 0; both are claims the equity bridges subtract from EV.
         minority = at(_TAGS_MINORITY, "minority interest")
         preferred = at(_TAGS_PREFERRED, "preferred stock")
+
+        # The schema and P/B/ROE models require common equity. Parent equity
+        # includes preferred stock; the consolidated fallback also includes
+        # noncontrolling interests. Subtract claims at the equity's own date
+        # when a stale equity line is used, rather than a newer bridge amount.
+        if equity is not None:
+            if equity_tag == _TAGS_EQUITY[1]:
+                equity -= self._instant_at(
+                    facts, _TAGS_MINORITY, equity_end, date_notes,
+                    "minority interest for common equity", bs_dates,
+                ) or 0.0
+            equity -= self._instant_at(
+                facts, _TAGS_PREFERRED_BOOK, equity_end, date_notes,
+                "preferred stock for common equity", bs_dates,
+            ) or 0.0
 
         return BalanceSheetSnapshot(
             as_of=as_of,

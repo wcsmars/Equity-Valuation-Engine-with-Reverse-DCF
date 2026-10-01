@@ -241,7 +241,7 @@ def _fallback_football_field(report: ValuationReport) -> list[FootballFieldRow]:
                 "52-week range", m.fifty_two_week_low, report.current_price, m.fifty_two_week_high
             )
         )
-    if report.dcf:
+    if report.dcf and (getattr(report.dcf, "assumptions", None) or {}).get("valuation_available") is not False:
         rows.append(band("DCF" + mark, report.dcf.implied_price, 0.15))
     if report.comps and report.comps.implied_price_summary:
         s = report.comps.implied_price_summary
@@ -252,7 +252,7 @@ def _fallback_football_field(report: ValuationReport) -> list[FootballFieldRow]:
     if report.ddm:
         ddm_mark = NOT_IN_BLEND if ddm_reference_only(report) else ""
         rows.append(band("DDM" + ddm_mark, report.ddm.implied_price, 0.10))
-    if report.fcfe:
+    if report.fcfe and (getattr(report.fcfe, "detail", None) or {}).get("valuation_available") is not False:
         rows.append(band("FCFE" + mark, report.fcfe.implied_price, 0.10))
     return [r for r in rows if r is not None]
 
@@ -263,8 +263,9 @@ def _build_summary(report: ValuationReport) -> dict:
     ``methods`` keeps every method's value for display. The blend differs in
     four ways, each recorded in ``report.warnings`` and, for a method left out,
     in ``excluded_from_blend`` (method -> reason):
-      * a price of exactly 0 (the placeholder the models return when they cannot
-        value the company) or a non-finite price is left out;
+      * an unavailable model or a non-finite price is left out. A zero is kept
+        only when the model explicitly marks a completed valuation, so an
+        actual zero-equity estimate is distinct from a failure placeholder;
       * for a bank, insurer, REIT or lender/BDC, a company with a consolidated
         captive finance arm or a debt-funded operating lessor
         (``financial_institution_detail`` gives the reason and the kind, whose
@@ -355,6 +356,10 @@ def _build_summary(report: ValuationReport) -> dict:
     blended_names: list[str] = []
     excluded: dict[str, str] = {}
     floored = False
+    availability = {
+        "DCF": (getattr(report.dcf, "assumptions", None) or {}).get("valuation_available"),
+        "FCFE": (getattr(report.fcfe, "detail", None) or {}).get("valuation_available"),
+    }
     for name, price in methods.items():
         if financial and name in ("DCF", "FCFE"):
             excluded[name] = excluded_reason
@@ -368,7 +373,7 @@ def _build_summary(report: ValuationReport) -> dict:
                               "check it" if peers_gave_no_price else
                               "dividends only and no comps to check it; supply peers")
             continue
-        if is_num(price) and price > 0:
+        if is_num(price) and (price > 0 or (price == 0 and availability.get(name) is True)):
             blend.append(price)
             blended_names.append(name)
             continue

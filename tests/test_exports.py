@@ -28,7 +28,7 @@ class DemoResultTests(unittest.TestCase):
         # The README "Results" table quotes these figures; keep them in step.
         s = _demo_report().summary
         self.assertAlmostEqual(s["current_price"], 40.84, delta=0.005)
-        expected = {"DCF": 33.38, "Comps (median)": 42.88, "DDM": 10.99, "FCFE": 31.41}
+        expected = {"DCF": 33.38, "Comps (median)": 46.96, "DDM": 10.99, "FCFE": 31.41}
         self.assertEqual(set(s["methods"]), set(expected))
         for method, price in expected.items():
             self.assertAlmostEqual(s["methods"][method], price, delta=0.005, msg=method)
@@ -99,6 +99,81 @@ class OfficeExportTests(unittest.TestCase):
             self.assertIn("Synthetic Corp", text)
             self.assertIn("Overvalued", text)
             self.assertGreaterEqual(len(Presentation(deck).slides), 1)
+
+    def test_zero_method_value_is_minus_100_percent_in_both_exports(self):
+        from docx import Document
+        from pptx import Presentation
+        from backend import exports
+
+        report = _demo_report()
+        report.summary["methods"]["DCF"] = 0.0
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(exports, "run_valuation_report", return_value=(report, {})), \
+                patch.object(exports, "_ensure_out", lambda: Path(tmp)):
+            memo = Document(exports.export_memo(DEMO_TICKER, {}))
+            self.assertEqual(memo.tables[0].rows[1].cells[2].text, "-100.0%")
+            deck = Presentation(exports.export_deck(DEMO_TICKER, {}))
+            table = next(s.table for s in deck.slides[1].shapes if s.has_table)
+            self.assertEqual(table.cell(1, 2).text, "-100.0%")
+
+    def test_deck_paginates_peers_notes_and_preserves_sources(self):
+        from pptx import Presentation
+        from backend import exports
+
+        report = _demo_report()
+        report.comps.peers = [dataclasses.replace(report.comps.peers[0],
+                              ticker=f"PEER{i}", currency="HKD") for i in range(35)]
+        note = {
+            "executive_summary": "Summary material.",
+            "valuation_view": "Valuation discussion.",
+            "thesis": [f"Thesis item {i}: " + "Revenue assumptions need evidence. " * 30
+                       for i in range(9)],
+            "risks": ["A material risk."],
+            "key_drivers": ["Demand."],
+            "catalysts": [f"Catalyst {i}" for i in range(6)],
+            "red_flags": ["Verify accounting."],
+            "what_would_change_my_mind": ["Failure to meet the operating plan."],
+            "citations": [{"source": "Annual report", "note": "Page 42"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(exports, "run_valuation_report", return_value=(report, {})), \
+                patch.object(exports, "_ensure_out", lambda: Path(tmp)):
+            deck = Presentation(exports.export_deck(DEMO_TICKER, {}, note))
+        texts, peer_rows = [], []
+        for slide in deck.slides:
+            for shape in slide.shapes:
+                self.assertGreaterEqual(shape.left, 0)
+                self.assertGreaterEqual(shape.top, 0)
+                self.assertLessEqual(shape.top + shape.height, deck.slide_height)
+                self.assertLessEqual(shape.left + shape.width, deck.slide_width)
+                if shape.has_text_frame:
+                    texts.append(shape.text)
+                if shape.has_table and shape.table.cell(0, 0).text == "Ticker":
+                    self.assertLessEqual(len(shape.table.rows), 13)
+                    peer_rows += [[c.text for c in row.cells] for row in list(shape.table.rows)[1:]]
+        joined = "\n".join(texts)
+        for i in range(9):
+            self.assertIn(f"Thesis item {i}:", joined)
+        self.assertIn("Catalyst 5", joined)
+        self.assertIn("Annual report: Page 42", joined)
+        self.assertIn("Valuation discussion.", joined)
+        self.assertIn("Failure to meet the operating plan.", joined)
+        self.assertEqual(len(peer_rows), 36)
+        self.assertEqual(peer_rows[-1][:2], ["PEER34", "HKD"])
+
+    def test_missing_price_does_not_break_football_field(self):
+        from pptx import Presentation
+        from backend import exports
+
+        report = _demo_report()
+        report.summary["current_price"] = None
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(exports, "run_valuation_report", return_value=(report, {})), \
+                patch.object(exports, "_ensure_out", lambda: Path(tmp)):
+            deck = Presentation(exports.export_deck(DEMO_TICKER, {}))
+        field = deck.slides[2]
+        self.assertIn("Football field", field.shapes[0].text)
+        self.assertFalse(any(s.has_text_frame and s.text.startswith("price ") for s in field.shapes))
 
 
 class SerializationTests(unittest.TestCase):

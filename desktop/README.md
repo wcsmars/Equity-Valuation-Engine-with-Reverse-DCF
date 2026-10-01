@@ -31,6 +31,10 @@ recreate `.venv` because Python virtual environments are not relocatable.
 and starts development servers. Stop those servers with Ctrl-C before launching
 the desktop app. It does not create a production frontend build.
 
+Run `npm --prefix desktop test` from the repository root to check the runtime
+helpers without opening a window. These tests use Node's standard library and
+temporary local HTTP servers; they do not require Electron or API keys.
+
 ## Build a local app
 
 After the setup above, run:

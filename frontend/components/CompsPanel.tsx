@@ -6,7 +6,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import type { Assumptions, CompRow, Report, StatRow } from "@/lib/types";
-import { fmtBig, fmtMoney, fmtMult, fmtPct, toneForUpside } from "@/lib/format";
+import { fmtBig, fmtCount, fmtMoney, fmtMult, fmtPct, toneForUpside } from "@/lib/format";
 import {
   Badge,
   Button,
@@ -26,6 +26,10 @@ const MULTIPLES: { key: keyof Pick<CompRow, "ev_ebitda" | "ev_sales" | "pe" | "p
   { key: "pb", label: "P/B" },
   { key: "peg", label: "PEG" },
 ];
+
+function compAmount(value: number | null, currency?: string | null): string {
+  return currency ? fmtBig(value, currency) : `${fmtCount(value)} (currency unknown)`;
+}
 
 export default function CompsPanel({
   report,
@@ -112,7 +116,7 @@ export default function CompsPanel({
                 <TH>EV/Sales</TH>
                 <TH>P/E</TH>
                 <TH>P/B</TH>
-                <TH>PEG</TH>
+                <TH><span title="Informational only: peer growth horizons may differ; PEG does not set an implied price.">PEG (ref.)</span></TH>
               </tr>
             </thead>
             <tbody>
@@ -129,10 +133,10 @@ export default function CompsPanel({
                     {comps.target.name || "—"}
                   </TD>
                   <TD num className="bg-surface-hi">
-                    {fmtBig(comps.target.market_cap, cur)}
+                    {compAmount(comps.target.market_cap, comps.target.currency)}
                   </TD>
                   <TD num className="bg-surface-hi">
-                    {fmtBig(comps.target.enterprise_value, cur)}
+                    {compAmount(comps.target.enterprise_value, comps.target.currency)}
                   </TD>
                   <TD num className="bg-surface-hi">
                     {fmtMult(comps.target.ev_ebitda)}
@@ -159,8 +163,8 @@ export default function CompsPanel({
                   <TD align="left" className="max-w-[12rem] truncate">
                     {p.name || "—"}
                   </TD>
-                  <TD num>{fmtBig(p.market_cap, cur)}</TD>
-                  <TD num>{fmtBig(p.enterprise_value, cur)}</TD>
+                  <TD num>{compAmount(p.market_cap, p.currency)}</TD>
+                  <TD num>{compAmount(p.enterprise_value, p.currency)}</TD>
                   <TD num>{fmtMult(p.ev_ebitda)}</TD>
                   <TD num>{fmtMult(p.ev_sales)}</TD>
                   <TD num>{fmtMult(p.pe)}</TD>

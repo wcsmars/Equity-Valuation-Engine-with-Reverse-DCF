@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import textwrap
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -70,6 +71,31 @@ def _pct(x, signed=False) -> str:
         return "n/a"
     s = "+" if (signed and x > 0) else ""
     return f"{s}{x * 100:.1f}%"
+
+
+def _method_upside(value, price) -> str:
+    return _pct(value / price - 1, signed=True) if (
+        is_num(value) and is_num(price) and price > 0
+    ) else "n/a"
+
+
+def _text_pages(items, *, width=95, lines_per_page=15):
+    """Bound slide text by wrapped lines, retaining every item and paragraph.
+
+    Long individual items split across slides instead of being truncated.
+    A conservative width leaves room for proportional fonts and margins.
+    """
+    if isinstance(items, str):
+        items = [items]
+    lines = []
+    for item in items or []:
+        for paragraph in str(item).splitlines() or [""]:
+            lines.extend(textwrap.wrap(paragraph, width=width) or [""])
+        lines.append("")
+    while lines and not lines[-1]:
+        lines.pop()
+    return ["\n".join(lines[i:i + lines_per_page])
+            for i in range(0, len(lines), lines_per_page)]
 
 
 def _blended_target(summary: dict, cur: str, comps=None) -> str:
@@ -176,7 +202,7 @@ def export_memo(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
         row = table.add_row().cells
         row[0].text = _method_label(s, name)
         row[1].text = _money(val, cur)
-        row[2].text = _pct((val / price - 1) if (val and price) else None, signed=True)
+        row[2].text = _method_upside(val, price)
     row = table.add_row().cells
     row[0].text = "Blended target"
     row[1].text = _blended_target(s, cur, report.comps)
@@ -313,19 +339,6 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
         r.font.color.rgb = color
         return box
 
-    def bullets(slide, l, t, w, h, items, size=13):
-        box = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
-        tf = box.text_frame
-        tf.word_wrap = True
-        first = True
-        for it in items:
-            p = tf.paragraphs[0] if first else tf.add_paragraph()
-            first = False
-            r = p.add_run()
-            r.text = f"•  {it}"
-            r.font.size = Pt(size)
-            r.font.color.rgb = INK
-
     # --- slide 1: title --------------------------------------------------------- #
     sl = add_slide()
     text(sl, 0.7, 2.2, 11.9, 1.0, f"{s.get('name')}  ({s.get('ticker')})", 40, True)
@@ -350,7 +363,7 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     for i, (name, val) in enumerate(methods, start=1):
         tbl.cell(i, 0).text = _method_label(s, name)
         tbl.cell(i, 1).text = _money(val, cur)
-        tbl.cell(i, 2).text = _pct((val / price - 1) if (val and price) else None, signed=True)
+        tbl.cell(i, 2).text = _method_upside(val, price)
     tbl.cell(rows - 1, 0).text = "Blended target"
     tbl.cell(rows - 1, 1).text = _blended_target(s, cur, report.comps)
     tbl.cell(rows - 1, 2).text = _blended_upside(s)
@@ -360,8 +373,9 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     if rows_ff:
         sl = add_slide()
         text(sl, 0.7, 0.4, 12, 0.6, "Football field — value ranges by method", 24, True)
-        lows = [r.low for r in rows_ff] + [price]
-        highs = [r.high for r in rows_ff] + [price]
+        price_points = [price] if is_num(price) and price > 0 else []
+        lows = [r.low for r in rows_ff] + price_points
+        highs = [r.high for r in rows_ff] + price_points
         vmin, vmax = min(lows), max(highs)
         pad = (vmax - vmin) * 0.06 or 1.0
         vmin -= pad
@@ -385,45 +399,68 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
             tick.fill.fore_color.rgb = INK
             tick.line.fill.background()
             y += 0.6
-        xp = chart_l + (price - vmin) / span * chart_w
-        pl = sl.shapes.add_shape(1, Inches(xp), Inches(1.2),
-                                 Emu(int(914400 * 0.025)), Inches(y - 1.5))
-        pl.fill.solid()
-        pl.fill.fore_color.rgb = ROSE
-        pl.line.fill.background()
-        text(sl, xp - 0.7, y + 0.05, 2.2, 0.4,
-             f"price {_money(price, cur, 0)}", 11, True, ROSE)
+        if price_points:
+            xp = chart_l + (price - vmin) / span * chart_w
+            pl = sl.shapes.add_shape(1, Inches(xp), Inches(1.2),
+                                     Emu(int(914400 * 0.025)), Inches(y - 1.2))
+            pl.fill.solid()
+            pl.fill.fore_color.rgb = ROSE
+            pl.line.fill.background()
+            text(sl, min(xp - 0.7, 10.4), y + 0.05, 2.2, 0.4,
+                 f"price {_money(price, cur, 0)}", 11, True, ROSE)
 
     # --- slide 4: comps ----------------------------------------------------------- #
     comps = report.comps
     if comps and comps.peers:
-        sl = add_slide()
-        text(sl, 0.7, 0.4, 12, 0.6, "Trading comps", 24, True)
         rows_c = [comps.target] + list(comps.peers)
-        tbl = sl.shapes.add_table(
-            len(rows_c) + 1, 6, Inches(0.7), Inches(1.2), Inches(11.9),
-            Inches(0.35 * (len(rows_c) + 1))).table
-        for j, h in enumerate(["Ticker", "Mkt cap", "EV/EBITDA", "EV/Sales", "P/E", "P/B"]):
-            tbl.cell(0, j).text = h
-        for i, rrow in enumerate(rows_c, start=1):
-            tbl.cell(i, 0).text = rrow.ticker + (" (target)" if i == 1 else "")
-            tbl.cell(i, 1).text = _cap(rrow.market_cap)
-            for j, attr in enumerate(["ev_ebitda", "ev_sales", "pe", "pb"], start=2):
-                v = getattr(rrow, attr)
-                tbl.cell(i, j).text = f"{v:.1f}x" if v else "n/a"
+        for start in range(0, len(rows_c), 12):
+            page = rows_c[start:start + 12]
+            sl = add_slide()
+            title = "Trading comps" + (" (continued)" if start else "")
+            text(sl, 0.7, 0.4, 12, 0.6, title, 24, True)
+            tbl = sl.shapes.add_table(
+                len(page) + 1, 7, Inches(0.7), Inches(1.2), Inches(11.9),
+                Inches(0.4 * (len(page) + 1))).table
+            for j, h in enumerate(["Ticker", "Currency", "Mkt cap", "EV/EBITDA", "EV/Sales", "P/E", "P/B"]):
+                tbl.cell(0, j).text = h
+            for i, rrow in enumerate(page, start=1):
+                tbl.cell(i, 0).text = rrow.ticker + (" (target)" if start == 0 and i == 1 else "")
+                tbl.cell(i, 1).text = rrow.currency or "n/a"
+                tbl.cell(i, 2).text = _cap(rrow.market_cap)
+                for j, attr in enumerate(["ev_ebitda", "ev_sales", "pe", "pb"], start=3):
+                    v = getattr(rrow, attr)
+                    tbl.cell(i, j).text = f"{v:.1f}x" if is_num(v) else "n/a"
+            for row in tbl.rows:
+                for cell in row.cells:
+                    for paragraph in cell.text_frame.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.size = Pt(13)
 
-    # --- slide 5: thesis / risks (AI note) ------------------------------------------ #
+    # --- research note: retain every section and source, across as many
+    # slides as needed. The old fixed boxes overlapped and silently cut items.
     if note:
+        sections = [("Executive summary", note.get("executive_summary")),
+                    ("Thesis", note.get("thesis")),
+                    ("Valuation view", note.get("valuation_view")),
+                    ("Key drivers", note.get("key_drivers")),
+                    ("Risks", note.get("risks")),
+                    ("Red flags / diligence items", note.get("red_flags")),
+                    ("Catalysts", note.get("catalysts")),
+                    ("What would change my mind", note.get("what_would_change_my_mind")),
+                    ("Sources", [f"{c.get('source')}: {c.get('note')}"
+                                 for c in note.get("citations") or []])]
+        for heading, items in sections:
+            for i, page in enumerate(_text_pages(items)):
+                sl = add_slide()
+                text(sl, 0.7, 0.4, 12, 0.6,
+                     heading + (" (continued)" if i else ""), 24, True)
+                text(sl, 0.7, 1.3, 11.9, 5.6, page, 18)
+
+    for i, page in enumerate(_text_pages(report.warnings)):
         sl = add_slide()
-        text(sl, 0.7, 0.4, 12, 0.6, "Thesis & risks", 24, True)
-        text(sl, 0.7, 1.1, 5.8, 0.5, "Thesis", 16, True, GREEN)
-        bullets(sl, 0.7, 1.6, 5.8, 5.0, (note.get("thesis") or [])[:6])
-        text(sl, 6.9, 1.1, 5.8, 0.5, "Risks", 16, True, ROSE)
-        bullets(sl, 6.9, 1.6, 5.8, 5.0, (note.get("risks") or [])[:6])
-        cats = note.get("catalysts") or []
-        if cats:
-            text(sl, 0.7, 5.9, 5.8, 0.4, "Catalysts", 14, True, AMBER)
-            bullets(sl, 0.7, 6.3, 11.9, 1.0, cats[:3], size=11)
+        text(sl, 0.7, 0.4, 12, 0.6,
+             "Model notes" + (" (continued)" if i else ""), 24, True)
+        text(sl, 0.7, 1.3, 11.9, 5.6, page, 18)
 
     # --- footer slide ------------------------------------------------------------ #
     sl = add_slide()
