@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { EventEmitter } = require("node:events");
-const { loadDotenv, uniquePath, waitForHttp, watchChildExit } = require("../runtime");
+const { loadDotenv, uniquePath, waitForHttp, watchChildExit, startupFailure } = require("../runtime");
 
 test("dotenv accepts shell-style literal keys without executing expressions", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "equity-desktop-env-"));
@@ -65,4 +65,11 @@ test("early child exit includes its startup diagnostics", async () => {
   const failed = watchChildExit("Frontend", proc, () => "build missing");
   proc.emit("exit", 1);
   await assert.rejects(failed, /Frontend exited during startup.*1[\s\S]*build missing/);
+});
+
+test("a startup failure is reported, but quitting during startup is not", () => {
+  const timeout = new Error("Timed out waiting for http://127.0.0.1:1/api/health");
+  assert.equal(startupFailure(timeout, false), timeout.message);
+  assert.equal(startupFailure("spawn EACCES", false), "spawn EACCES");
+  assert.equal(startupFailure(timeout, true), null);
 });

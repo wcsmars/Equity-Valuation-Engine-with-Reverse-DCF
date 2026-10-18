@@ -1,7 +1,7 @@
 # Core
 pandas>=1.5
 numpy>=1.23
-requests>=2.31
+requests>=2.33
 
 # Market data
 # Older releases are rejected by Yahoo's current endpoints.

@@ -16,8 +16,8 @@
     "dmg": "electron-builder --mac dmg"
   },
   "devDependencies": {
-    "electron": "^42.11.8",
-    "electron-builder": "^26.15.0"
+    "electron": "^42.11.12",
+    "electron-builder": "^26.17.0"
   },
   "build": {
     "appId": "com.wcsmars.equityresearchautomation",

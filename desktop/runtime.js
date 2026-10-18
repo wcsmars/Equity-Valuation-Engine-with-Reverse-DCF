@@ -97,4 +97,12 @@ function watchChildExit(name, proc, logTail) {
   });
 }
 
-module.exports = { loadDotenv, waitForHttp, uniquePath, watchChildExit };
+// The message a failed startup should report, or null when there is nothing to
+// report: quitting while the servers are still starting kills them and rejects
+// the startup promise too, and that is not a failure.
+function startupFailure(error, quitting) {
+  if (quitting) return null;
+  return String(error && error.message ? error.message : error);
+}
+
+module.exports = { loadDotenv, waitForHttp, uniquePath, watchChildExit, startupFailure };

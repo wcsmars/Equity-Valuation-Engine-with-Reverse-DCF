@@ -56,6 +56,11 @@ publish the generated configuration or packaged local app as a portable release.
 If macOS prompts about the unsigned app, use Finder's Open command and the
 available macOS security controls for your own local build.
 
+Keep the checkout out of a cloud-synced folder that offloads unused files, or
+mark it to stay downloaded. Each launch reads `.venv`, `frontend/node_modules`,
+and `frontend/.next`; when those files have been offloaded, startup waits for
+them to download again and can time out.
+
 `ERC_PROJECT_ROOT` can override the checkout location for source runs or
 packaging. `ERC_NODE_PATH` can select a Node executable. For example:
 
