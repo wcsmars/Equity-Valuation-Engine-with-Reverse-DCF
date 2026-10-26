@@ -107,6 +107,8 @@ class OfficeExportTests(unittest.TestCase):
 
         report = _demo_report()
         report.summary["methods"]["DCF"] = 0.0
+        report.dcf.implied_price = 0.0
+        report.dcf.assumptions["valuation_available"] = True
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(exports, "run_valuation_report", return_value=(report, {})), \
                 patch.object(exports, "_ensure_out", lambda: Path(tmp)):
@@ -115,6 +117,26 @@ class OfficeExportTests(unittest.TestCase):
             deck = Presentation(exports.export_deck(DEMO_TICKER, {}))
             table = next(s.table for s in deck.slides[1].shapes if s.has_table)
             self.assertEqual(table.cell(1, 2).text, "-100.0%")
+
+    def test_unavailable_method_is_not_minus_100_percent_in_office_exports(self):
+        from docx import Document
+        from pptx import Presentation
+        from backend import exports
+
+        report = _demo_report()
+        report.summary["methods"]["DCF"] = 0.0
+        report.dcf.implied_price = 0.0
+        report.dcf.assumptions["valuation_available"] = False
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(exports, "run_valuation_report", return_value=(report, {})), \
+                patch.object(exports, "_ensure_out", lambda: Path(tmp)):
+            memo = Document(exports.export_memo(DEMO_TICKER, {}))
+            self.assertEqual(memo.tables[0].rows[1].cells[1].text, "n/a")
+            self.assertEqual(memo.tables[0].rows[1].cells[2].text, "n/a")
+            deck = Presentation(exports.export_deck(DEMO_TICKER, {}))
+            table = next(s.table for s in deck.slides[1].shapes if s.has_table)
+            self.assertEqual(table.cell(1, 1).text, "n/a")
+            self.assertEqual(table.cell(1, 2).text, "n/a")
 
     def test_deck_paginates_peers_notes_and_preserves_sources(self):
         from pptx import Presentation

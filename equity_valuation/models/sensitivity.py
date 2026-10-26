@@ -49,6 +49,7 @@ from ..schemas import (
 from ..utils import (
     EBIT_DERIVED_KINDS,
     NOT_IN_BLEND,
+    available_model_price,
     ddm_reference_only,
     financial_institution,
     financial_kind,
@@ -461,7 +462,7 @@ def build_football_field(report) -> list[FootballFieldRow]:
     # DDM / FCFE — +/-10% bands around the implied price
     # ----------------------------------------------------------------------- #
     if ddm is not None:
-        ddm_price = getattr(ddm, "implied_price", None)
+        ddm_price = available_model_price(ddm)
         if is_num(ddm_price):
             low, base, high = _band(float(ddm_price), 0.10)
             base = min(max(base, low), high)

@@ -245,20 +245,34 @@ export default function MultiplesPanel({
                   {estimates.map((row, i) => {
                     const date = getStr(row, "date");
                     const label = date ? date.slice(0, 4) : "—";
+                    // FMP estimates follow the accounts' currency, which may
+                    // differ from the listing's quote currency (especially ADRs).
+                    const rawCurrency = getStr(row, "reportedCurrency");
+                    const reportingCurrency = rawCurrency && /^[A-Z]{3}$/.test(rawCurrency)
+                      ? rawCurrency : null;
                     return (
                       <tr key={`${date ?? "row"}-${i}`}>
                         <TD align="left">{label}</TD>
                         <TD num>
-                          {fmtBig(getNum(row, "estimatedRevenueAvg"), cur)}
+                          {reportingCurrency
+                            ? fmtBig(getNum(row, "estimatedRevenueAvg"), reportingCurrency)
+                            : fmtCount(getNum(row, "estimatedRevenueAvg"))}
                         </TD>
                         <TD num>
-                          {fmtMoney(getNum(row, "estimatedEpsAvg"), cur)}
+                          {reportingCurrency
+                            ? fmtMoney(getNum(row, "estimatedEpsAvg"), reportingCurrency)
+                            : fmtNum(getNum(row, "estimatedEpsAvg"))}
                         </TD>
                       </tr>
                     );
                   })}
                 </tbody>
               </Table>
+              <p className="mt-2 text-[11px] text-ink-faint">
+                Estimates use the issuer&apos;s reporting currency. Currency and
+                ordinary-share/ADR basis may differ from the quoted stock;
+                figures without a currency marker have no currency supplied.
+              </p>
             </div>
           )}
         </Card>

@@ -25,7 +25,7 @@ from equity_valuation.data.base import DataError
 from . import ai_service, exports, filings, store
 from .fmp_client import FMPClient
 from .serialization import build_ai_context
-from .valuation_service import AssumptionError, run_valuation
+from .valuation_service import AssumptionError, SnapshotError, run_valuation
 
 app = FastAPI(title="Equity Research Automation API", version="2.0.0")
 
@@ -361,6 +361,8 @@ def _anthropic_http(exc: Exception) -> Optional[HTTPException]:
 
 
 def _http(exc: Exception) -> HTTPException:
+    if isinstance(exc, SnapshotError):
+        return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, ai_service.AIError):
         return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, AssumptionError):

@@ -596,7 +596,7 @@ class EdgarClient:
                     # the same header rarely helps, but the budget is small.
                     last_err = (
                         "SEC returned 403 (forbidden) — verify the User-Agent "
-                        f"header ({self.user_agent!r}) includes contact info"
+                        "header includes contact info"
                     )
                 elif status == 429 or 500 <= status < 600:
                     last_err = f"SEC returned HTTP {status}"
@@ -1129,10 +1129,10 @@ class EdgarClient:
         except AttributeError:
             return None
 
-        def reported(end: str, filed) -> bool:
-            # A period cannot end after the filing that reports it, so such a
-            # date is a forecast or a typo (Oracle's 2199-12-31).
-            return bool(filed) and end <= str(filed)[:10]
+        def reported(end: object, filed: object) -> bool:
+            # Use the same calendar validation as the financial parser. A
+            # malformed date must not disable the recent-currency window.
+            return bool(filed) and _reported_period(end, filed)
 
         # Monetary units are ISO currency codes ("USD", "CNY"); share counts,
         # ratios and per-share units ("shares", "pure", "USD/shares") are not.
@@ -1144,9 +1144,10 @@ class EdgarClient:
                         and unit.isupper() and isinstance(entries, list)):
                     continue
                 ends_by_unit.setdefault(unit, []).extend(
-                    str(e["end"])[:10] for e in entries
+                    e["end"] for e in entries
                     if isinstance(e, dict) and e.get("end")
-                    and reported(str(e["end"])[:10], e.get("filed"))
+                    and is_num(e.get("val"))
+                    and reported(e["end"], e.get("filed"))
                 )
         if not any(u != _UNIT_USD and ends for u, ends in ends_by_unit.items()):
             return None

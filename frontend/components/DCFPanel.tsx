@@ -285,7 +285,7 @@ export default function DCFPanel({
       </Card>
 
       {/* --- Results --------------------------------------------------- */}
-      {dcf ? <Card
+      {dcf && dcf.implied_price != null ? <Card
         title="DCF output"
         subtitle={
           notInBlend

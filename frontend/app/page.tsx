@@ -488,8 +488,8 @@ export default function Home() {
     }
   }, [report, researchNotes, ticker, queueResearchSave]);
 
-  // Export the inputs of the valuation on screen, not slider moves that
-  // haven't been recomputed yet, so the file matches the dashboard.
+  // Export the saved report snapshot so changing prices or cache expiry do
+  // not change the valuation in the file. Unsent slider edits stay separate.
   const handleExport = useCallback(
     async (kind: ExportKind) => {
       if (!ticker || !report || exporting !== null) return; // no concurrent exports
@@ -500,7 +500,8 @@ export default function Home() {
           kind,
           ticker,
           assumptionsFromUsed(report.assumptions_used),
-          note
+          note,
+          report.report_id
         );
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -816,6 +817,13 @@ export default function Home() {
                   {s.currency}
                 </span>
               </div>
+              {report.valued_at && (
+                <p className="mt-1 text-[11px] text-ink-faint">
+                  Calculated {new Date(report.valued_at).toLocaleString(undefined, {
+                    dateStyle: "medium", timeStyle: "short",
+                  })}. Market prices and filings may be older.
+                </p>
+              )}
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
                 {EXPORTS.map((e) => (
                   <button
@@ -883,8 +891,9 @@ export default function Home() {
 
           {restoreFailedFor === ticker && (
             <div className="mt-3 rounded-lg border border-flat/40 bg-flat/10 px-4 py-2 text-xs text-flat">
-              Couldn&apos;t load the saved research for {ticker}, so autosave is
-              paused to avoid overwriting it. Load the ticker again to retry.
+              Couldn&apos;t load the saved research for {ticker}. Research editing
+              and AI actions are paused to protect your saved notes. Load the
+              ticker again to retry.
             </div>
           )}
 
@@ -941,7 +950,7 @@ export default function Home() {
 
             {/* Kept mounted (hidden) so a 60s filing digest survives tab
                 switches; keyed by ticker so state resets per company. */}
-            <div className={tab === "Filings" ? "" : "hidden"}>
+            <fieldset disabled={restoreFailedFor === ticker} className={tab === "Filings" ? "" : "hidden"}>
               <FilingsPanel
                 key={ticker}
                 ticker={ticker}
@@ -951,7 +960,7 @@ export default function Home() {
                 fmpEnabled={status?.fmp_enabled ?? false}
                 onDigested={onDigested}
               />
-            </div>
+            </fieldset>
 
             {tab === "Multiples" && (
               <MultiplesPanel report={report} enrichment={enrichment} />
@@ -963,7 +972,7 @@ export default function Home() {
 
             {/* Kept mounted (hidden) so chat history and in-progress digests
                 survive tab switches; keyed by ticker. */}
-            <div className={tab === "AI Research" ? "" : "hidden"}>
+            <fieldset disabled={restoreFailedFor === ticker} className={tab === "AI Research" ? "" : "hidden"}>
               <AIResearchPanel
                 key={ticker}
                 report={report}
@@ -978,7 +987,7 @@ export default function Home() {
                 noteLoading={noteLoading}
                 onExportMemo={() => handleExport("memo")}
               />
-            </div>
+            </fieldset>
           </div>
 
           <p className="mt-8 text-center text-[11px] text-ink-faint">

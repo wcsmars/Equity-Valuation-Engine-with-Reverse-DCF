@@ -33,6 +33,8 @@ price, says so).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from math import isclose
 from typing import Optional
 
 from . import config
@@ -48,6 +50,7 @@ from .utils import (
     LOW_DDM_PAYOUT_SHARE,
     NOT_IN_BLEND,
     REFERENCE_ONLY_KINDS,
+    available_model_price,
     ddm_left_alone,
     ddm_reference_only,
     financial_institution,
@@ -95,6 +98,7 @@ def value_company(
         company=company,
         macro=macro,
         current_price=current_price,
+        valued_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     report.warnings.extend(company.source_notes)
 
@@ -249,7 +253,7 @@ def _fallback_football_field(report: ValuationReport) -> list[FootballFieldRow]:
             rows.append(
                 FootballFieldRow("Comps", s["low"], s.get("median", report.current_price), s["high"])
             )
-    if report.ddm:
+    if available_model_price(report.ddm) is not None:
         ddm_mark = NOT_IN_BLEND if ddm_reference_only(report) else ""
         rows.append(band("DDM" + ddm_mark, report.ddm.implied_price, 0.10))
     if report.fcfe and (getattr(report.fcfe, "detail", None) or {}).get("valuation_available") is not False:
@@ -456,8 +460,8 @@ def _recommendation(target: Optional[float], price: Optional[float]) -> str:
     if target is None or not is_num(target) or not is_num(price) or price <= 0:
         return "N/A"
     upside = target / price - 1.0
-    if upside >= 0.15:
+    if upside >= 0.15 or isclose(upside, 0.15, rel_tol=0.0, abs_tol=1e-12):
         return "Undervalued"
-    if upside <= -0.15:
+    if upside <= -0.15 or isclose(upside, -0.15, rel_tol=0.0, abs_tol=1e-12):
         return "Overvalued"
     return "Fairly valued"

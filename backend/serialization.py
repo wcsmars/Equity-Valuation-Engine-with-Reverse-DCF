@@ -18,6 +18,7 @@ from typing import Any, Optional
 # The no-target rule every output shares (the Excel and HTML reports, the memo
 # and deck, and the dashboard's copy in lib/format.ts).
 from equity_valuation.report.excel import needs_peers
+from equity_valuation.utils import available_model_price, cagr, is_num
 
 
 def _sanitize(obj: Any) -> Any:
@@ -36,6 +37,19 @@ def _sanitize(obj: Any) -> Any:
 def report_to_dict(report, assumptions_used: Optional[dict] = None) -> dict:
     """Serialize a ValuationReport to a JSON-safe dict."""
     d = dataclasses.asdict(report)
+
+    # A failed model's numeric sentinel is not an estimate of zero value.
+    # Preserve diagnostics/projections while giving the UI and AI no target.
+    for name in ("dcf", "ddm", "fcfe"):
+        result = d.get(name)
+        if result:
+            result["implied_price"] = available_model_price(result)
+            if result["implied_price"] is None and "upside" in result:
+                result["upside"] = None
+    methods = (d.get("summary") or {}).get("methods") or {}
+    for label, name in (("DCF", "dcf"), ("DDM", "ddm"), ("FCFE", "fcfe")):
+        if label in methods:
+            methods[label] = available_model_price(d.get(name))
 
     # asdict() drops @property values — re-attach net_debt where present.
     try:
@@ -182,7 +196,9 @@ def build_ai_context(report: dict) -> str:
             f"EBIT margin {_pct(_ratio(last('ebit'), last('revenue')))}"
         )
         first, latest = (rev[0] if rev else None), (rev[-1] if rev else None)
-        n = len(rev) - 1
+        n = (years[-1] - years[0]) if (
+            len(years) == len(rev) and is_num(years[0]) and is_num(years[-1])
+        ) else len(rev) - 1
         if (
             n >= 1
             and isinstance(first, (int, float))
@@ -190,8 +206,8 @@ def build_ai_context(report: dict) -> str:
             and first > 0
             and latest > 0
         ):
-            cagr = (latest / first) ** (1 / n) - 1
-            lines.append(f"HISTORICAL REVENUE CAGR ({n}y): {_pct(cagr)}")
+            growth = cagr(first, latest, n)
+            lines.append(f"HISTORICAL REVENUE CAGR ({n}y): {_pct(growth)}")
     lines.append(
         f"BALANCE SHEET: total debt {_big(bs.get('total_debt'), sym)}, "
         f"cash {_big(bs.get('cash_and_investments'), sym)}, "

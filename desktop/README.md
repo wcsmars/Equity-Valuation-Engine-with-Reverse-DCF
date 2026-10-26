@@ -21,7 +21,8 @@ npm --prefix desktop start
 Copy `.env.example` to `.env` and add your own optional API keys. Set
 `SEC_USER_AGENT` to your contact identity to enable SEC EDGAR requests. The
 desktop app reads this file at each launch. It builds the frontend automatically
-when a production build is missing, so the first launch can take longer.
+when a production build is missing or older than the frontend source and
+dependency files, so the first launch after an update can take longer.
 
 Source launches find the project relative to `desktop/main.js`. No absolute
 paths or generated configuration are needed. After moving the checkout,

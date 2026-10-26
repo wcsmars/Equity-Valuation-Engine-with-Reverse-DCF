@@ -1290,12 +1290,27 @@ class YFinanceClient:
         ni_names = ("Net Income Common Stockholders", "NetIncomeCommonStockholders",
                     "Net Income", "NetIncome")
 
-        # Period-end columns, oldest -> newest. yfinance gives newest-first.
-        cols = list(income.columns)
-        try:
-            cols = sorted(cols)  # Timestamps sort chronologically -> oldest first
-        except Exception:
-            cols = list(reversed(cols))  # fall back to a simple reversal
+        # Only real period-end dates may anchor annual history. Undated/TTM
+        # columns otherwise become FY0 or a duplicated annual observation.
+        cols = [c for c in income.columns if self._col_date(c) is not None]
+        cols = sorted(cols, key=self._col_date)
+        if len(cols) != len(income.columns):
+            notes.append("yfinance fallback: ignored undated income-statement columns")
+        # A changed year-end can supply two observations with one fiscal-year
+        # label. Their durations are unavailable here, so neither can safely be
+        # treated as a separate full year in growth or reinvestment estimates.
+        year_counts: dict[int, int] = {}
+        for col in cols:
+            year = self._year_of(col)
+            year_counts[year] = year_counts.get(year, 0) + 1
+        ambiguous = {year for year, count in year_counts.items() if count > 1}
+        if ambiguous:
+            cols = [c for c in cols if self._year_of(c) not in ambiguous]
+            notes.append(
+                "yfinance fallback: excluded multiple periods sharing "
+                + ", ".join(f"FY{y}" for y in sorted(ambiguous))
+                + "; annual durations cannot be established after a fiscal year-end change"
+            )
 
         # Keep periods with revenue, and with net income too where that line
         # exists at all (a sparse oldest column otherwise enters the history
@@ -1438,9 +1453,9 @@ class YFinanceClient:
         )
         dividends_paid = series(
             [(cashflow, (
-                "Cash Dividends Paid",
                 "Common Stock Dividend Paid",
                 "CommonStockDividendPaid",
+                "Cash Dividends Paid",
                 "Dividends Paid",
             ))],
             positive=True,
@@ -1491,7 +1506,9 @@ class YFinanceClient:
         lead: list[str] = []
         kind = None
         info = self._info(tk)
-        col = self._newest_column(balance)
+        col = next(
+            (c for c in balance.columns if self._date_iso(c) == balance_sheet.as_of), None
+        ) if balance is not None else None
         if col is not None:
             evidence, note = self._captive_finance_evidence(
                 balance, col, info.get("sector"), info.get("industry")
@@ -1820,11 +1837,30 @@ class YFinanceClient:
                 total_equity=0.0,
             )
 
-        # Newest period-end column.
-        try:
-            col = max(balance.columns)
-        except Exception:
-            col = balance.columns[0]
+        # Ignore an entirely empty newest column (Yahoo can insert one before
+        # the statement is populated). Do not replace real zero balances.
+        dated = sorted(
+            (c for c in balance.columns if self._col_date(c) is not None),
+            key=self._col_date, reverse=True,
+        )
+        anchors = (
+            "Total Debt", "Long Term Debt", "Current Debt",
+            "Long Term Debt And Capital Lease Obligation",
+            "Current Debt And Capital Lease Obligation", "Short Term Debt",
+            "Cash Cash Equivalents And Short Term Investments",
+            "Cash And Cash Equivalents", "Other Short Term Investments",
+            "Short Term Investments", "Common Stock Equity", "Stockholders Equity",
+            "Total Equity Gross Minority Interest",
+        )
+        col = next((c for c in dated if self._cell(balance, anchors, c) is not None), None)
+        if col is None:
+            notes.append("yfinance fallback: no dated balance sheet with usable debt, cash or equity")
+            return self._build_balance_sheet(None, notes)
+        if col != dated[0]:
+            notes.append(
+                f"yfinance fallback: empty newer balance-sheet columns ignored; "
+                f"using {self._date_iso(col)}"
+            )
         as_of = self._date_iso(col)
 
         def val(names: tuple[str, ...]) -> Optional[float]:
@@ -1968,10 +2004,8 @@ class YFinanceClient:
         """The newest period-end column of a statement frame, or None."""
         if frame is None or getattr(frame, "empty", True):
             return None
-        try:
-            return max(frame.columns)
-        except Exception:
-            return frame.columns[0]
+        dated = [c for c in frame.columns if YFinanceClient._col_date(c) is not None]
+        return max(dated, key=YFinanceClient._col_date) if dated else None
 
     @staticmethod
     def _col_date(col: object) -> Optional[datetime.date]:
@@ -1983,7 +2017,13 @@ class YFinanceClient:
                 day = datetime.date.fromisoformat(str(col)[:10])
             except ValueError:
                 return None
-        return day if isinstance(day, datetime.date) else None
+        if not isinstance(day, datetime.date):
+            return None
+        try:
+            # NaT inherits datetime but has non-integer calendar components.
+            return datetime.date(day.year, day.month, day.day)
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     @staticmethod
     def _year_of(col: object) -> Optional[int]:
@@ -1994,18 +2034,10 @@ class YFinanceClient:
         rule as the EDGAR parser), so it does not share a label with the next
         fiscal year ending in late December.
         """
-        # pandas Timestamp / datetime expose `.year`.
-        yr = getattr(col, "year", None)
-        if isinstance(yr, int):
-            month, day = getattr(col, "month", 0), getattr(col, "day", 0)
-            return yr - 1 if (month == 1 and isinstance(day, int) and day <= 14) else yr
-        # Fallback: parse a leading 4-digit year from the string form.
-        s = str(col)
-        if len(s) >= 10 and s[:4].isdigit() and s[5:7] == "01" and s[8:10].isdigit():
-            return int(s[:4]) - 1 if int(s[8:10]) <= 14 else int(s[:4])
-        if len(s) >= 4 and s[:4].isdigit():
-            return int(s[:4])
-        return None
+        day = YFinanceClient._col_date(col)
+        if day is None:
+            return None
+        return day.year - 1 if day.month == 1 and day.day <= 14 else day.year
 
     @staticmethod
     def _date_iso(col: object) -> str:

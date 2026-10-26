@@ -76,6 +76,7 @@ run needs no network access or API keys:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip setuptools
 python -m pip install -r requirements.txt
 python -m equity_valuation --demo
 ```
@@ -111,15 +112,16 @@ The Excel DCF sheet contains formulas for selected calculations; other model
 outputs are snapshots. The HTML report embeds its chart library for offline use.
 Rates are decimals (`--rf 0.043` means 4.3%); percent-style, non-finite or
 out-of-range values are rejected. `--terminal-growth` applies to the DCF, DDM
-and FCFE. The command exits 1 if the valuation or an export fails and 2 for
-invalid arguments.
+and FCFE. The command exits 1 if an export fails or no requested model produces a usable
+valuation, and 2 for invalid arguments. Diagnostic exports are still written
+when the input data loads but every requested model is unavailable.
 
 ## Run the dashboard
 
 The dashboard also needs Node.js 22.12 or newer and npm.
 
 ```bash
-cp .env.example .env
+test -f .env || cp .env.example .env
 # Edit .env: set your SEC contact and any optional API keys.
 ./run_dev.sh
 ```
@@ -127,6 +129,18 @@ cp .env.example .env
 Open `http://127.0.0.1:3000`. The script installs Python dependencies, installs
 frontend packages from the lockfile on first run, and starts FastAPI and Next.js.
 Press Ctrl-C to stop both servers.
+
+Dashboard exports use the exact displayed valuation, with its calculation time.
+Each calculated report is retained in memory for up to 24 hours, limited to the
+32 latest reports. Restarting the backend or exceeding those limits requires
+Recompute before export; the app shows a conflict instead of silently refreshing
+prices. Unsaved assumption changes take effect only after Recompute. Direct API
+clients may omit `report_id` to calculate a new export from their payload.
+
+FMP enrichment uses the stable API. Analyst revenue/EPS estimates use the
+reporting currency when supplied by FMP; they carry no quote-currency symbol
+when that currency is unknown. Missing models display as unavailable, while a
+completed model that values equity at zero remains a zero estimate.
 
 ![Valuation tab for MSFT: editable DCF assumptions and the reverse DCF card](docs/screenshots/valuation-dcf.png)
 

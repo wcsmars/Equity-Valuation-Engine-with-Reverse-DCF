@@ -59,47 +59,94 @@ class FMPClient:
             return data
         return None
 
+    @staticmethod
+    def _aliases(row: Optional[dict], aliases: dict[str, str]) -> Optional[dict]:
+        """Keep the dashboard contract while accepting FMP's stable field names."""
+        if row is None:
+            return None
+        out = dict(row)
+        for old, current in aliases.items():
+            if out.get(old) is None and current in out:
+                out[old] = out[current]
+        return out
+
     # --- individual endpoints ---------------------------------------------- #
     def profile(self, ticker: str) -> Optional[dict]:
-        return self._first(self._get(f"/api/v3/profile/{ticker}"))
+        return self._first(self._get("/stable/profile", {"symbol": ticker.upper()}))
 
     def quote(self, ticker: str) -> Optional[dict]:
-        return self._first(self._get(f"/api/v3/quote/{ticker}"))
+        return self._first(self._get("/stable/quote", {"symbol": ticker.upper()}))
 
     def ratios_ttm(self, ticker: str) -> Optional[dict]:
-        return self._first(self._get(f"/api/v3/ratios-ttm/{ticker}"))
+        return self._aliases(
+            self._first(self._get("/stable/ratios-ttm", {"symbol": ticker.upper()})),
+            {"peRatioTTM": "priceToEarningsRatioTTM",
+             "priceToFreeCashFlowsRatioTTM": "priceToFreeCashFlowRatioTTM",
+             "payoutRatioTTM": "dividendPayoutRatioTTM",
+             "debtEquityRatioTTM": "debtToEquityRatioTTM"},
+        )
 
     def key_metrics_ttm(self, ticker: str) -> Optional[dict]:
-        return self._first(self._get(f"/api/v3/key-metrics-ttm/{ticker}"))
+        return self._aliases(
+            self._first(self._get("/stable/key-metrics-ttm", {"symbol": ticker.upper()})),
+            {"roicTTM": "returnOnInvestedCapitalTTM"},
+        )
 
     def price_target(self, ticker: str) -> Optional[dict]:
         return self._first(
-            self._get("/api/v4/price-target-consensus", {"symbol": ticker})
+            self._get("/stable/price-target-consensus", {"symbol": ticker.upper()})
         )
 
     def rating(self, ticker: str) -> Optional[dict]:
-        return self._first(self._get(f"/api/v3/rating/{ticker}"))
+        return self._first(self._get("/stable/ratings-snapshot", {"symbol": ticker.upper()}))
 
     def peers(self, ticker: str) -> list[str]:
-        data = self._first(self._get("/api/v4/stock_peers", {"symbol": ticker}))
-        if data and isinstance(data.get("peersList"), list):
-            return [str(p) for p in data["peersList"]]
-        return []
+        data = self._get("/stable/stock-peers", {"symbol": ticker.upper()})
+        rows = data if isinstance(data, list) else [data]
+        symbols: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # Stable returns one {symbol, companyName, ...} row per peer.
+            # Retain support for a cached legacy response's peersList too.
+            candidates = row.get("peersList")
+            if not isinstance(candidates, list):
+                candidates = [row.get("symbol")]
+            for value in candidates:
+                if isinstance(value, str) and value.strip():
+                    symbol = value.strip().upper()
+                    if symbol != ticker.strip().upper() and symbol not in symbols:
+                        symbols.append(symbol)
+        return symbols
 
     def news(self, ticker: str, limit: int = 30) -> list[dict]:
-        data = self._get("/api/v3/stock_news", {"tickers": ticker, "limit": limit})
-        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        data = self._get("/stable/news/stock", {"symbols": ticker.upper(), "limit": limit})
+        rows = []
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, dict):
+                continue
+            normalized = self._aliases(row, {"site": "publisher"})
+            for key in ("title", "text", "url", "site", "publishedDate", "image"):
+                if key in normalized and not isinstance(normalized[key], str):
+                    normalized[key] = None
+            rows.append(normalized)
+        return rows
 
     def analyst_estimates(self, ticker: str, limit: int = 6) -> list[dict]:
         data = self._get(
-            f"/api/v3/analyst-estimates/{ticker}", {"limit": limit, "period": "annual"}
+            "/stable/analyst-estimates",
+            {"symbol": ticker.upper(), "limit": limit, "period": "annual", "page": 0},
         )
-        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        # Amounts use the reporting currency, which may differ from the quote.
+        # Do not attach the profile's quote currency to these financial estimates.
+        return [self._aliases(row, {"estimatedRevenueAvg": "revenueAvg",
+                                   "estimatedEpsAvg": "epsAvg"})
+                for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     def transcripts_list(self, ticker: str, limit: int = 12) -> list[dict]:
         """Available earnings-call transcripts as [{quarter, year, date}]."""
         data = self._get(
-            "/api/v4/earning_call_transcript", {"symbol": ticker.upper()}
+            "/stable/earning-call-transcript-dates", {"symbol": ticker.upper()}
         )
         out: list[dict] = []
         if isinstance(data, list):
@@ -113,7 +160,7 @@ class FMPClient:
                     out.append(
                         {
                             "quarter": row.get("quarter"),
-                            "year": row.get("year"),
+                            "year": row.get("fiscalYear", row.get("year")),
                             "date": str(row.get("date", "")),
                         }
                     )
@@ -122,8 +169,8 @@ class FMPClient:
     def transcript(self, ticker: str, year: int, quarter: int) -> Optional[dict]:
         """One earnings-call transcript {content, date, ...} or None."""
         data = self._get(
-            f"/api/v3/earning_call_transcript/{ticker.upper()}",
-            {"year": year, "quarter": quarter},
+            "/stable/earning-call-transcript",
+            {"symbol": ticker.upper(), "year": year, "quarter": quarter},
         )
         return self._first(data)
 
@@ -133,12 +180,19 @@ class FMPClient:
         ticker = ticker.strip().upper()
         if not self.enabled:
             return {"enabled": False}
+        ratios = self.ratios_ttm(ticker)
+        metrics = self.key_metrics_ttm(ticker)
+        # ROE moved from ratios to key metrics in the stable API.
+        if metrics and metrics.get("returnOnEquityTTM") is not None:
+            ratios = dict(ratios or {})
+            if ratios.get("returnOnEquityTTM") is None:
+                ratios["returnOnEquityTTM"] = metrics["returnOnEquityTTM"]
         return {
             "enabled": True,
             "profile": self.profile(ticker),
             "quote": self.quote(ticker),
-            "ratios_ttm": self.ratios_ttm(ticker),
-            "key_metrics_ttm": self.key_metrics_ttm(ticker),
+            "ratios_ttm": ratios,
+            "key_metrics_ttm": metrics,
             "price_target": self.price_target(ticker),
             "rating": self.rating(ticker),
             "peers": self.peers(ticker),

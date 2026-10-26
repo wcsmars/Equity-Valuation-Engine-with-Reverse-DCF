@@ -1454,5 +1454,86 @@ class ExternalDataExportTests(unittest.TestCase):
             self.assertIn("GBP", peer_row)
             wb.close()
 
+class UnavailableValuationReportTests(unittest.TestCase):
+    @staticmethod
+    def _report(*, missing_shares=False, missing_margin=False, zero_value=False):
+        company = make_company()
+        if missing_shares:
+            company.market.shares_outstanding = 0.0
+            company.financials.diluted_shares = [0.0] * 5
+        if missing_margin:
+            company.financials.net_income = [None] * 5
+        if zero_value:
+            company.balance_sheet.total_debt = 0.0
+            company.balance_sheet.cash_and_investments = 0.0
+            for name in ("ebit", "net_income", "pretax_income", "interest_expense", "change_in_nwc"):
+                setattr(company.financials, name, [0.0] * 5)
+            company.financials.capex = company.financials.dep_amort[:]
+        provider = SyntheticProvider()
+        provider.get_company_data = lambda ticker: company
+        return value_company("SYNT", provider=provider, run_ddm=False,
+                             run_comps=False, run_sensitivity=False)
+
+    def test_missing_shares_show_no_price_or_downside_in_exports_and_cli(self):
+        report = self._report(missing_shares=True)
+        wb, _ = _workbook(self, report)
+        summary_rows = _label_rows(wb["Summary"])
+        for name in ("DCF (FCFF) (not in blend)", "FCFE (not in blend)"):
+            row = summary_rows[name]
+            self.assertIsNone(wb["Summary"].cell(row, 2).value)
+            self.assertEqual(wb["Summary"].cell(row, 3).value, "n/a")
+        for sheet in ("DCF", "DDM_FCFE"):
+            rows = _label_rows(wb[sheet])
+            self.assertIsNone(wb[sheet].cell(rows["Implied price / share"], 2).value)
+            self.assertIsNone(wb[sheet].cell(rows["Upside / (downside)"], 2).value)
+        from equity_valuation.report.html import _dcf_table, _methods_table
+        for markup in (_dcf_table(report, "$"), _methods_table(report, "$")):
+            self.assertNotIn("-100.0%", markup)
+            self.assertNotIn("$0.00", markup)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            from equity_valuation.cli import _print_summary
+            _print_summary(report)
+        self.assertNotIn("-100.0%", output.getvalue())
+
+    def test_missing_fcfe_margin_is_unavailable_even_with_valid_shares(self):
+        report = self._report(missing_margin=True)
+        wb, _ = _workbook(self, report)
+        rows = _label_rows(wb["DDM_FCFE"])
+        self.assertIsNone(wb["DDM_FCFE"].cell(rows["Implied price / share"], 2).value)
+        self.assertIsNone(wb["DDM_FCFE"].cell(rows["Upside / (downside)"], 2).value)
+
+    def test_completed_zero_values_keep_the_real_total_loss(self):
+        report = self._report(zero_value=True)
+        wb, evaluator = _workbook(self, report)
+        for sheet in ("DCF", "DDM_FCFE"):
+            rows = _label_rows(wb[sheet])
+            self.assertEqual(evaluator.value(sheet, f"B{rows['Implied price / share']}"), 0.0)
+            self.assertEqual(evaluator.value(sheet, f"B{rows['Upside / (downside)']}"), -1.0)
+        from equity_valuation.report.html import _methods_table
+        self.assertIn("-100.0%", _methods_table(report, "$"))
+
+    def test_cli_returns_failure_with_diagnostic_exports_when_every_model_unavailable(self):
+        from equity_valuation import engine
+        out = _tmpdir(self)
+        with patch.object(engine, "value_company", return_value=self._report(missing_shares=True)):
+            code, _stdout, error = _run_cli(["SYNT", "--quiet", "--excel", "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("no requested model produced an available valuation", error)
+        self.assertTrue((Path(out) / "SYNT_valuation.xlsx").exists())
+
+    def test_calculation_time_is_preserved_separately_from_export_time(self):
+        report = self._report()
+        self.assertTrue(report.valued_at.endswith("+00:00"))
+        report.valued_at = "2026-01-02T03:04:05+00:00"
+        wb, _ = _workbook(self, report)
+        rows = _label_rows(wb["Summary"])
+        self.assertEqual(wb["Summary"].cell(rows["Valuation calculated (UTC)"], 2).value,
+                         report.valued_at)
+        self.assertNotEqual(wb["Summary"].cell(rows["Report generated (UTC)"], 2).value,
+                            report.valued_at)
+        from equity_valuation.report.html import _header_html
+        self.assertIn("Valuation calculated (UTC): " + report.valued_at, _header_html(report, "$"))
+
+
 if __name__ == "__main__":
     unittest.main()

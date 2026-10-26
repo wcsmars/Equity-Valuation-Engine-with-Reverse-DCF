@@ -60,7 +60,7 @@ function DetailList({
   const notes = Array.isArray(rawNotes)
     ? rawNotes.filter((n): n is string => typeof n === "string" && n !== "")
     : [];
-  const entries = Object.entries(detail || {}).filter(([k]) => k !== "notes");
+  const entries = Object.entries(detail || {}).filter(([k]) => !["notes", "valuation_available"].includes(k));
   if (entries.length === 0 && notes.length === 0) return null;
   return (
     <div className="mt-3 border-t border-line pt-3">
@@ -97,9 +97,9 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
   const fcfe = report.fcfe;
 
   const ddmUpside =
-    ddm && price ? ddm.implied_price / price - 1 : null;
+    ddm && ddm.implied_price != null && price > 0 ? ddm.implied_price / price - 1 : null;
   const fcfeUpside =
-    fcfe && price ? fcfe.implied_price / price - 1 : null;
+    fcfe && fcfe.implied_price != null && price > 0 ? fcfe.implied_price / price - 1 : null;
 
   const fcfeYears = fcfe?.years || [];
   // Methods left out of the blended target are shown for reference only (a
@@ -119,7 +119,7 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
           "Implied value from projected dividends discounted at the cost of equity"
         )}
       >
-        {ddm == null ? (
+        {ddm == null || ddm.implied_price == null ? (
           <EmptyState
             title="DDM unavailable"
             hint="No valid dividend valuation was produced. Check the report warnings and dividend assumptions."
@@ -156,7 +156,7 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
           "Free cash flow to equity discounted at the cost of equity"
         )}
       >
-        {fcfe == null ? (
+        {fcfe == null || fcfe.implied_price == null ? (
           <EmptyState
             title="FCFE unavailable"
             hint={(report.warnings || []).join(" · ")}

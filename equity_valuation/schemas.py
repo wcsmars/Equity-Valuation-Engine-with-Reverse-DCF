@@ -274,3 +274,5 @@ class ValuationReport:
     football_field: list[FootballFieldRow] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # UTC calculation timestamp, preserved when the same valuation is exported.
+    valued_at: Optional[str] = None

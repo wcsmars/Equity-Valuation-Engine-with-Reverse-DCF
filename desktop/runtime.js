@@ -105,4 +105,23 @@ function startupFailure(error, quitting) {
   return String(error && error.message ? error.message : error);
 }
 
-module.exports = { loadDotenv, waitForHttp, uniquePath, watchChildExit, startupFailure };
+// A production bundle can remain present after code or dependencies change.
+// Rebuild when any input is newer, not just after `next dev` removes BUILD_ID.
+function productionBuildIsCurrent(frontendDir) {
+  const marker = path.join(frontendDir, ".next", "BUILD_ID");
+  if (!fs.existsSync(marker)) return false;
+  const builtAt = fs.statSync(marker).mtimeMs;
+  const changed = (file) => {
+    if (!fs.existsSync(file)) return false;
+    const stat = fs.statSync(file);
+    if (stat.isDirectory()) return stat.mtimeMs > builtAt ||
+      fs.readdirSync(file).some((name) => changed(path.join(file, name)));
+    return stat.mtimeMs > builtAt;
+  };
+  return !["app", "components", "lib", "public", "package.json", "package-lock.json",
+    "next.config.mjs", "postcss.config.mjs", "tailwind.config.ts", "tsconfig.json"]
+    .some((name) => changed(path.join(frontendDir, name)));
+}
+
+module.exports = { loadDotenv, waitForHttp, uniquePath, watchChildExit, startupFailure,
+  productionBuildIsCurrent };

@@ -10,6 +10,8 @@ anthropic>=0.78
 # Office artifacts (research memo / briefing deck)
 python-docx>=1.1
 python-pptx>=1.0
+# Image processing used by the Office exporters.
+pillow>=13.0.0
 # requests, pandas, numpy, yfinance, openpyxl, plotly come from
 # ../requirements.txt (the valuation engine). Install both:
 #   pip install -r ../requirements.txt -r requirements-backend.txt

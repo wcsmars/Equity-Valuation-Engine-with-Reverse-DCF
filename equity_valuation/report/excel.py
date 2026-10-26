@@ -31,7 +31,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from .. import config
 from ..data.market import _BLUME_MARKET_WEIGHT, _BLUME_RAW_WEIGHT
 from ..schemas import ValuationReport
-from ..utils import is_num, median
+from ..utils import available_model_price, is_num, median
 
 # --------------------------------------------------------------------------- #
 #  Styling constants
@@ -273,8 +273,11 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     _set(ws, row, 2, cur_price, fmt=money_fmt, align=_RIGHT)
     current_price_cell = f"B{row}"
     row += 1
-    _set(ws, row, 1, "Report date", font=_LABEL_FONT)
-    _set(ws, row, 2, _dt.date.today().isoformat())
+    _set(ws, row, 1, "Valuation calculated (UTC)", font=_LABEL_FONT)
+    _set(ws, row, 2, getattr(report, "valued_at", None) or "Not recorded")
+    row += 1
+    _set(ws, row, 1, "Report generated (UTC)", font=_LABEL_FONT)
+    _set(ws, row, 2, _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"))
     row += 2
 
     # --- Method valuation table ------------------------------------------- #
@@ -315,13 +318,13 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     ddm = report.ddm
     fcfe = report.fcfe
 
-    _method_line("DCF (FCFF)", getattr(dcf, "implied_price", None) if dcf else None, "DCF")
+    _method_line("DCF (FCFF)", available_model_price(dcf), "DCF")
     comps_med = None
     if comps is not None:
         comps_med = (comps.implied_price_summary or {}).get("median")
     _method_line("Trading comps (median)", comps_med, "Comps (median)")
-    _method_line("DDM", getattr(ddm, "implied_price", None) if ddm else None, "DDM")
-    _method_line("FCFE", getattr(fcfe, "implied_price", None) if fcfe else None, "FCFE")
+    _method_line("DDM", available_model_price(ddm), "DDM")
+    _method_line("FCFE", available_model_price(fcfe), "FCFE")
 
     # Blended target: prefer the engine-computed value on report.summary so the
     # Excel and HTML headline targets always agree (a None there means no
@@ -656,10 +659,11 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     # Implied price = equity value / shares  (LIVE formula).
     _set(ws, row, 1, "Implied price / share", font=_LABEL_FONT)
     shares_val = _num(getattr(dcf, "shares", None))
-    if shares_val:
+    available_price = available_model_price(dcf)
+    if available_price is not None and shares_val and shares_val > 0:
         _formula(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
     else:
-        _set(ws, row, 2, _num(getattr(dcf, "implied_price", None)),
+        _set(ws, row, 2, available_price,
              fmt=money_fmt, align=_RIGHT)
     implied_cell = f"B{row}"
     row += 1
@@ -672,9 +676,10 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
 
     # Upside = implied / current - 1  (LIVE formula, sign-colored).
     _set(ws, row, 1, "Upside / (downside)", font=_LABEL_FONT)
-    up_val = _num(getattr(dcf, "upside", None))
+    up_val = None
     cur_p = _num(getattr(dcf, "current_price", None))
-    if cur_p:
+    if available_price is not None and cur_p and cur_p > 0:
+        up_val = available_price / cur_p - 1.0
         up_cell = _formula(ws, row, 2, f"={implied_cell}/{current_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
     else:
@@ -817,7 +822,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
              fmt=PERCENT_FMT, align=_RIGHT)
         row += 1
         _set(ws, row, 1, "Implied price", font=_LABEL_FONT)
-        _set(ws, row, 2, _num(getattr(ddm, "implied_price", None)),
+        _set(ws, row, 2, available_model_price(ddm),
              fmt=money_fmt, align=_RIGHT)
         row += 1
         # Spill any scalar detail entries (growth inputs, D0, stage PVs, ...).
@@ -923,10 +928,11 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
 
     # Implied price = equity / shares  (LIVE formula).
     _set(ws, row, 1, "Implied price / share", font=_LABEL_FONT)
-    if _num(getattr(fcfe, "shares", None)):
+    available_price = available_model_price(fcfe)
+    if available_price is not None and (_num(getattr(fcfe, "shares", None)) or 0) > 0:
         _formula(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
     else:
-        _set(ws, row, 2, _num(getattr(fcfe, "implied_price", None)),
+        _set(ws, row, 2, available_price,
              fmt=money_fmt, align=_RIGHT)
     implied_cell = f"B{row}"
     row += 1
@@ -940,8 +946,8 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     # Upside = implied / current - 1  (LIVE formula, sign-colored).
     _set(ws, row, 1, "Upside / (downside)", font=_LABEL_FONT)
     cur_p = _num(getattr(fcfe, "current_price", None))
-    imp = _num(getattr(fcfe, "implied_price", None))
-    if cur_p:
+    imp = available_price
+    if imp is not None and cur_p and cur_p > 0:
         up_cell = _formula(ws, row, 2, f"={implied_cell}/{current_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
         # Uncoloured for a reference-only FCFE or when the engine gives no verdict.

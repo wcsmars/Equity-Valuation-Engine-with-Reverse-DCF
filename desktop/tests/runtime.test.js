@@ -5,7 +5,31 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { EventEmitter } = require("node:events");
-const { loadDotenv, uniquePath, waitForHttp, watchChildExit, startupFailure } = require("../runtime");
+const { loadDotenv, uniquePath, waitForHttp, watchChildExit, startupFailure, productionBuildIsCurrent } = require("../runtime");
+
+test("desktop rebuilds stale source and dependencies even while BUILD_ID exists", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "equity-desktop-build-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.equal(productionBuildIsCurrent(dir), false);
+  fs.mkdirSync(path.join(dir, ".next"));
+  fs.mkdirSync(path.join(dir, "app"));
+  const marker = path.join(dir, ".next", "BUILD_ID");
+  const source = path.join(dir, "app", "page.tsx");
+  fs.writeFileSync(source, "old source");
+  fs.utimesSync(source, 1000, 1000);
+  fs.utimesSync(path.join(dir, "app"), 1000, 1000);
+  fs.writeFileSync(marker, "production");
+  fs.utimesSync(marker, 2000, 2000);
+  assert.equal(productionBuildIsCurrent(dir), true);
+  fs.utimesSync(source, 3000, 3000);
+  assert.equal(productionBuildIsCurrent(dir), false);
+  fs.utimesSync(source, 1000, 1000);
+  fs.unlinkSync(source);
+  assert.equal(productionBuildIsCurrent(dir), false);
+  fs.utimesSync(path.join(dir, "app"), 1000, 1000);
+  fs.writeFileSync(path.join(dir, "package-lock.json"), "{}");
+  assert.equal(productionBuildIsCurrent(dir), false);
+});
 
 test("dotenv accepts shell-style literal keys without executing expressions", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "equity-desktop-env-"));

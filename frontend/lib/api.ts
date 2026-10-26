@@ -289,12 +289,14 @@ export async function downloadExport(
   kind: ExportKind,
   ticker: string,
   assumptions: Assumptions,
-  note?: ResearchNote | null
+  note?: ResearchNote | null,
+  reportId?: string
 ): Promise<void> {
   const res = await fetch(apiUrl(`/api/export/${kind}`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ticker, note: note ?? null, ...assumptions }),
+    body: JSON.stringify({ ...assumptions, ticker, note: note ?? null,
+      ...(reportId ? { report_id: reportId } : {}) }),
   });
   if (!res.ok) throw new Error(await errorDetail(res));
   const blob = await res.blob();

@@ -16,7 +16,7 @@
     "dmg": "electron-builder --mac dmg"
   },
   "devDependencies": {
-    "electron": "^42.11.12",
+    "electron": "^42.11.18",
     "electron-builder": "^26.17.0"
   },
   "build": {
@@ -24,7 +24,9 @@
     "productName": "Equity Research Automation",
     "asar": true,
     "npmRebuild": false,
-    "directories": { "output": "dist" },
+    "directories": {
+      "output": "dist"
+    },
     "files": [
       "main.js",
       "runtime.js",
@@ -35,7 +37,9 @@
       "package.json"
     ],
     "mac": {
-      "target": ["dir"],
+      "target": [
+        "dir"
+      ],
       "category": "public.app-category.finance",
       "icon": "assets/icon.icns"
     }

@@ -16,6 +16,7 @@ const {
   uniquePath,
   watchChildExit,
   startupFailure,
+  productionBuildIsCurrent,
 } = require("./runtime");
 
 // Source launches always resolve the adjacent checkout. Packaged local apps
@@ -102,7 +103,7 @@ function pipeLogs(name, proc, onLog) {
 // (e.g. via run_dev.sh) overwrites .next with a dev build that next start can't
 // serve, so we detect that and rebuild.
 function hasProductionBuild() {
-  return fs.existsSync(path.join(FRONTEND_DIR, ".next", "BUILD_ID"));
+  return productionBuildIsCurrent(FRONTEND_DIR);
 }
 
 function buildFrontend(onLog, logTail) {
@@ -170,11 +171,11 @@ async function startServers(onLog) {
 
   // Self-heal a missing/dev-clobbered production build before next start.
   if (!hasProductionBuild()) {
-    log("[build] No production build — building the UI (first run)…");
+    log("[build] Production build missing or older than the source — building the UI…");
     if (mainWindow) {
       mainWindow.webContents
         .executeJavaScript(
-          "var s=document.querySelector('.sub'); if(s){s.textContent='Preparing the app for first launch (building the UI)…';}"
+          "var s=document.querySelector('.sub'); if(s){s.textContent='Preparing the app (building the latest UI)…';}"
         )
         .catch(() => {});
     }

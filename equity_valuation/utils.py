@@ -11,24 +11,48 @@ from typing import Optional, Sequence
 
 
 def safe_div(num: Optional[float], den: Optional[float]) -> Optional[float]:
-    """Division that returns None on zero/None/NaN inputs instead of raising."""
-    if num is None or den is None:
+    """Finite division, or None for missing/invalid inputs or overflow.
+
+    An infinite denominator must not turn a missing ratio into a real zero,
+    and booleans are flags rather than financial values.
+    """
+    if not is_num(num) or not is_num(den) or den == 0:
         return None
     try:
-        if den == 0 or _isnan(den) or _isnan(num):
-            return None
-        return num / den
-    except (TypeError, ZeroDivisionError):
+        result = num / den
+    except (OverflowError, ZeroDivisionError):
         return None
-
-
-def _isnan(x: object) -> bool:
-    return isinstance(x, float) and math.isnan(x)
+    return result if is_num(result) else None
 
 
 def is_num(x: object) -> bool:
     """True if x is a finite real number."""
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
+
+
+def available_model_price(result) -> Optional[float]:
+    """A completed model's finite price, including genuine zero equity, else None.
+
+    DCF and FCFE retain zero-valued placeholders when essential data is absent.
+    Those are explicitly marked unavailable and must not appear as a -100%
+    estimate in reports. Older positive/negative results have no completion
+    flag; only a zero requires an explicit True flag. Accept serialized results
+    as well as the model dataclasses so every output uses the same rule.
+    """
+    if result is None:
+        return None
+    get = result.get if isinstance(result, dict) else lambda key, default=None: getattr(result, key, default)
+    price = get("implied_price")
+    metadata = get("assumptions") or get("detail") or {}
+    available = metadata.get("valuation_available")
+    if available is False or not is_num(price) or (price == 0 and available is not True):
+        return None
+    return float(price)
 
 
 def clean(values: Sequence[Optional[float]]) -> list[float]:

@@ -90,9 +90,9 @@ export interface DCF {
   net_debt: number;
   equity_value: number;
   shares: number;
-  implied_price: number;
+  implied_price: number | null;
   current_price: number;
-  upside: number;
+  upside: number | null;
   assumptions: Record<string, unknown>;
 }
 
@@ -134,7 +134,7 @@ export interface Comps {
 
 export interface DDM {
   method: string;
-  implied_price: number;
+  implied_price: number | null;
   cost_of_equity: number;
   detail: Record<string, unknown>;
 }
@@ -147,7 +147,7 @@ export interface FCFE {
   pv_terminal: number;
   equity_value: number;
   shares: number;
-  implied_price: number;
+  implied_price: number | null;
   current_price: number;
   cost_of_equity: number;
   detail: Record<string, unknown>;
@@ -205,6 +205,8 @@ export interface ReverseDCF {
 }
 
 export interface Report {
+  report_id?: string;
+  valued_at?: string;
   summary: Summary;
   company: Company;
   macro: Macro;

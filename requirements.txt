@@ -2,6 +2,8 @@
 pandas>=1.5
 numpy>=1.23
 requests>=2.33
+# Keep the trust store beyond the revoked-certificate security fixes.
+certifi>=2026.10.19
 
 # Market data
 # Older releases are rejected by Yahoo's current endpoints.

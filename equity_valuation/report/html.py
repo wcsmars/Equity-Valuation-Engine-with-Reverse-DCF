@@ -26,7 +26,7 @@ from typing import Optional
 
 from .. import config
 from ..schemas import ValuationReport
-from ..utils import is_num, median
+from ..utils import available_model_price, is_num, median
 # The rules every output shares (no-target text, method-upside colour, the
 # Blume note) live with the Excel exporter.
 from .excel import BLUME_NOTE, method_upside_toned, no_target_text
@@ -539,14 +539,16 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         ("Less: preferred equity", _fmt_big(_claim("preferred_equity"), symbol)),
         ("Equity value", _fmt_big(getattr(dcf, "equity_value", None), symbol)),
         ("Shares", _fmt_big(getattr(dcf, "shares", None))),
-        ("Implied price", _fmt_price(getattr(dcf, "implied_price", None), symbol)),
+        ("Implied price", _fmt_price(available_model_price(dcf), symbol)),
         ("Current price", _fmt_price(getattr(dcf, "current_price", None), symbol)),
     ]
     bridge_rows = "".join(
         f"<tr><th class='rowhead'>{_esc(k)}</th><td>{v}</td></tr>"
         for k, v in bridge_items
     )
-    up = getattr(dcf, "upside", None)
+    price = available_model_price(dcf)
+    cur = getattr(dcf, "current_price", None)
+    up = price / cur - 1.0 if price is not None and is_num(cur) and cur > 0 else None
     # Uncoloured for a reference-only DCF or when the engine gives no verdict.
     up_cls = _upside_class(up) if method_upside_toned(report.summary, "DCF") else "neutral"
     bridge_rows += (
@@ -725,10 +727,12 @@ def _header_html(report: ValuationReport, symbol: str) -> str:
         for lbl, val, cls in cards
     )
     sub = " · ".join(filter(None, [ticker, _esc(currency or "")]))
+    calculated = _esc(getattr(report, "valued_at", None) or "Not recorded")
     return (
         "<header class='report-header'>"
         f"<h1>{name}</h1>"
         f"<div class='subtitle'>{sub}</div>"
+        f"<div class='calculated'>Valuation calculated (UTC): {calculated}</div>"
         f"<div class='cards'>{cards_html}</div>"
         + _methods_table(report, symbol)
         + "</header>"
@@ -748,7 +752,10 @@ def _methods_table(report: ValuationReport, symbol: str) -> str:
     cur = report.current_price
     rows = []
     for name, price in methods.items():
-        up = (price / cur - 1.0) if (is_num(price) and is_num(cur) and cur) else None
+        model = {"DCF": report.dcf, "DDM": report.ddm, "FCFE": report.fcfe}.get(name)
+        if model is not None:
+            price = available_model_price(model)
+        up = (price / cur - 1.0) if (is_num(price) and is_num(cur) and cur > 0) else None
         mark = (f" <span class='aside'>(not in blend: {_esc(excluded[name])})</span>"
                 if name in excluded else "")
         cls = _upside_class(up) if method_upside_toned(report.summary, name) else "neutral"
@@ -1011,7 +1018,7 @@ def write_html(report: ValuationReport, path: str) -> str:
         comps_section=comps_section,
         sens_section=sens_section,
         footnotes=footnotes,
-        generated=_esc(datetime.date.today().isoformat()),
+        generated=_esc(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")),
     )
 
     with open(path, "w", encoding="utf-8") as fh:

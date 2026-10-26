@@ -23,6 +23,7 @@ import { Badge, Card, Stat, Table, TD, TH } from "@/components/ui";
 function FootballField({ report }: { report: Report }) {
   const rows = report.football_field || [];
   const price = report.current_price;
+  const hasPrice = typeof price === "number" && Number.isFinite(price) && price > 0;
   const cur = report.summary.currency;
   if (rows.length === 0) {
     return <p className="text-sm text-ink-faint">No valuation ranges available.</p>;
@@ -30,8 +31,8 @@ function FootballField({ report }: { report: Report }) {
 
   const lows = rows.map((r) => r.low);
   const highs = rows.map((r) => r.high);
-  let min = Math.min(...lows, price);
-  let max = Math.max(...highs, price);
+  let min = Math.min(...lows, ...(hasPrice ? [price] : []));
+  let max = Math.max(...highs, ...(hasPrice ? [price] : []));
   const pad = (max - min) * 0.06 || 1;
   min -= pad;
   max += pad;
@@ -75,7 +76,7 @@ function FootballField({ report }: { report: Report }) {
       </div>
 
       {/* current-price reference line spanning the chart */}
-      <div className="mt-2 flex items-center gap-3">
+      {hasPrice && <div className="mt-2 flex items-center gap-3">
         <div className="w-32 shrink-0" />
         <div className="relative h-5 flex-1">
           <div
@@ -89,7 +90,7 @@ function FootballField({ report }: { report: Report }) {
             price {fmtMoney(price, cur, 0)}
           </div>
         </div>
-      </div>
+      </div>}
     </div>
   );
 }

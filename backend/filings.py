@@ -192,6 +192,17 @@ _ITEM_PATTERNS = {
               r"item\s+7a\.?", r"item\s+3\.?\s"]),
 }
 
+# Foreign annual reports number these disclosures differently from 10-Ks.
+# Item 3 contains key information, including the Item 3.D risk factors.
+_20F_ITEM_PATTERNS = {
+    "risk_factors": (r"item\s+3\.?\s*[—:\-–\s]*key\s+information",
+                     [r"item\s+4\b"]),
+    "business": (r"item\s+4\.?\s*[—:\-–\s]*information\s+on\s+the\s+company",
+                 [r"item\s+4a\b", r"item\s+5\b"]),
+    "mdna": (r"item\s+5\.?\s*[—:\-–\s]*operating\s+and\s+financial\s+review",
+             [r"item\s+6\b"]),
+}
+
 
 def _at_line_start(text: str, pos: int) -> bool:
     """True if a heading match at `pos` begins a line (only whitespace before
@@ -209,7 +220,8 @@ def extract_sections(text: str, form: str) -> dict[str, str]:
 
     low = text.lower()
     sections: dict[str, str] = {}
-    for key, (start_pat, end_pats) in _ITEM_PATTERNS.items():
+    patterns = _20F_ITEM_PATTERNS if base == "20-F" else _ITEM_PATTERNS
+    for key, (start_pat, end_pats) in patterns.items():
         starts = [m.start() for m in re.finditer(start_pat, low)]
         if not starts:
             continue
@@ -259,6 +271,12 @@ def build_filing_material(ticker: str, form: str, filed: str,
         "mdna": "MANAGEMENT'S DISCUSSION & ANALYSIS",
         "document": "FILING TEXT",
     }
+    if form.split("/")[0].upper() == "20-F":
+        titles.update({
+            "business": "ITEM 4 - INFORMATION ON THE COMPANY",
+            "risk_factors": "ITEM 3 - KEY INFORMATION AND RISK FACTORS",
+            "mdna": "ITEM 5 - OPERATING AND FINANCIAL REVIEW",
+        })
     parts = [f"SEC FILING: {form} for {ticker.upper()}, filed {filed} "
              f"(accession {accession_number})"]
     total = len(parts[0])

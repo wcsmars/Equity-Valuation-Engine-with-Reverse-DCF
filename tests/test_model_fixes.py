@@ -75,6 +75,8 @@ from equity_valuation.utils import (
     screened_incremental_ratio,
     series_cagr,
     trim_outliers,
+    available_model_price,
+    safe_div,
 )
 
 from tests.test_synthetic import make_distressed_company
@@ -2648,6 +2650,46 @@ class PeerWeightingTests(unittest.TestCase):
         self.assertEqual(comps.implied_price_summary["median"],
                          median([v for v in comps.implied.values() if v is not None]))
         self.assertTrue(any("growth bases are not comparable" in n for n in comps.notes))
+
+class NumericAvailabilityTests(unittest.TestCase):
+    def test_verdict_thresholds_include_exact_fifteen_percent_moves(self):
+        for price in (10.0, 100.0, 200.0, 1_000_000.0):
+            with self.subTest(price=price):
+                self.assertEqual(_recommendation(price * 1.15, price), "Undervalued")
+                self.assertEqual(_recommendation(price * 0.85, price), "Overvalued")
+                self.assertEqual(_recommendation(price * (1.15 - 1e-8), price), "Fairly valued")
+                self.assertEqual(_recommendation(price * (0.85 + 1e-8), price), "Fairly valued")
+
+    def test_failed_h_model_does_not_become_a_zero_price_football_bar(self):
+        report = value_company("SYNT", provider=SyntheticProvider(),
+                               ddm_assumptions=DDMAssumptions(method="h_model", high_growth_rate=-0.9),
+                               run_dcf=False, run_fcfe=False, run_comps=False)
+        self.assertEqual(report.ddm.implied_price, 0.0)
+        self.assertIn("DDM", report.summary["excluded_from_blend"])
+        for rows in (report.football_field, _fallback_football_field(report)):
+            self.assertNotIn("DDM", [r.method for r in rows])
+
+    def test_invalid_divisions_do_not_become_financial_values(self):
+        for numerator, denominator in (
+            (1.0, float("inf")), (float("inf"), 1.0), (1.0, float("nan")),
+            (True, 2.0), (1.0, False), (1e308, 1e-308), (None, 1), (1, 0), (10 ** 400, 1),
+        ):
+            with self.subTest(numerator=numerator, denominator=denominator):
+                self.assertIsNone(safe_div(numerator, denominator))
+        self.assertEqual(safe_div(0.0, 10), 0.0)
+        self.assertEqual(safe_div(-5, 2), -2.5)
+
+    def test_available_price_distinguishes_failed_and_completed_zero(self):
+        for metadata in ("assumptions", "detail"):
+            for flag, expected in ((None, None), (False, None), (True, 0.0)):
+                model = {"implied_price": 0.0, metadata: {"valuation_available": flag}}
+                with self.subTest(metadata=metadata, flag=flag):
+                    self.assertEqual(available_model_price(model), expected)
+                    self.assertEqual(available_model_price(SimpleNamespace(**model)), expected)
+        self.assertEqual(available_model_price(SimpleNamespace(implied_price=-2.0)), -2.0)
+        self.assertIsNone(available_model_price({"implied_price": 100.0,
+                                               "detail": {"valuation_available": False}}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ import sys
 
 from . import config
 from .schemas import DCFAssumptions, DDMAssumptions, MacroAssumptions
-from .utils import is_num
+from .utils import available_model_price, is_num
 
 
 def _fmt_money(x, sym="$"):
@@ -164,7 +164,14 @@ def _print_summary(report) -> None:
     print("  Method" + " " * (17 + extra) + "Implied price      Upside")
     print("  " + "-" * (50 + extra))
     for name, price in s["methods"].items():
-        available = excluded.get(name) not in ("no valuation (0.00)", "non-finite implied price")
+        attr = {"DCF": "dcf", "DDM": "ddm", "FCFE": "fcfe"}.get(name)
+        model = getattr(report, attr, None) if attr else None
+        if model is not None:
+            price = available_model_price(model)
+        available = (is_num(price) and excluded.get(name)
+                     not in ("no valuation (0.00)", "non-finite implied price"))
+        if not available:
+            price = None
         up = (price / s["current_price"] - 1.0) if (
             available and is_num(price) and is_num(s["current_price"]) and s["current_price"] > 0
         ) else None
@@ -263,7 +270,15 @@ def main(argv=None) -> int:
     # Same sanitizing as the dashboard's exports: a ticker like BRK/B must not
     # turn into a sub-directory of the output path.
     stem = re.sub(r"[^A-Za-z0-9_.-]", "_", report.company.ticker or "report")
-    failed = False
+    requested_models = not all((args.no_dcf, args.no_comps, args.no_ddm, args.no_fcfe))
+    has_value = any(available_model_price(model) is not None
+                    for model in (report.dcf, report.ddm, report.fcfe))
+    if report.comps is not None:
+        has_value = has_value or is_num((report.comps.implied_price_summary or {}).get("median"))
+    failed = requested_models and not has_value
+    if failed:
+        print("ERROR: no requested model produced an available valuation; "
+              "exports contain diagnostics only. See the report warnings.", file=sys.stderr)
 
     if want_excel:
         try:

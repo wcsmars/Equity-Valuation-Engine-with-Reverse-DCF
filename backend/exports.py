@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Optional
 
 from equity_valuation.report.excel import no_target_text
-from equity_valuation.utils import is_num
+from equity_valuation.utils import available_model_price, is_num
 
-from .valuation_service import run_valuation_report
+from .valuation_service import get_report_snapshot, run_valuation_report
 
 _OUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
@@ -132,6 +132,14 @@ def _method_label(summary: dict, name: str) -> str:
     return f"{name} (not in blend)" if name in excluded else name
 
 
+def _method_values(report) -> dict:
+    methods = dict(report.summary.get("methods") or {})
+    for label, name in (("DCF", "dcf"), ("DDM", "ddm"), ("FCFE", "fcfe")):
+        if label in methods:
+            methods[label] = available_model_price(getattr(report, name, None))
+    return methods
+
+
 def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
@@ -141,13 +149,19 @@ def _ensure_out() -> Path:
     return _OUT_DIR
 
 
+def _export_report(ticker: str, payload: dict):
+    if "report_id" in payload:
+        return get_report_snapshot(ticker, payload["report_id"])
+    return run_valuation_report(ticker, payload)
+
+
 # --------------------------------------------------------------------------- #
 #  Engine-native exports
 # --------------------------------------------------------------------------- #
 def export_excel(ticker: str, payload: dict) -> str:
     from equity_valuation.report.excel import write_excel
 
-    report, _ = run_valuation_report(ticker, payload)
+    report, _ = _export_report(ticker, payload)
     path = _ensure_out() / f"{_safe(ticker.upper())}_valuation.xlsx"
     return write_excel(report, str(path))
 
@@ -155,7 +169,7 @@ def export_excel(ticker: str, payload: dict) -> str:
 def export_html(ticker: str, payload: dict) -> str:
     from equity_valuation.report.html import write_html
 
-    report, _ = run_valuation_report(ticker, payload)
+    report, _ = _export_report(ticker, payload)
     path = _ensure_out() / f"{_safe(ticker.upper())}_valuation.html"
     return write_html(report, str(path))
 
@@ -167,7 +181,7 @@ def export_memo(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     from docx import Document
     from docx.shared import Pt, RGBColor
 
-    report, echo = run_valuation_report(ticker, payload)
+    report, echo = _export_report(ticker, payload)
     s = report.summary
     cur = s.get("currency", "USD")
 
@@ -186,13 +200,15 @@ def export_memo(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
         f"{_headline(s, cur, report.comps)} · model verdict: {s.get('recommendation') or 'n/a'}"
     )
     run.font.color.rgb = RGBColor(0x60, 0x70, 0x8A)
+    if report.valued_at:
+        doc.add_paragraph(f"Valuation calculated: {report.valued_at}")
 
     if note and note.get("stance"):
         doc.add_paragraph(f"Analytical stance: {note['stance']}").runs[0].bold = True
 
     # --- valuation summary table -------------------------------------------- #
     doc.add_heading("Valuation summary", level=1)
-    methods = s.get("methods") or {}
+    methods = _method_values(report)
     table = doc.add_table(rows=1, cols=3)
     table.style = "Light Grid Accent 1"
     hdr = table.rows[0].cells
@@ -306,7 +322,7 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     from pptx.enum.text import PP_ALIGN
     from pptx.util import Emu, Inches, Pt
 
-    report, _echo = run_valuation_report(ticker, payload)
+    report, _echo = _export_report(ticker, payload)
     s = report.summary
     cur = s.get("currency", "USD")
     price = s.get("current_price")
@@ -343,7 +359,8 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     sl = add_slide()
     text(sl, 0.7, 2.2, 11.9, 1.0, f"{s.get('name')}  ({s.get('ticker')})", 40, True)
     text(sl, 0.7, 3.3, 11.9, 0.6,
-         f"Valuation briefing · {date.today().isoformat()}", 18, False, DIM)
+         f"Valuation briefing · {date.today().isoformat()}"
+         + (f" · Calculated {report.valued_at}" if report.valued_at else ""), 18, False, DIM)
     verdict = s.get("recommendation") or "n/a"
     # No colour when no verdict is given (no target, or a withheld verdict).
     vcolor = {"Undervalued": GREEN, "Overvalued": ROSE, "Fairly valued": AMBER}.get(verdict, DIM)
@@ -354,7 +371,7 @@ def export_deck(ticker: str, payload: dict, note: Optional[dict] = None) -> str:
     # --- slide 2: method summary ------------------------------------------------- #
     sl = add_slide()
     text(sl, 0.7, 0.4, 12, 0.6, "Valuation summary", 24, True)
-    methods = list((s.get("methods") or {}).items())
+    methods = list(_method_values(report).items())
     rows = len(methods) + 2
     tbl = sl.shapes.add_table(rows, 3, Inches(0.7), Inches(1.2), Inches(8.0),
                               Inches(0.4 * rows)).table

@@ -12,7 +12,9 @@ Responsibilities:
 
 from __future__ import annotations
 
+import copy
 import math
+import secrets
 import threading
 import time
 from typing import Any, Optional
@@ -41,6 +43,41 @@ _base: Optional[tuple[float, DataProvider]] = None  # (built at, shared provider
 _peer_cache_lock = threading.Lock()
 _peer_cache: dict[tuple, tuple[float, list]] = {}  # tickers tuple -> (ts, rows)
 _PEER_TTL = 600.0
+
+# Retain exact displayed calculations for exports after data caches expire.
+# Snapshots are local to this process and bounded in both age and count.
+_SNAPSHOT_TTL = 86400.0
+_SNAPSHOT_LIMIT = 32
+_snapshot_lock = threading.Lock()
+_report_snapshots: dict[str, tuple[float, str, Any, dict]] = {}
+
+
+class SnapshotError(ValueError):
+    """A displayed report is no longer available for export."""
+
+
+def _remember_report(ticker: str, report, echo: dict) -> str:
+    now = time.monotonic()
+    report_id = secrets.token_urlsafe(24)
+    snapshot = (now, ticker.strip().upper(), copy.deepcopy(report), copy.deepcopy(echo))
+    with _snapshot_lock:
+        _prune(_report_snapshots, now, _SNAPSHOT_TTL)
+        while len(_report_snapshots) >= _SNAPSHOT_LIMIT:
+            del _report_snapshots[next(iter(_report_snapshots))]
+        _report_snapshots[report_id] = snapshot
+    return report_id
+
+
+def get_report_snapshot(ticker: str, report_id: str):
+    """Return an isolated copy; never silently recalculate an expired report."""
+    with _snapshot_lock:
+        _prune(_report_snapshots, time.monotonic(), _SNAPSHOT_TTL)
+        snapshot = _report_snapshots.get(report_id) if isinstance(report_id, str) else None
+        if snapshot is None or snapshot[1] != ticker.strip().upper():
+            raise SnapshotError(
+                "This displayed report is no longer available for export. "
+                "Recompute the valuation, review it, then export again.")
+        return copy.deepcopy(snapshot[2]), copy.deepcopy(snapshot[3])
 
 
 class _CachedProvider(DataProvider):
@@ -420,4 +457,5 @@ def run_valuation(ticker: str, payload: Optional[dict] = None) -> dict:
     from .serialization import _sanitize  # reverse_dcf rides after report_to_dict
 
     d["reverse_dcf"] = _sanitize(_reverse_dcf(report, dcf, macro))
+    d["report_id"] = _remember_report(ticker, report, echo)
     return d
