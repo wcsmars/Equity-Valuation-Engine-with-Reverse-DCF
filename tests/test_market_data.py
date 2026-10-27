@@ -3,31 +3,42 @@
 yfinance ``Ticker`` objects are replaced with ``unittest.mock`` stand-ins that
 carry hand-built ``.info`` dicts, ``fast_info`` fields and statement DataFrames
 shaped like yfinance 1.x output (period-end Timestamp columns, newest first;
-pretty row labels) and dividend histories shaped like ``get_dividends()``.
-Covered: minor-unit quote currencies (GBp, ZAc) including their dividends,
+pretty row labels), and dividend and split histories shaped like
+``get_dividends()`` and ``get_splits()``.
+Covered: minor-unit quote currencies (GBp, ZAc) including their dividends and
+a market cap without a share count, zero 52-week bounds,
 the DDM D0 choice (Yahoo's indicated rate plus the 3-year average of recurring
-variable/special dividends, steady as ex-dates drift; one-off specials, cuts,
-large final dividends, ADRs, the no-rate path), the Blume beta adjustment and
-non-positive betas (and the raw beta in the API payload), reporting vs quote
-currency conversion for foreign issuers,
-the ``.info`` outage path, multi-class share counts, comps rows rebuilt from
-market cap, debt and cash on one currency and share basis (also without a
-balance sheet, or when the check fails), statement tables in another currency
-than Yahoo's financialCurrency (VALE, PBR), the statement fallback's column
-and label handling and its captive-finance mark, HybridProvider's note
-hand-off and market-data backfills, its rejection of stale EDGAR histories and
-its Yahoo backfills of what EDGAR's tags miss: debt (with zero cash), and
+variable/special dividends, steady as ex-dates drift; one-off specials, step
+raises, cuts, large final dividends, ADRs, the no-rate path), the Blume beta
+adjustment and non-positive betas (and the raw beta in the API payload),
+reporting vs quote currency conversion for foreign issuers (every monetary
+field), the ``.info`` outage path, multi-class share counts, comps rows rebuilt
+from market cap, debt and cash on one currency and share basis (also without a
+balance sheet, when the check fails, or for an Up-C issuer), statement tables
+in another currency than Yahoo's financialCurrency (VALE, PBR), the statement
+fallback's column and label handling and its captive-finance mark,
+HybridProvider's note hand-off and market-data backfills (a D0 of 0 from an
+incomplete payment history, ADR share-count caveats), class-share tickers
+typed with a dot, spin-offs Yahoo records after the latest fiscal year, its
+rejection of stale EDGAR histories and its Yahoo backfills of what EDGAR's
+tags miss: debt (with zero cash), D&A years no D&A tag covers (EBITDA
+recomputed; not for banks, insurers, BDCs, REITs and debt-funded lessors, nor
+on another D&A definition than EDGAR's), and
 capex years no capex tag covers, matched by fiscal year (not for banks,
 insurers, BDCs and REITs, nor when Yahoo's capex is on another definition than
 EDGAR's or, for a lessor, far above its D&A; a failed Yahoo request is told
 apart from a statement without capex). The EDGAR gap notes those backfills
-parse are also produced by the real EDGAR client on a companyfacts fixture.
+parse are also produced by the real EDGAR client on a companyfacts fixture,
+as is the annual-report form behind the 20-F share-count WARNING. EDGAR's
+own fiscal-year end date and the fallback's working-capital gap notes are
+covered too.
 "Today" is pinned wherever a date window matters.
 No network access is needed. Run with:  python -m unittest tests.test_market_data
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import unittest
 from unittest import mock
@@ -44,6 +55,7 @@ from equity_valuation.data.base import DataError
 from equity_valuation.data.edgar import EdgarClient
 from equity_valuation.data.market import YFinanceClient, major_currency
 from equity_valuation.data.provider import HybridProvider
+from equity_valuation.models import ddm_fcfe
 from equity_valuation.schemas import AnnualFinancials, BalanceSheetSnapshot
 
 NaN = np.nan
@@ -106,12 +118,14 @@ def fast(last_price=None, currency=None, shares=None):
 
 
 def ticker(info=None, fast_info=None, fin=None, cf=None, bs=None, info_error=None, divs=None,
-           qbs=None):
+           qbs=None, splits=None):
     """A mocked yfinance Ticker (`divs`: what ``get_dividends()`` returns; None -> no method;
-    `qbs`: the quarterly balance sheet)."""
+    `qbs`: the quarterly balance sheet; `splits`: what ``get_splits()`` returns)."""
     spec = ["info", "fast_info", "financials", "cashflow", "balance_sheet",
             "quarterly_balance_sheet"]
-    tk = mock.NonCallableMock(spec=spec + (["get_dividends"] if divs is not None else []))
+    spec += (["get_dividends"] if divs is not None else []) + (
+        ["get_splits"] if splits is not None else [])
+    tk = mock.NonCallableMock(spec=spec)
     if info_error is not None:
         type(tk).info = mock.PropertyMock(side_effect=info_error)
     else:
@@ -123,13 +137,20 @@ def ticker(info=None, fast_info=None, fin=None, cf=None, bs=None, info_error=Non
     tk.quarterly_balance_sheet = qbs if qbs is not None else pd.DataFrame()
     if divs is not None:
         tk.get_dividends = mock.Mock(return_value=divs)
+    if splits is not None:
+        tk.get_splits = mock.Mock(return_value=splits)
     return tk
 
 
-def dividends(payments: dict) -> pd.Series:
+def dividends(payments: dict, name: str = "Dividends") -> pd.Series:
     """A ``get_dividends()`` Series: {ISO ex-date: amount}, exchange-tz index."""
     idx = pd.DatetimeIndex(pd.to_datetime(list(payments)), name="Date").tz_localize("America/New_York")
-    return pd.Series(list(payments.values()), index=idx, name="Dividends", dtype=float)
+    return pd.Series(list(payments.values()), index=idx, name=name, dtype=float)
+
+
+def splits(records: dict) -> pd.Series:
+    """A ``get_splits()`` Series: {ISO date: factor}, as Yahoo records them."""
+    return dividends(records, name="Stock Splits")
 
 
 def client(tickers: dict) -> YFinanceClient:
@@ -181,6 +202,54 @@ class MarketDataTests(unittest.TestCase):
         md = client({"X.L": ticker(info)}).get_market_data("X.L")
         self.assertAlmostEqual(md.market_cap, 250.0)
         self.assertAlmostEqual(md.dividend_per_share, 1.0)
+
+    def test_pence_line_without_shares_outstanding_keeps_the_pound_market_cap(self) -> None:
+        # SHEL.L shape: marketCap in pounds, price in pence, no sharesOutstanding.
+        # The cap was read as pence (100x too small, and the share count with it).
+        info = {"currency": "GBp", "currentPrice": 2500.0, "marketCap": 250.0}
+        md = client({"X.L": ticker(info)}).get_market_data("X.L")
+        self.assertAlmostEqual(md.market_cap, 250.0)
+        self.assertAlmostEqual(md.shares_outstanding, 10.0)
+        self.assertIn("marketCap read as GBP, Yahoo's usual unit on GBp lines (no share count "
+                      "to check it against the price)", md._source_notes)
+        # fast_info's share count checks the unit either way, without the note.
+        for cap in (250.0, 25000.0):
+            with self.subTest(marketCap=cap):
+                tk = ticker(dict(info, marketCap=cap), fast_info=fast(shares=10.0))
+                md = client({"X.L": tk}).get_market_data("X.L")
+                self.assertAlmostEqual(md.market_cap, 250.0)
+                self.assertAlmostEqual(md.shares_outstanding, 10.0)
+                self.assertFalse(any("marketCap read as" in n for n in md._source_notes))
+        # The comps row of the same line agrees with the target's market data.
+        row = client({"X.L": ticker(info)}).get_comp_row("X.L")
+        self.assertAlmostEqual(row.market_cap, 250.0)
+
+    def test_zero_52_week_bound_is_left_unset(self) -> None:
+        # SHEL.L once came back with fiftyTwoWeekLow 0.0: a sentinel, not a price.
+        from equity_valuation.models.sensitivity import build_football_field
+        from equity_valuation.schemas import CompanyData, MacroAssumptions, ValuationReport
+
+        info = {"currency": "GBp", "currentPrice": 3909.0, "sharesOutstanding": 10.0,
+                "fiftyTwoWeekLow": 0.0, "fiftyTwoWeekHigh": 3980.0}
+        md = client({"SHEL.L": ticker(info)}).get_market_data("SHEL.L")
+        self.assertIsNone(md.fifty_two_week_low)
+        self.assertAlmostEqual(md.fifty_two_week_high, 39.8)
+        fin, bs, cik, name = edgar_fundamentals([2024, 2025], "2025-12-31")
+        report = ValuationReport(company=CompanyData(md.ticker, name, cik, fin, bs, md),
+                                 macro=MacroAssumptions(), current_price=md.price)
+        self.assertFalse(any(r.method == "52-week range" for r in build_football_field(report)))
+
+    def test_last_fiscal_year_end_is_attached_as_a_date(self) -> None:
+        # Yahoo's info.lastFiscalYearEnd is epoch seconds (FDX: 1780185600).
+        info = {"currency": "USD", "currentPrice": 250.0, "sharesOutstanding": 10.0}
+        for value, expected in ((1780185600, datetime.date(2026, 5, 31)),
+                                (1780185600.0, datetime.date(2026, 5, 31)),
+                                (0, None), (-1, None), ("2026-05-31", None), (True, None),
+                                (1e20, None), (None, None)):
+            with self.subTest(value=value):
+                md = client({"FDX": ticker(dict(info, lastFiscalYearEnd=value))}
+                            ).get_market_data("FDX")
+                self.assertEqual(getattr(md, "_last_fiscal_year_end", None), expected)
 
     def test_info_outage_uses_fast_info_and_never_fabricates_a_cap(self) -> None:
         tk = ticker(info_error=RuntimeError("HTTP 401"),
@@ -514,6 +583,48 @@ class DividendPerShareTests(unittest.TestCase):
         self.assertAlmostEqual(md.dividend_per_share, sum(0.1 * 1.1 ** i for i in range(16, 20)))
         self.assertFalse(any("special" in n for n in md._source_notes), md._source_notes)
 
+    def test_step_raise_is_a_new_regular_level_once_confirmed(self) -> None:
+        # NVDA: 0.01 a quarter, then 0.25 on 2026-06-04 and 2026-09-10. Both
+        # new payments were read as one-off specials (D0 0.04 on the no-rate
+        # path, with a note calling the raise a special).
+        start = datetime.date(2021, 12, 8)
+        divs = {(start + datetime.timedelta(days=91 * i)).isoformat(): 0.01 for i in range(18)}
+        divs.update({"2026-06-04": 0.25, "2026-09-10": 0.25})
+        info = {"currency": "USD", "currentPrice": 180.0, "sharesOutstanding": 1.0}
+        md = self._md("NVDA", info, dividends(divs))
+        self.assertAlmostEqual(md.dividend_per_share, 0.01 + 0.01 + 0.25 + 0.25)
+        self.assertEqual(md._source_notes, [
+            "Yahoo's indicated dividend rate unavailable; DDM D0 = trailing-12-month regular "
+            "cash dividends from the payment history (0.52 USD)"])
+        # Yahoo's indicated rate still leads when it is there.
+        md = self._md("NVDA", dict(info, dividendRate=1.0), dividends(divs))
+        self.assertEqual((md.dividend_per_share, md._source_notes), (1.0, []))
+        # The first payment at the new level alone is still read as a special.
+        first = {d: a for d, a in divs.items() if d < "2026-09-01"}
+        with mock.patch.object(market_mod, "_today", return_value=datetime.date(2026, 7, 1)):
+            md = self._md("NVDA", info, dividends(first))
+        self.assertAlmostEqual(md.dividend_per_share, 0.04)
+        self.assertTrue(any("one-off special payment (0.24 on 2026-06-04" in n
+                            for n in md._source_notes), md._source_notes)
+
+    def test_adjacent_specials_followed_by_the_old_level_stay_special(self) -> None:
+        # HSBC ADR (live history): 0.50 interims and a large final each
+        # spring; 2024-05-09's 1.55 is the 0.50 interim plus a 1.05 special,
+        # next to the 1.55 final of 2024-03-07, and 0.50 a quarter follows.
+        # A step-raise reading of the pair made both regular (no-rate D0
+        # 3.017 instead of 2.00 + 1.717).
+        divs = dividends({
+            "2022-03-10": 0.9, "2022-08-18": 0.45, "2023-03-02": 1.15, "2023-05-11": 0.5,
+            "2023-08-10": 0.5, "2023-11-09": 0.5, "2024-03-07": 1.55, "2024-05-09": 1.55,
+            "2024-08-16": 0.5, "2024-11-08": 0.5, "2025-03-07": 1.8, "2025-05-09": 0.5,
+            "2025-08-15": 0.5, "2025-11-07": 0.5, "2026-03-13": 2.25, "2026-05-15": 0.5,
+            "2026-08-14": 0.5})
+        md = self._md("HSBC", {"currency": "USD", "currentPrice": 60.0,
+                               "sharesOutstanding": 1.0}, divs)
+        self.assertAlmostEqual(md.dividend_per_share, 2.0 + (1.05 + 1.05 + 1.3 + 1.75) / 3)
+        self.assertIn("(1.05 on 2024-03-07, 1.05 on 2024-05-09, 1.3 on 2025-03-07, 1.75 on "
+                      "2026-03-13 above the regular dividend", md._source_notes[0])
+
     def test_regular_payer_keeps_the_indicated_rate_silently(self) -> None:
         # KO: indicated 2.12 after a raise; TTM 2.10.
         info = {"currency": "USD", "currentPrice": 87.07, "sharesOutstanding": 1.0,
@@ -634,6 +745,22 @@ class StatementFallbackTests(unittest.TestCase):
         self.assertEqual(fin.dep_amort, [0.0] * 4)
         self.assertIn("yfinance fallback: D&A unavailable; filled with 0.0", fin._source_notes)
 
+    def test_missing_working_capital_years_are_noted(self) -> None:
+        cf = cashflow()
+        cf.loc["Change In Working Capital", COLS[1]] = NaN  # FY2023
+        fin, _bs = self._fallback(cf=cf)
+        self.assertEqual(fin.change_in_nwc, [5.0, 6.0, 0.0, 10.0])
+        self.assertIn("yfinance fallback: change in working capital missing for FY2023; filled "
+                      "with 0.0", fin._source_notes)
+        fin, _bs = self._fallback(cf=cashflow().drop(index="Change In Working Capital"))
+        self.assertEqual(fin.change_in_nwc, [0.0] * 4)
+        note = "yfinance fallback: change in working capital unavailable; filled with 0.0"
+        self.assertIn(note, fin._source_notes)
+        # The FCFE's own no-dNWC-history note steps aside for a note at the source.
+        self.assertRegex(note, ddm_fcfe._NWC_SOURCE_NOTE)
+        fin, _bs = self._fallback()
+        self.assertFalse(any("working capital" in n for n in fin._source_notes))
+
     def test_tax_benefit_keeps_its_sign(self) -> None:
         fin, _bs = self._fallback()
         self.assertEqual(fin.tax_expense, [30.0, -34.0, 38.0, 42.0])
@@ -649,16 +776,40 @@ class StatementFallbackTests(unittest.TestCase):
         self.assertEqual(bs.total_equity, 800.0)
 
     def test_foreign_statements_are_converted_to_the_quote_currency(self) -> None:
+        # Every field matches the same statements read in USD: each monetary
+        # series and balance-sheet amount converted (32 is a power of two, so
+        # equality is exact), fiscal years and share counts untouched.
+        pref = {"Preferred Stock": [25, 25, 25, 25, NaN]}
+        usd_fin, usd_bs = self._fallback(bs=balance(**pref))
         info = {"currency": "USD", "financialCurrency": "TWD"}
-        fin, bs = self._fallback(info=info, fin=income(32), cf=cashflow(32), bs=balance(32),
-                                 extra={"TWDUSD=X": fx_ticker(1 / 32)})
+        fin, bs = self._fallback(info=info, fin=income(32), cf=cashflow(32),
+                                 bs=balance(32, **pref), extra={"TWDUSD=X": fx_ticker(1 / 32)})
+        self.assertEqual(dataclasses.asdict(fin), dataclasses.asdict(usd_fin))
+        self.assertEqual(dataclasses.asdict(bs), dataclasses.asdict(usd_bs))
+        # The fixture fills every field, so each one is checked, except the
+        # operating-lease liability: Yahoo's total debt already includes leases,
+        # so the fallback leaves it None (scale_fundamentals keeps None).
+        self.assertIsNone(usd_bs.operating_lease_liability)
+        for obj in (usd_fin, usd_bs):
+            for field in dataclasses.fields(obj):
+                if field.name == "operating_lease_liability":
+                    continue
+                value = getattr(obj, field.name)
+                with self.subTest(field=field.name):
+                    self.assertTrue(all(value) if isinstance(value, list) else value)
         self.assertEqual(fin.revenue, [700.0, 800.0, 900.0, 1000.0])
-        self.assertEqual(fin.dividends_paid, [34.0, 36.0, 38.0, 40.0])
-        self.assertEqual(fin.diluted_shares, [10.0] * 4)  # share counts untouched
-        self.assertEqual((bs.total_debt, bs.cash_and_investments, bs.total_equity,
-                          bs.minority_interest), (300.0, 150.0, 800.0, 50.0))
+        self.assertEqual(fin.diluted_shares, [10.0] * 4)
+        self.assertEqual(bs.preferred_equity, 25.0)
         self.assertTrue(fin._source_notes[0].startswith(
             "Fundamentals converted from TWD to USD at spot 0.03125"))
+
+    def test_every_monetary_field_is_in_the_fx_conversion_lists(self) -> None:
+        # A money field added to the schema must be added to the lists too.
+        self.assertEqual(set(market_mod._MONEY_SERIES),
+                         {f.name for f in dataclasses.fields(AnnualFinancials)}
+                         - {"fiscal_years", "diluted_shares"})
+        self.assertEqual(set(market_mod._MONEY_BALANCE),
+                         {f.name for f in dataclasses.fields(BalanceSheetSnapshot)} - {"as_of"})
 
     def test_missing_fx_rate_stops_unit_mixed_valuation(self) -> None:
         info = {"currency": "USD", "financialCurrency": "TWD"}
@@ -814,6 +965,321 @@ class HybridProviderMarketTests(unittest.TestCase):
         self.assertEqual(cd.market.market_cap, 0.0)
         self.assertTrue(cd.source_notes[1].startswith("WARNING: market cap unavailable"),
                         cd.source_notes)
+
+    # --- a D0 of 0 from Yahoo's payment history --------------------------- #
+    def test_d0_of_zero_from_an_incomplete_history_comes_from_the_statements(self) -> None:
+        # TM ADR: Yahoo's history stops at 2024-03-27 (2.00 shown for FY2024)
+        # while the statements show FY2024 dividends of 40 / 10 shares = 4.00.
+        # A failed history fetch already reached the statements; a stale one
+        # gave D0 = 0 and skipped the DDM.
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 200.0,
+                "sharesOutstanding": 10.0, "marketCap": 2000.0}
+        divs = dividends({"2022-03-30": 2.0, "2022-09-29": 2.0, "2023-03-30": 2.0,
+                          "2023-09-28": 2.0, "2024-03-27": 2.0})
+        c = client({"TM": ticker(info, fin=income(), cf=cashflow(), bs=balance(), divs=divs)})
+        with mock.patch.object(market_mod, "_today", return_value=datetime.date(2025, 6, 30)):
+            cd = HybridProvider(edgar=self._edgar_fails(), market=c).get_company_data("TM")
+        self.assertAlmostEqual(cd.market.dividend_per_share, 4.0)
+        self.assertIn("Yahoo's dividend payment history gives D0 = 0 (last ex-date 2024-03-27), "
+                      "but FY2024 dividends paid / shares (4.0000) is more than 1.5x the 2 that "
+                      "history shows for that year, so it looks incomplete (Yahoo's ADR "
+                      "histories can stop early); DDM D0 = 4.0000 from the statements",
+                      cd.source_notes)
+
+    def test_suspended_dividend_keeps_d0_of_zero(self) -> None:
+        # INTC in October 2025: its last quarterly went ex 2024-08-07 and the
+        # FY2024 dividends paid (0.20 a share) are what the history shows.
+        edgar = mock.Mock()
+        edgar.get_annual_financials.return_value = edgar_fundamentals(
+            [2021, 2022, 2023, 2024], "2025-06-28")
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 37.0,
+                "sharesOutstanding": 10.0, "marketCap": 370.0}
+        divs = dividends({"2023-11-06": 0.05, "2024-02-06": 0.05, "2024-05-06": 0.05,
+                          "2024-08-07": 0.05})
+        tk = ticker(info, divs=divs)
+        with mock.patch.object(market_mod, "_today", return_value=datetime.date(2025, 10, 15)):
+            cd = HybridProvider(edgar=edgar, market=client({"INTC": tk})).get_company_data("INTC")
+        self.assertEqual(cd.market.dividend_per_share, 0.0)
+        self.assertFalse(any("from the statements" in n for n in cd.source_notes))
+
+    def test_suspended_dividend_after_a_june_year_end_keeps_d0_of_zero(self) -> None:
+        # An EDGAR filer with a June year end: 0.05 a quarter until the
+        # 2025-08-15 ex-date, then suspended (Yahoo then has no dividendRate).
+        # FY2026 (July 2025 - June 2026) paid 0.05 a share. Taking FY2026 to
+        # end on 31 December left the year's own ex-dates out of the window
+        # and replaced D0 with 0.05 ("history ... looks incomplete").
+        fin, bs, cik, name = edgar_fundamentals([2023, 2024, 2025, 2026], "2026-06-30")
+        fin.dividends_paid = [2.0, 2.0, 2.0, 0.5]
+        edgar = mock.Mock()
+        edgar.get_annual_financials.return_value = (fin, bs, cik, name)
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 37.0,
+                "sharesOutstanding": 10.0, "marketCap": 370.0}
+        divs = dividends({"2024-08-15": 0.05, "2024-11-15": 0.05, "2025-02-14": 0.05,
+                          "2025-05-15": 0.05, "2025-08-15": 0.05})
+        for label, extra in (("Yahoo's year-end date", {"lastFiscalYearEnd": 1782777600}),
+                             ("no year-end date", {})):
+            with self.subTest(label), mock.patch.object(
+                    market_mod, "_today", return_value=datetime.date(2026, 10, 27)):
+                tk = ticker(dict(info, **extra), divs=divs)
+                cd = HybridProvider(edgar=edgar, market=client({"X": tk})).get_company_data("X")
+                self.assertEqual(cd.market.dividend_per_share, 0.0)
+                self.assertFalse(any("from the statements" in n for n in cd.source_notes),
+                                 cd.source_notes)
+
+    def test_incomplete_history_is_found_without_a_year_end_date(self) -> None:
+        # The same check when only the label year is known: the window then
+        # covers that year and the one before. The history stops at
+        # 2023-06-15 while FY2025 paid 4.00 a share.
+        fin, bs, cik, name = edgar_fundamentals([2022, 2023, 2024, 2025], "2025-12-31")
+        fin.dividends_paid = [40.0] * 4
+        edgar = mock.Mock()
+        edgar.get_annual_financials.return_value = (fin, bs, cik, name)
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 200.0,
+                "sharesOutstanding": 10.0, "marketCap": 2000.0}
+        divs = dividends({"2022-06-15": 2.0, "2022-12-15": 2.0, "2023-06-15": 2.0})
+        with mock.patch.object(market_mod, "_today", return_value=TODAY):
+            cd = HybridProvider(edgar=edgar, market=client({"X": ticker(info, divs=divs)})
+                                ).get_company_data("X")
+        self.assertAlmostEqual(cd.market.dividend_per_share, 4.0)
+        self.assertIn("Yahoo's dividend payment history gives D0 = 0 (last ex-date 2023-06-15), "
+                      "but FY2025 dividends paid / shares (4.0000) is more than 1.5x the 0 that "
+                      "history shows for that year and the one before (its end date is not "
+                      "known), so it looks incomplete (Yahoo's ADR histories can stop early); "
+                      "DDM D0 = 4.0000 from the statements", cd.source_notes)
+
+    # --- share-count backfill caveats ---------------------------------------- #
+    def test_share_count_backfill_warns_only_for_edgar_counts_of_a_20f_filer(self) -> None:
+        # Yahoo's ADR statements count ADSs (the quoted basis); EDGAR counts a
+        # 20-F filer's ordinary shares (EDU: 1.60B against 155M ADSs).
+        md = market_mod.MarketData(ticker="EDU", name="X", currency="USD", price=60.0,
+                                   shares_outstanding=0.0, market_cap=0.0)
+        fin = edgar_fundamentals([2024, 2025], "2025-12-31")[0]
+        plain = ("shares outstanding unavailable from Yahoo; using FY2025 diluted "
+                 "weighted-average shares from {} (10)")
+        for from_fallback, form, expected in (
+            (True, None, plain.format("yfinance")),
+            (False, "10-K", plain.format("EDGAR")),
+            (False, "20-F", "WARNING: " + plain.format("EDGAR") + "; EDGAR counts a 20-F "
+             "filer's ordinary shares, so for an ADR the market cap, dividend per share and "
+             "per-share values are off by the ADS ratio"),
+        ):
+            with self.subTest(form=form, from_fallback=from_fallback):
+                fin._annual_form = form
+                notes: list[str] = []
+                HybridProvider._backfill_market(md, fin, from_fallback, notes)
+                self.assertEqual(notes[0], expected)
+        # The form and year-end markers survive the FX copy of EDGAR's statements.
+        bs = edgar_fundamentals([2024, 2025], "2025-12-31")[1]
+        fin._latest_fy_end = "2025-12-31"
+        scaled = market_mod.scale_fundamentals(fin, bs, 2.0)[0]
+        self.assertEqual((scaled._annual_form, scaled._latest_fy_end), ("20-F", "2025-12-31"))
+
+    # --- class-share tickers typed with a dot -------------------------------- #
+    @staticmethod
+    def _sec_lists(*symbols):
+        def resolve(sym):
+            if sym in symbols:
+                return "0001067983", "Fixture Class Shares Co"
+            raise DataError(f"ticker {sym!r} not found in SEC EDGAR directory")
+        edgar = mock.Mock()
+        edgar.resolve_cik.side_effect = resolve
+        edgar.get_annual_financials.return_value = edgar_fundamentals(
+            [2022, 2023, 2024, 2025], "2026-06-30")
+        return edgar
+
+    def test_dotted_class_share_ticker_is_valued_under_the_dashed_form(self) -> None:
+        info = {"currency": "USD", "currentPrice": 480.0, "sharesOutstanding": 10.0}
+        c = client({"BRK.B": ticker({}), "BRK-B": ticker(info)})
+        edgar = self._sec_lists("BRK-B")
+        cd = HybridProvider(edgar=edgar, market=c).get_company_data("brk.b")
+        self.assertEqual((cd.ticker, cd.market.ticker, cd.market.price), ("BRK-B", "BRK-B", 480.0))
+        edgar.get_annual_financials.assert_called_once_with("BRK-B")
+        self.assertEqual(cd.source_notes[0], (
+            "Yahoo has no quote for BRK.B; valued as BRK-B, the SEC directory's form of this "
+            "class-share ticker (Yahoo writes class shares with a dash)"))
+
+    def test_other_dotted_tickers_keep_yahoos_error(self) -> None:
+        edgar = self._sec_lists("BRK-B")
+        provider = HybridProvider(edgar=edgar, market=client({"VOD.L": ticker({}),
+                                                              "7203.T": ticker({})}))
+        with self.assertRaisesRegex(DataError, "No obtainable price for 'VOD.L'"):
+            provider.get_company_data("VOD.L")  # VOD-L is not in the SEC directory
+        with self.assertRaisesRegex(DataError, "No obtainable price for '7203.T'"):
+            provider.get_company_data("7203.T")
+        self.assertEqual([c.args for c in edgar.resolve_cik.call_args_list], [("VOD-L",)])
+
+    def test_dotted_class_share_peer_is_retried_in_the_dashed_form(self) -> None:
+        info = {"currency": "USD", "financialCurrency": "USD", "marketCap": 1000.0,
+                "trailingPE": 20.0}
+        c = client({"BF.B": ticker({}), "BF-B": ticker(info), "KO": ticker(info)})
+        provider = HybridProvider(edgar=self._sec_lists("BF-B", "KO"), market=c)
+        rows = provider.get_peer_comp_rows(["BF.B", "KO", "XX.L"])
+        self.assertEqual([r.ticker for r in rows], ["KO", "BF-B"])
+
+    def test_peer_lookups_stop_when_the_sec_directory_is_unreachable(self) -> None:
+        # Each lookup would retry the directory download (three tries of up
+        # to 20 seconds) for every failed dotted peer during an SEC outage.
+        info = {"currency": "USD", "financialCurrency": "USD", "marketCap": 1000.0,
+                "trailingPE": 20.0}
+        c = client({"AA.L": ticker({}), "BB.L": ticker({}), "CC.L": ticker({}),
+                    "KO": ticker(info)})
+        edgar = mock.Mock()
+        edgar.resolve_cik.side_effect = DataError(
+            "failed to GET https://www.sec.gov/files/company_tickers.json: network error")
+        rows = HybridProvider(edgar=edgar, market=c).get_peer_comp_rows(
+            ["AA.L", "KO", "BB.L", "CC.L"])
+        self.assertEqual([r.ticker for r in rows], ["KO"])
+        self.assertEqual([a.args for a in edgar.resolve_cik.call_args_list], [("AA-L",)])
+        # A ticker the directory does not list does not stop the others.
+        edgar = self._sec_lists("BF-B")
+        c = client({"AA.L": ticker({}), "BF.B": ticker({}), "BF-B": ticker(info)})
+        rows = HybridProvider(edgar=edgar, market=c).get_peer_comp_rows(["AA.L", "BF.B"])
+        self.assertEqual([r.ticker for r in rows], ["BF-B"])
+
+
+class CorporateActionTests(unittest.TestCase):
+    """Yahoo split records after the latest fiscal year (live shapes, October 2026)."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(provider_mod, "_today", return_value=TODAY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _company(shares: float, records: dict, fy_shares: float = 10.0,
+                 years=(2022, 2023, 2024, 2025), as_of="2026-06-30", fy_end=None,
+                 **info_extra):
+        # FY2025 statements with 10 diluted shares a year by default;
+        # `fy_end` is the EDGAR client's `_latest_fy_end` marker.
+        fin, bs, cik, name = edgar_fundamentals(list(years), as_of)
+        fin.diluted_shares = [fy_shares] * len(years)
+        if fy_end is not None:
+            fin._latest_fy_end = fy_end
+        edgar = mock.Mock()
+        edgar.get_annual_financials.return_value = (fin, bs, cik, name)
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 200.0,
+                "sharesOutstanding": shares, "marketCap": 200.0 * shares, **info_extra}
+        tk = ticker(info, splits=splits(records))
+        return HybridProvider(edgar=edgar, market=client({"X": tk})).get_company_data("X")
+
+    @staticmethod
+    def _warned(cd) -> list[str]:
+        return [n for n in cd.source_notes if "corporate action" in n]
+
+    def test_spin_off_after_the_fiscal_year_warns(self) -> None:
+        # HON: Solstice (1.061, within FY2025), then the Aerospace spin-off
+        # with a 1-for-2 consolidation (0.9535) after it; 5 shares against 10.
+        cd = self._company(5.0, {"2025-10-30": 1.061, "2026-06-29": 0.9535})
+        self.assertEqual(cd.source_notes[0], "Fundamentals: SEC EDGAR (CIK 0001094517)")
+        self.assertEqual(cd.source_notes[1], (
+            "WARNING: Yahoo records a corporate action after FY2025 that is not a plain split: "
+            "2026-06-29 (factor 0.9535); likely a spin-off or other distribution of value, so "
+            "the FY2025 statements may still include a business the company no longer owns "
+            "and the per-share values and verdict are unreliable until the next annual "
+            "report"))
+        # CMCSA: the Versant spin-off (1.067) with the share count unchanged.
+        cd = self._company(9.8, {"2026-01-05": 1.067})
+        self.assertTrue(cd.source_notes[1].startswith(
+            "WARNING: Yahoo records a corporate action after FY2025 that is not a plain split: "
+            "2026-01-05 (factor 1.067)"), cd.source_notes)
+
+    def test_spin_off_warns_when_the_counts_are_restated_for_its_consolidation(self) -> None:
+        # HON live: EDGAR restates the FY2025 diluted count for the 1-for-2
+        # (321.4M, about 643M before) and Yahoo counts 316.94M, a move of
+        # 0.986 that matched the 0.9535 factor within 5% and silenced the
+        # WARNING. A factor below 1 cannot be a stock dividend. (Yahoo's own
+        # statements restate counts for splits too.)
+        cd = self._company(316.94e6, {"2025-10-30": 1.061, "2026-06-29": 0.9535},
+                           fy_shares=321.4e6, lastFiscalYearEnd=1767139200)
+        self.assertEqual(self._warned(cd), [
+            "WARNING: Yahoo records a corporate action after FY2025 that is not a plain split: "
+            "2026-06-29 (factor 0.9535); likely a spin-off or other distribution of value, so "
+            "the FY2025 statements may still include a business the company no longer owns "
+            "and the per-share values and verdict are unreliable until the next annual "
+            "report"])
+
+    def test_spin_off_right_after_a_non_december_year_end_warns(self) -> None:
+        # FDX: FY2026 ended 2026-05-31 and the FedEx Freight spin-off went ex
+        # on 2026-06-01 (factor 1.241). EDGAR labels the year only, so taking
+        # it to end on 31 December put the spin-off inside it; Yahoo's
+        # lastFiscalYearEnd (1780185600 = 2026-05-31) gives the real date.
+        fdx = dict(records={"2026-06-01": 1.241}, years=(2023, 2024, 2025, 2026),
+                   as_of="2026-05-31")
+        cd = self._company(9.7, lastFiscalYearEnd=1780185600, **fdx)
+        self.assertEqual(len(self._warned(cd)), 1, cd.source_notes)
+        self.assertIn("after FY2026 that is not a plain split: 2026-06-01 (factor 1.241)",
+                      self._warned(cd)[0])
+        # Without Yahoo's date the year end is only an upper bound (documented),
+        # unless EDGAR's own period end for FY2026 is known: it is exact.
+        self.assertEqual(self._warned(self._company(9.7, **fdx)), [])
+        cd = self._company(9.7, fy_end="2026-05-31", **fdx)
+        self.assertIn("after FY2026 that is not a plain split: 2026-06-01 (factor 1.241)",
+                      self._warned(cd)[0])
+        # EDGAR's date wins over Yahoo's when they differ; one outside the
+        # label year's range (a malformed marker) is ignored.
+        cd = self._company(9.7, fy_end="2026-05-31", lastFiscalYearEnd=1782864000, **fdx)
+        self.assertEqual(len(self._warned(cd)), 1, cd.source_notes)
+        for bad in ("2027-05-31", "not a date"):
+            self.assertEqual(self._warned(self._company(9.7, fy_end=bad, **fdx)), [])
+        # Yahoo's date a year ahead of the statements (FY2026 ended, its
+        # annual report not filed yet): FY2025 ended 2025-05-31.
+        cd = self._company(9.7, {"2025-09-01": 1.241}, years=(2022, 2023, 2024, 2025),
+                           as_of="2025-05-31", lastFiscalYearEnd=1780185600)
+        self.assertIn("after FY2025 that is not a plain split: 2025-09-01", self._warned(cd)[0])
+
+    def test_plain_splits_stock_dividends_and_earlier_events_are_silent(self) -> None:
+        for label, shares, records, fy_shares in (
+            ("CRWD's 4-for-1 split", 40.0, {"2026-07-02": 4.0}, 10.0),
+            ("a 1-for-2 consolidation", 5.0, {"2026-03-02": 0.5}, 10.0),
+            ("a 1-for-20 reverse split", 0.5, {"2026-03-02": 0.05}, 10.0),
+            ("a 1-for-20 reverse split, counts restated", 0.5, {"2026-03-02": 0.05}, 0.5),
+            ("a 5% stock dividend", 10.4, {"2026-03-02": 1.05}, 10.0),
+            ("a split and a stock dividend", 21.0, {"2026-03-02": 2.0, "2026-05-01": 1.05},
+             10.0),
+            ("a split and a stock dividend, counts restated for the split", 21.0,
+             {"2026-03-02": 2.0, "2026-05-01": 1.05}, 20.0),
+            ("a spin-off within the fiscal year", 10.0, {"2025-10-30": 1.061}, 10.0),
+            ("no split records", 10.0, {}, 10.0),
+        ):
+            with self.subTest(label):
+                cd = self._company(shares, records, fy_shares=fy_shares)
+                self.assertEqual(self._warned(cd), [], cd.source_notes)
+
+    def test_fiscal_year_end_uses_the_reported_date_in_the_label_year(self) -> None:
+        # FY2025 covers year ends from 2025-01-15 to 2026-01-14.
+        fin = edgar_fundamentals([2024, 2025], "2026-03-31")[0]
+        d = datetime.date
+
+        def end(as_of, from_fallback, reported):
+            bs = BalanceSheetSnapshot(as_of=as_of, total_debt=0.0, cash_and_investments=0.0,
+                                      total_equity=1.0)
+            return provider_mod._fiscal_year_end(fin, bs, from_fallback, reported)
+
+        for label, reported, expected in (
+            ("no date: 31 December, an upper bound", None, (d(2025, 12, 31), False)),
+            ("Yahoo's date in the year", d(2025, 6, 30), (d(2025, 6, 30), True)),
+            ("Yahoo a year ahead", d(2026, 6, 30), (d(2025, 6, 30), True)),
+            ("Yahoo a year behind", d(2024, 9, 27), (d(2025, 9, 27), True)),
+            ("a 52/53-week year ending in early January", d(2026, 1, 3), (d(2026, 1, 3), True)),
+            ("a date years away", d(2021, 6, 30), (d(2025, 12, 31), False)),
+            ("29 February, a year off", d(2024, 2, 29), (d(2025, 12, 31), False)),
+        ):
+            with self.subTest(label):
+                self.assertEqual(end("2026-03-31", False, reported), expected)
+        # The fallback's balance sheet is its year-end column: it comes first
+        # when it falls in the label year, and gives way to Yahoo's date
+        # otherwise.
+        self.assertEqual(end("2026-01-10", True, d(2025, 6, 30)), (d(2026, 1, 10), True))
+        self.assertEqual(end("2026-03-31", True, d(2025, 3, 31)), (d(2025, 3, 31), True))
+        self.assertEqual(end("2026-03-31", True, None), (d(2025, 12, 31), False))
+
+    def test_unreadable_split_records_are_silent(self) -> None:
+        edgar = mock.Mock()
+        edgar.get_annual_financials.return_value = edgar_fundamentals([2024, 2025], "2026-06-30")
+        tk = ticker({"currency": "USD", "currentPrice": 200.0, "sharesOutstanding": 5.0})
+        tk.get_splits = mock.Mock(side_effect=RuntimeError("HTTP 429"))
+        cd = HybridProvider(edgar=edgar, market=client({"X": tk})).get_company_data("X")
+        self.assertFalse(any("corporate action" in n for n in cd.source_notes))
 
 
 def edgar_fundamentals(years: list[int], as_of: str) -> tuple:
@@ -1070,6 +1536,38 @@ class CompRowTests(unittest.TestCase):
         self.assertAlmostEqual(row.pb, 1078.4 / 700.0)
         self.assertIn("(Yahoo's -234 is more than 25% away", row._source_notes[0])
 
+    def test_up_c_market_cap_already_prices_the_minority_units(self) -> None:
+        # IBKR shape: marketCap prices all 40 economic units at 10.00 while 10
+        # Class A shares are listed; the other 30 units are the balance sheet's
+        # minority interest. Yahoo's EV (-40) prices only Class A and adds that
+        # minority interest at book. Rebuilding it the usual way counted the
+        # minority interest twice and gave P/B 400 / 20 = 20 (IBKR 24.6).
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 10.0,
+                "sharesOutstanding": 10.0, "marketCap": 400.0, "enterpriseValue": -40.0,
+                "totalDebt": 50.0, "totalCash": 250.0, "totalRevenue": 100.0,
+                "ebitda": 40.0, "enterpriseToEbitda": -1.0, "enterpriseToRevenue": -0.4,
+                "priceToBook": 5.0, "trailingPE": 20.0}
+        qbs = yahoo_quarters(**{"Minority Interest": [60.0, 58.0, 55.0],
+                                "Common Stock Equity": [20.0, 19.0, 18.0]})
+        row = client({"IBKR": ticker(info, qbs=qbs)}).get_comp_row("IBKR")
+        self.assertAlmostEqual(row.enterprise_value, 400.0 + 50.0 - 250.0)  # no minority added
+        self.assertAlmostEqual(row.ev_sales, 2.0)
+        self.assertAlmostEqual(row.ev_ebitda, 5.0)
+        self.assertAlmostEqual(row.pb, 400.0 / (20.0 + 60.0))  # Yahoo's per-share 5.0 too
+        self.assertTrue(row._source_notes[0].startswith(
+            "IBKR: EV rebuilt as market cap + (total debt - total cash) = 200 USD"),
+            row._source_notes)
+        self.assertIn("Yahoo's market cap prices 40 units against 10 listed shares (an Up-C "
+                      "structure", row._source_notes[0])
+        self.assertIn("P/B 5 -> 5 (market cap / (common equity + minority interest) at "
+                      "2026-06-30)", row._source_notes[0])
+        # A small minority interest beside a multi-class count is not Up-C (BRK-B).
+        qbs = yahoo_quarters(**{"Minority Interest": [4.0, 4.0, 4.0],
+                                "Common Stock Equity": [20.0, 19.0, 18.0]})
+        row = client({"IBKR": ticker(info, qbs=qbs)}).get_comp_row("IBKR")
+        self.assertAlmostEqual(row.enterprise_value, 204.0)
+        self.assertAlmostEqual(row.pb, 20.0)
+
     def test_rows_without_debt_or_cash_figures_are_left_alone(self) -> None:
         info = {"currency": "USD", "financialCurrency": "USD", "marketCap": 1000.0,
                 "enterpriseValue": 5000.0, "enterpriseToEbitda": 10.0, "priceToBook": 3.0}
@@ -1290,6 +1788,16 @@ class CaptiveFinanceFallbackTests(unittest.TestCase):
         self.assertAlmostEqual(scaled.revenue[0], 130.0)
         self.assertFalse(hasattr(scaled, "_source_notes"))
 
+    def test_fx_copy_scales_an_operating_lease_and_keeps_none(self) -> None:
+        fin, bs, _cik, _name = edgar_fundamentals([2024], "2024-12-31")
+        self.assertIsNone(market_mod.scale_fundamentals(fin, bs, 1.3)[1]
+                          .operating_lease_liability)
+        leased = dataclasses.replace(bs, operating_lease_liability=20.0)
+        scaled = market_mod.scale_fundamentals(fin, leased, 1.3)[1]
+        self.assertAlmostEqual(scaled.operating_lease_liability, 26.0)
+        self.assertAlmostEqual(scaled.total_debt, 65.0)
+        self.assertEqual(leased.operating_lease_liability, 20.0)  # a copy
+
 
 # The EDGAR client's warning (edgar.py) when interest implies debt its tags miss.
 EDGAR_DEBT_WARNING = (
@@ -1340,11 +1848,12 @@ class EdgarDebtBackfillTests(unittest.TestCase):
     ]
 
     def _company(self, as_of="2026-03-31", debt=0.0, cash=30.5, notes=None, kind=None,
-                 info=None, qbs=None, extra=None, fin=None):
+                 info=None, qbs=None, extra=None, fin=None, lease=None):
         edgar_fin, bs, cik, name = edgar_fundamentals([2022, 2023, 2024, 2025], as_of)
         edgar_fin._source_notes = list(notes if notes is not None else [EDGAR_DEBT_WARNING])
         edgar_fin._financial_kind = kind
         bs.total_debt, bs.cash_and_investments = debt, cash
+        bs.operating_lease_liability = lease
         edgar = mock.Mock()
         edgar.get_annual_financials.return_value = (edgar_fin, bs, cik, name)
         tk = ticker(info or self.INFO, qbs=qbs if qbs is not None else yahoo_quarters(**self.FORD),
@@ -1492,6 +2001,30 @@ class EdgarDebtBackfillTests(unittest.TestCase):
         self.assertAlmostEqual(cd.balance_sheet.total_debt, 106.1 + 52.4)
         self.assertIn("(long-term plus current debt, current lease obligations included)",
                       cd.source_notes[2])
+
+    def test_edgar_lease_stays_only_while_the_backfilled_debt_leaves_leases_out(self) -> None:
+        # Leases excluded (Ford's plain lines; Total Debt less leases): EDGAR's
+        # operating-lease liabilities stay a separate claim for the comps.
+        cd, _ = self._company(lease=8.0)
+        self.assertEqual(cd.balance_sheet.operating_lease_liability, 8.0)
+        rows = {k: v for k, v in self.FORD.items() if k not in ("Long Term Debt", "Current Debt")}
+        cd, _ = self._company(qbs=yahoo_quarters(**rows), lease=8.0)
+        self.assertEqual(cd.balance_sheet.operating_lease_liability, 8.0)
+        # Included, or possibly included (Total Debt alone): cleared, so the
+        # leases are not counted twice.
+        del rows["Capital Lease Obligations"]
+        cd, _ = self._company(qbs=yahoo_quarters(**rows), lease=8.0)
+        self.assertIn("(total debt, which may include lease obligations)", cd.source_notes[2])
+        self.assertIsNone(cd.balance_sheet.operating_lease_liability)
+        rows = {k: v for k, v in self.FORD.items() if k != "Current Debt"}
+        rows["Current Debt And Capital Lease Obligation"] = [53.0, 52.4, 58.9]
+        cd, _ = self._company(qbs=yahoo_quarters(**rows), lease=8.0)
+        self.assertIn("current lease obligations included", cd.source_notes[2])
+        self.assertIsNone(cd.balance_sheet.operating_lease_liability)
+        # No backfill (EDGAR's own debt): the lease stays.
+        cd, _ = self._company(debt=40.0, notes=[], lease=8.0)
+        self.assertEqual(cd.balance_sheet.total_debt, 40.0)
+        self.assertEqual(cd.balance_sheet.operating_lease_liability, 8.0)
 
     def test_yahoo_tables_in_usd_under_a_local_financial_currency(self) -> None:
         # Table Total Debt 163.3 against totalDebt 816.5 and revenue 1,000
@@ -1721,6 +2254,226 @@ class EdgarCapexBackfillTests(unittest.TestCase):
         self.assertIsNone(client({"X": failed}).get_capex_by_year("X"))
 
 
+class EdgarDABackfillTests(unittest.TestCase):
+    """D&A years no EDGAR tag covers come from Yahoo's statements (PCG, CVNA)."""
+
+    INFO = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 18.0,
+            "sharesOutstanding": 10.0, "marketCap": 180.0}
+    YEARS = [2021, 2022, 2023, 2024, 2025]
+    # PG&E-like Yahoo 'Reconciled Depreciation' (income statement), FY2025 back
+    # to FY2022; PG&E tags its D&A only with company-specific elements.
+    DA = {"Reconciled Depreciation": [-4410.0, -4127.0, -3951.0, -3856.0]}
+    ALL_GAP = "D&A unavailable on EDGAR; filled with 0.0"
+    FILLED = ("; backfilled from Yahoo's annual income or cash-flow statement (D&A for the "
+              "same fiscal year): ")
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(provider_mod, "_today", return_value=TODAY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _company(self, da, notes, inc=None, cf=None, info=None, extra=None, years=None,
+                 kind=None, capex=None, ebit=None):
+        fin, bs, cik, name = edgar_fundamentals(list(years or self.YEARS), "2026-06-30")
+        if ebit is not None:
+            fin.ebit = list(ebit)
+        fin.dep_amort = list(da)
+        fin.ebitda = [e + d for e, d in zip(fin.ebit, da)]
+        if capex is not None:
+            fin.capex = list(capex)
+        fin._source_notes = list(notes)
+        fin._financial_kind = kind
+        fin._annual_form = "10-K"  # any marker: it must survive the copy
+        edgar = mock.Mock()
+        edgar.get_annual_financials.return_value = (fin, bs, cik, name)
+        tickers = {"PCG": ticker(info or self.INFO,
+                                 fin=inc if inc is not None else yahoo_cashflow(**self.DA),
+                                 cf=cf)}
+        tickers.update(extra or {})
+        cd = HybridProvider(edgar=edgar, market=client(tickers)).get_company_data("PCG")
+        return cd, fin
+
+    def test_pcg_like_da_without_any_tag_is_backfilled_and_ebitda_recomputed(self) -> None:
+        cd, fin = self._company([0.0] * 5, [self.ALL_GAP])
+        self.assertEqual(cd.financials.dep_amort, [0.0, 3856.0, 3951.0, 4127.0, 4410.0])
+        self.assertEqual(cd.financials.ebitda, [10.0, 3866.0, 3961.0, 4137.0, 4420.0])
+        self.assertEqual(cd.financials.ebit, fin.ebit)
+        self.assertEqual(cd.financials.capex, fin.capex)
+        # EDGAR's object is not mutated; the client's markers survive the copy.
+        self.assertEqual((fin.dep_amort, fin.ebitda), ([0.0] * 5, [10.0] * 5))
+        self.assertEqual(cd.financials._annual_form, "10-K")
+        self.assertIn(self.ALL_GAP + self.FILLED + (
+            "FY2022 3,856 (year to 2022-12-31), FY2023 3,951 (year to 2023-12-31), FY2024 "
+            "4,127 (year to 2024-12-31), FY2025 4,410 (year to 2025-12-31); EBITDA recomputed "
+            "as EBIT + D&A for those years; FY2021 not in Yahoo's statements, left at 0.0"),
+            cd.source_notes)
+        self.assertFalse(any(n == self.ALL_GAP for n in cd.source_notes))
+
+    def test_only_the_years_edgar_zero_filled_are_backfilled(self) -> None:
+        # Carvana-like: a tag gap in the latest years; reported years keep
+        # EDGAR's figure (here within 1% of Yahoo's, so the two define D&A alike).
+        gap = "D&A not reported on EDGAR for FY2024-2025; filled with 0.0"
+        cd, _ = self._company([3700.0, 3850.0, 3950.0, 0.0, 0.0], [gap])
+        self.assertEqual(cd.financials.dep_amort, [3700.0, 3850.0, 3950.0, 4127.0, 4410.0])
+        self.assertEqual(cd.financials.ebitda, [3710.0, 3860.0, 3960.0, 4137.0, 4420.0])
+        self.assertIn(gap + self.FILLED + "FY2024 4,127 (year to 2024-12-31), FY2025 4,410 "
+                      "(year to 2025-12-31); EBITDA recomputed as EBIT + D&A for those years",
+                      cd.source_notes)
+
+    def test_ebitda_is_not_recomputed_where_edgar_zero_filled_ebit_too(self) -> None:
+        # Carvana-like: EDGAR has no operating income for FY2021-2022 either.
+        # FY2022's D&A is filled, but its EBITDA stays 0.0: D&A alone would
+        # pass for a small EBITDA.
+        ebit_gap = "EBIT (operating income) not reported on EDGAR for FY2021-2022; filled with 0.0"
+        cd, fin = self._company([0.0] * 5, [ebit_gap, self.ALL_GAP],
+                                ebit=[0.0, 0.0, 10.0, 10.0, 10.0])
+        self.assertEqual(cd.financials.dep_amort, [0.0, 3856.0, 3951.0, 4127.0, 4410.0])
+        self.assertEqual(cd.financials.ebitda, [0.0, 0.0, 3961.0, 4137.0, 4420.0])
+        self.assertEqual(cd.financials.ebit, fin.ebit)
+        self.assertIn(self.ALL_GAP + self.FILLED + (
+            "FY2022 3,856 (year to 2022-12-31), FY2023 3,951 (year to 2023-12-31), FY2024 "
+            "4,127 (year to 2024-12-31), FY2025 4,410 (year to 2025-12-31); EBITDA recomputed "
+            "as EBIT + D&A for FY2023-2025; EBITDA for FY2022 left at 0.0, since EBIT is not "
+            "reported on EDGAR there either (D&A alone is no EBITDA); FY2021 not in Yahoo's "
+            "statements, left at 0.0"), cd.source_notes)
+        self.assertIn(ebit_gap, cd.source_notes)
+
+    def test_ebitda_stays_where_edgar_has_no_ebit_at_all_or_left_a_lenders_at_0(self) -> None:
+        # No operating income in any year: no EBITDA year is recomputed.
+        ebit_gap = "EBIT (operating income) unavailable on EDGAR; filled with 0.0"
+        cd, _ = self._company([0.0] * 5, [ebit_gap, self.ALL_GAP], ebit=[0.0] * 5)
+        self.assertEqual(cd.financials.dep_amort, [0.0, 3856.0, 3951.0, 4127.0, 4410.0])
+        self.assertEqual(cd.financials.ebitda, [0.0] * 5)
+        self.assertTrue(any(n.endswith(
+            "(year to 2025-12-31); EBITDA for FY2022-2025 left at 0.0, since EBIT is not "
+            "reported on EDGAR there either (D&A alone is no EBITDA); FY2021 not in Yahoo's "
+            "statements, left at 0.0") for n in cd.source_notes), cd.source_notes)
+        # A lender's year EDGAR did not derive EBIT for stays 0.0.
+        lender = ("EBIT (OperatingIncomeLoss) not reported on EDGAR for FY2025; left at 0.0 "
+                  "rather than derived as pretax income + interest expense: FY2025 interest "
+                  "expense is 40% of revenue, as for a lender, broker or mortgage REIT, so it "
+                  "is likely a funding cost that adding it back would count twice")
+        cd, _ = self._company([0.0] * 5, [lender, self.ALL_GAP], ebit=[10.0] * 4 + [0.0])
+        self.assertEqual(cd.financials.ebitda, [10.0, 3866.0, 3961.0, 4137.0, 0.0])
+        self.assertTrue(any("; EBITDA recomputed as EBIT + D&A for FY2022-2024; EBITDA for "
+                            "FY2025 left at 0.0, since EBIT is not reported on EDGAR there "
+                            "either" in n for n in cd.source_notes), cd.source_notes)
+        # EBIT EDGAR derived, or took from revenue - costs where the pretax-based
+        # figure exceeded revenue, is EBIT: those years are recomputed.
+        derived = [
+            "EBIT (OperatingIncomeLoss) not reported on EDGAR for FY2023-2025; derived as "
+            "pretax income + interest expense",
+            "EBIT (OperatingIncomeLoss) not reported on EDGAR for FY2022, and pretax income + "
+            "interest expense exceeds revenue there, so it is not used as EBIT",
+            "EBIT (OperatingIncomeLoss) not reported on EDGAR for FY2022; derived as revenue - "
+            "CostsAndExpenses"]
+        cd, _ = self._company([0.0] * 5, derived + [self.ALL_GAP])
+        self.assertEqual(cd.financials.ebitda, [10.0, 3866.0, 3961.0, 4137.0, 4420.0])
+        self.assertTrue(any("; EBITDA recomputed as EBIT + D&A for those years; FY2021 not in "
+                            "Yahoo's statements" in n for n in cd.source_notes), cd.source_notes)
+
+    def test_yahoo_da_on_another_definition_is_not_used(self) -> None:
+        # EDGAR's FY2022-2023 D&A is about a quarter of Yahoo's (3.9x).
+        gap = "D&A not reported on EDGAR for FY2024-2025; filled with 0.0"
+        cd, fin = self._company([900.0, 1000.0, 1000.0, 0.0, 0.0], [gap])
+        self.assertEqual(cd.financials.dep_amort, fin.dep_amort)
+        self.assertEqual(cd.financials.ebitda, fin.ebitda)
+        self.assertIn(gap + "; not backfilled from Yahoo's annual statements: their D&A for "
+                      "FY2022-2023, which EDGAR also reports, is a median 3.9x EDGAR's, so the "
+                      "two likely define D&A differently; FY2024-2025 left at 0.0",
+                      cd.source_notes)
+
+    def test_banks_insurers_bdcs_reits_and_lessors_are_not_backfilled(self) -> None:
+        for kind, label in (("bank", "a bank"), ("insurer", "an insurer"),
+                            ("bdc", "a business development company"), ("reit", "a REIT"),
+                            ("lessor", "a debt-funded lessor")):
+            with self.subTest(kind=kind), \
+                    mock.patch.object(YFinanceClient, "get_da_by_year") as get_da:
+                cd, _ = self._company([0.0] * 5, [self.ALL_GAP], kind=kind)
+                self.assertEqual(cd.financials.dep_amort, [0.0] * 5)
+                self.assertIn(self.ALL_GAP + f"; not backfilled from Yahoo: for {label} the "
+                              "FCFF DCF and FCFE, which D&A feeds, are shown for reference only "
+                              "(EBITDA for those years is EBIT alone)", cd.source_notes)
+                get_da.assert_not_called()
+
+    def test_reported_or_unexplained_da_is_never_replaced(self) -> None:
+        with mock.patch.object(YFinanceClient, "get_da_by_year") as get_da:
+            # A non-zero EDGAR figure stays, whatever the gap note says.
+            cd, _ = self._company([3.0] * 5, [self.ALL_GAP])
+            self.assertEqual(cd.financials.dep_amort, [3.0] * 5)
+            self.assertIn(self.ALL_GAP, cd.source_notes)
+            # A 0 without EDGAR's gap note is a reading, not a tag gap.
+            cd, _ = self._company([3.0, 3.0, 3.0, 3.0, 0.0], [])
+            self.assertEqual(cd.financials.dep_amort, [3.0, 3.0, 3.0, 3.0, 0.0])
+            get_da.assert_not_called()
+
+    def test_failed_or_empty_yahoo_statements(self) -> None:
+        # Neither statement could be read (empty frames, as when rate-limited).
+        cd, _ = self._company([0.0] * 5, [self.ALL_GAP], inc=pd.DataFrame())
+        self.assertEqual(cd.financials.dep_amort, [0.0] * 5)
+        self.assertIn(self.ALL_GAP + "; Yahoo's annual income and cash-flow statements could not "
+                      "be read (the request failed or returned nothing), so nothing was "
+                      "backfilled", cd.source_notes)
+        # Read, but no D&A line in them.
+        inc = yahoo_cashflow(**{"Total Revenue": [10.0, 9.0, 8.0, 7.0]})
+        cd, _ = self._company([0.0] * 5, [self.ALL_GAP], inc=inc)
+        self.assertEqual(cd.financials.dep_amort, [0.0] * 5)
+        self.assertIn(self.ALL_GAP + "; Yahoo's annual statements show no D&A for FY2021-2025 "
+                      "either, so nothing was backfilled", cd.source_notes)
+
+    def test_yahoo_da_in_another_currency_is_converted_or_skipped(self) -> None:
+        info = dict(self.INFO, financialCurrency="EUR")
+        cd, _ = self._company([0.0] * 5, [self.ALL_GAP], info=info,
+                              extra={"EURUSD=X": fx_ticker(1.1)})
+        self.assertEqual(cd.financials.dep_amort,
+                         [0.0] + [v * 1.1 for v in (3856.0, 3951.0, 4127.0, 4410.0)])
+        self.assertTrue(any("FY2025 4,851 (year to 2025-12-31) (Yahoo's EUR figures at "
+                            "EUR->USD spot 1.1)" in n for n in cd.source_notes), cd.source_notes)
+        cd, _ = self._company([0.0] * 5, [self.ALL_GAP], info=info)
+        self.assertEqual(cd.financials.dep_amort, [0.0] * 5)
+        self.assertIn(self.ALL_GAP + "; Yahoo's statements are in EUR and no EUR->USD rate "
+                      "could be fetched, so nothing was backfilled", cd.source_notes)
+
+    def test_da_and_capex_gaps_are_both_backfilled(self) -> None:
+        # D&A is filled first, then capex from the same cash-flow statement.
+        cf = yahoo_cashflow(**{"Capital Expenditure": [-9600.0, -9500.0, -9400.0, -9300.0]})
+        notes = [self.ALL_GAP, "capex unavailable on EDGAR; filled with 0.0"]
+        cd, _ = self._company([0.0] * 5, notes, cf=cf, capex=[0.0] * 5)
+        self.assertEqual(cd.financials.dep_amort, [0.0, 3856.0, 3951.0, 4127.0, 4410.0])
+        self.assertEqual(cd.financials.capex, [0.0, 9300.0, 9400.0, 9500.0, 9600.0])
+        self.assertTrue(any(n.startswith(self.ALL_GAP + self.FILLED) for n in cd.source_notes))
+        self.assertTrue(any(n.startswith("capex unavailable on EDGAR; filled with 0.0; "
+                                         "backfilled from Yahoo's annual cash-flow statement")
+                            for n in cd.source_notes), cd.source_notes)
+
+    def test_da_by_year_prefers_the_income_statement_then_the_cash_flow(self) -> None:
+        inc = yahoo_cashflow(**{"Reconciled Depreciation": [-40.0, NaN, -20.0, 0.0]})
+        cf = yahoo_cashflow(**{"Depreciation And Amortization": [44.0, 33.0, 22.0, 11.0]})
+        items = client({"X": ticker(self.INFO, fin=inc, cf=cf)}).get_da_by_year("X")
+        # FY2025 and FY2023 from the income statement; FY2024 (NaN) and FY2022
+        # (a 0 is not a reading) from the cash-flow statement.
+        self.assertEqual(items["by_year"], {2025: ("2025-12-31", 40.0),
+                                            2024: ("2024-12-31", 33.0),
+                                            2023: ("2023-12-31", 20.0),
+                                            2022: ("2022-12-31", 11.0)})
+        self.assertEqual((items["currency"], items["currency_note"]), ("USD", None))
+        # Only the cash-flow statement: its D&A line. A fiscal year two columns
+        # share (a changed year end) is left out.
+        cf = yahoo_cashflow(("2025-12-31", "2024-12-31", "2024-06-30", "2023-06-30"),
+                            **{"Depreciation": [5.0, 4.0, 3.5, 3.0]})
+        items = client({"X": ticker(self.INFO, cf=cf)}).get_da_by_year("X")
+        self.assertEqual(items["by_year"], {2025: ("2025-12-31", 5.0), 2023: ("2023-06-30", 3.0)})
+        # Read, but no D&A in either: an empty by_year; neither read: None.
+        inc = yahoo_cashflow(**{"Total Revenue": [10.0, 9.0, 8.0, 7.0]})
+        self.assertEqual(client({"X": ticker(self.INFO, fin=inc)}).get_da_by_year("X"),
+                         {"currency": None, "currency_note": None, "by_year": {}})
+        self.assertIsNone(client({"X": ticker(self.INFO)}).get_da_by_year("X"))
+        failed = ticker(self.INFO)
+        type(failed).financials = mock.PropertyMock(side_effect=RuntimeError("HTTP 429"))
+        type(failed).cashflow = mock.PropertyMock(side_effect=RuntimeError("HTTP 429"))
+        self.assertIsNone(client({"X": failed}).get_da_by_year("X"))
+
+
 # --------------------------------------------------------------------------- #
 #  The EDGAR notes the backfills parse, as the real EDGAR client words them
 # --------------------------------------------------------------------------- #
@@ -1781,9 +2534,93 @@ class EdgarNoteContractTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _company(self, edgar: EdgarClient, qbs=None):
-        tk = ticker(self.INFO, cf=yahoo_cashflow(self.CF_DATES, **self.CF), qbs=qbs)
+    def _company(self, edgar: EdgarClient, qbs=None, info=None, cf_rows=None):
+        tk = ticker(info or self.INFO, cf=yahoo_cashflow(self.CF_DATES, **(cf_rows or self.CF)),
+                    qbs=qbs)
         return HybridProvider(edgar=edgar, market=client({"FIX": tk})).get_company_data("FIX")
+
+    def test_da_without_any_tag_is_backfilled(self) -> None:
+        # PG&E-like: no D&A tag at all. Yahoo's cash-flow D&A (the income
+        # statement here has none) fills FY2021-2024 and EBITDA follows.
+        rows = dict(self.CF, **{"Depreciation And Amortization": [52.0, 51.0, 50.0, 49.0]})
+        cd = self._company(edgar_client(DepreciationDepletionAndAmortization=None),
+                           cf_rows=rows)
+        self.assertEqual(cd.financials.dep_amort, [0.0, 0.0, 49.0, 50.0, 51.0, 52.0])
+        self.assertEqual(cd.financials.ebitda, [150.0, 150.0, 199.0, 200.0, 201.0, 202.0])
+        self.assertIn(
+            "D&A unavailable on EDGAR; filled with 0.0; backfilled from Yahoo's annual income or "
+            "cash-flow statement (D&A for the same fiscal year): FY2021 49 (year to "
+            "2021-12-31), FY2022 50 (year to 2022-12-31), FY2023 51 (year to 2023-12-31), "
+            "FY2024 52 (year to 2024-12-31); EBITDA recomputed as EBIT + D&A for those years; "
+            "FY2019-2020 not in Yahoo's statements, left at 0.0", cd.source_notes)
+
+    def test_da_gap_years_are_backfilled(self) -> None:
+        flows = [_edgar_flow(y, 50.0) for y in FIX_YEARS if y != 2023]
+        rows = dict(self.CF, **{"Depreciation And Amortization": [52.0, 51.0, 50.0, 49.0]})
+        cd = self._company(edgar_client(DepreciationDepletionAndAmortization=flows),
+                           cf_rows=rows)
+        self.assertEqual(cd.financials.dep_amort, [50.0, 50.0, 50.0, 50.0, 51.0, 50.0])
+        self.assertIn("D&A not reported on EDGAR for FY2023; filled with 0.0; backfilled from "
+                      "Yahoo's annual income or cash-flow statement (D&A for the same fiscal "
+                      "year): FY2023 51 (year to 2023-12-31); EBITDA recomputed as EBIT + D&A "
+                      "for those years", cd.source_notes)
+
+    def test_da_backfill_leaves_ebitda_at_0_where_edgar_zero_filled_ebit(self) -> None:
+        # Carvana-like: no D&A tag, and no operating income (nor anything to
+        # derive it from) for FY2022. Its D&A is filled; its EBITDA stays 0.0.
+        rows = dict(self.CF, **{"Depreciation And Amortization": [52.0, 51.0, 50.0, 49.0]})
+        oi = [_edgar_flow(y, 150.0) for y in FIX_YEARS if y != 2022]
+        cd = self._company(edgar_client(DepreciationDepletionAndAmortization=None,
+                                        OperatingIncomeLoss=oi), cf_rows=rows)
+        self.assertEqual(cd.financials.ebit, [150.0, 150.0, 150.0, 0.0, 150.0, 150.0])
+        self.assertEqual(cd.financials.dep_amort, [0.0, 0.0, 49.0, 50.0, 51.0, 52.0])
+        self.assertEqual(cd.financials.ebitda, [150.0, 150.0, 199.0, 0.0, 201.0, 202.0])
+        self.assertIn("EBIT (operating income) not reported on EDGAR for FY2022; filled with 0.0",
+                      cd.source_notes)
+        self.assertTrue(any(n.startswith("D&A unavailable on EDGAR; filled with 0.0; backfilled")
+                            and n.endswith(
+                                "; EBITDA recomputed as EBIT + D&A for FY2021, FY2023-2024; "
+                                "EBITDA for FY2022 left at 0.0, since EBIT is not reported on "
+                                "EDGAR there either (D&A alone is no EBITDA); FY2019-2020 not "
+                                "in Yahoo's statements, left at 0.0")
+                            for n in cd.source_notes), cd.source_notes)
+        # A lender-like filer (interest 20% of revenue): EDGAR leaves FY2022's
+        # EBIT at 0.0 rather than derive it, and its EBITDA stays 0.0 too.
+        interest = [_edgar_flow(y, 300.0) for y in FIX_YEARS]
+        cd = self._company(edgar_client(DepreciationDepletionAndAmortization=None,
+                                        OperatingIncomeLoss=oi, InterestExpense=interest),
+                           cf_rows=rows)
+        self.assertTrue(any(n.startswith("EBIT (OperatingIncomeLoss) not reported on EDGAR for "
+                                         "FY2022; left at 0.0 rather than derived")
+                            for n in cd.source_notes), cd.source_notes)
+        self.assertEqual(cd.financials.dep_amort, [0.0, 0.0, 49.0, 50.0, 51.0, 52.0])
+        self.assertEqual(cd.financials.ebitda, [150.0, 150.0, 199.0, 0.0, 201.0, 202.0])
+
+    def test_20f_share_count_warning_fires_from_the_edgar_form(self) -> None:
+        # Yahoo gives no share count, so EDGAR's diluted count (400) is used.
+        # The EDGAR client marks the latest annual report's form: a 20-F
+        # filer's count is of ordinary shares, not the ADSs quoted.
+        info = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 20.0}
+        plain = ("shares outstanding unavailable from Yahoo; using FY2024 diluted "
+                 "weighted-average shares from EDGAR (400)")
+        for form, expected in (
+            ("10-K", plain),
+            ("20-F", "WARNING: " + plain + "; EDGAR counts a 20-F filer's ordinary shares, so "
+             "for an ADR the market cap, dividend per share and per-share values are off by "
+             "the ADS ratio"),
+        ):
+            with self.subTest(form=form):
+                edgar = edgar_client()
+                for node in edgar.company_facts.return_value["facts"]["us-gaap"].values():
+                    for facts in node["units"].values():
+                        for fact in facts:
+                            fact["form"] = form
+                cd = self._company(edgar, info=info)
+                self.assertEqual(cd.financials._annual_form, form)
+                self.assertEqual(cd.market.shares_outstanding, 400.0)
+                self.assertIn(expected, cd.source_notes)
+                self.assertNotIn("WARNING: " + plain if form == "10-K" else plain,
+                                 cd.source_notes)
 
     def test_capex_without_any_tag_is_backfilled(self) -> None:
         cd = self._company(edgar_client(PaymentsToAcquirePropertyPlantAndEquipment=None))

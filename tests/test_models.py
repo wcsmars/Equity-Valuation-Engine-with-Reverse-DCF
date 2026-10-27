@@ -12,9 +12,10 @@ from dataclasses import replace
 import math
 import unittest
 
-from equity_valuation.data.synthetic import make_company
+from equity_valuation.data.synthetic import DEMO_PEERS, SyntheticProvider, make_company
+from equity_valuation.models.comps import run_comps
 from equity_valuation.models.dcf import run_dcf
-from equity_valuation.models.ddm_fcfe import run_ddm
+from equity_valuation.models.ddm_fcfe import run_ddm, run_fcfe
 from equity_valuation.models.wacc import compute_wacc
 from equity_valuation.schemas import DCFAssumptions, DDMAssumptions, MacroAssumptions
 
@@ -74,7 +75,15 @@ class DCFFormulaTests(unittest.TestCase):
         )
         w = dcf.assumptions["wacc"]
         n = dcf.assumptions["forecast_years"]
-        self.assertTrue(_close(dcf.terminal_value, dcf.assumptions["ebitda_terminal"] * 12.0))
+        # EBITDA_N rebuilt independently: final-year revenue x (final EBIT
+        # margin + the pooled historical D&A share), so a wrong EBITDA (EBIT
+        # only, another year, half the D&A) fails here, not just the TV.
+        fin = self.company.financials
+        da_pct = sum(fin.dep_amort) / sum(fin.revenue)
+        ebitda_n = dcf.revenue[-1] * (dcf.assumptions["ebit_margin_path"][-1] + da_pct)
+        self.assertTrue(_close(dcf.assumptions["ebitda_terminal"], ebitda_n))
+        self.assertTrue(_close(dcf.terminal_value, ebitda_n * 12.0))
+        self.assertAlmostEqual(dcf.implied_price, 39.2443, places=3)  # demo at 12x
         # An exit-multiple TV is a year-end sale value: full period N, not N-0.5.
         self.assertEqual(dcf.assumptions["terminal_discount_exponent"], float(n))
         self.assertTrue(_close(dcf.pv_terminal, dcf.terminal_value / (1.0 + w) ** n))
@@ -103,7 +112,56 @@ class DCFFormulaTests(unittest.TestCase):
         ))
 
 
+class CompsBridgeTests(unittest.TestCase):
+    def test_ev_multiples_subtract_minority_and_preferred(self) -> None:
+        # The comps EV->equity bridge, like the DCF's: EV multiples lose
+        # (minority + preferred) / shares, equity multiples do not move, and
+        # the target's own EV carries both claims.
+        company = make_company()
+        price = company.market.price
+        base = run_comps(company, SyntheticProvider(), DEMO_PEERS, price)
+        minority, preferred = 5_000_000_000.0, 2_000_000_000.0
+        levered = replace(company, balance_sheet=replace(
+            company.balance_sheet, minority_interest=minority, preferred_equity=preferred))
+        comps = run_comps(levered, SyntheticProvider(), DEMO_PEERS, price)
+        shares = company.market.shares_outstanding
+        for m in ("ev_ebitda", "ev_sales"):
+            self.assertIsNotNone(base.implied[m], m)
+            self.assertAlmostEqual(base.implied[m] - comps.implied[m],
+                                   (minority + preferred) / shares, places=9, msg=m)
+        for m in ("pe", "pb"):
+            self.assertEqual(comps.implied[m], base.implied[m], m)
+        self.assertAlmostEqual(comps.target.enterprise_value - base.target.enterprise_value,
+                               minority + preferred, delta=1.0)
+
+
 class DDMFormulaTests(unittest.TestCase):
+    def test_perpetual_growth_at_or_above_ke_is_clamped(self) -> None:
+        # Every perpetuity needs ke - g >= 0.005: a terminal growth above ke
+        # (or within the spread) is clamped to ke - 0.005, with a note, in all
+        # three DDM forms and in the FCFE (fade path and terminal value).
+        company, macro = make_company(), MacroAssumptions()
+        price = company.market.price
+        ke = run_ddm(company, macro, DDMAssumptions(method="gordon"), price).cost_of_equity
+        d0 = company.market.dividend_per_share
+        for g in (0.20, ke - 0.001):
+            for method, key in (("gordon", "growth"), ("h_model", "terminal_growth_used"),
+                                ("two_stage", "terminal_growth_used")):
+                with self.subTest(g=g, method=method):
+                    r = run_ddm(company, macro, DDMAssumptions(method=method, terminal_growth=g),
+                                price)
+                    self.assertAlmostEqual(r.detail[key], ke - 0.005, places=12)
+                    self.assertTrue(any("clamped to" in n for n in r.detail["notes"]))
+                    self.assertGreater(r.implied_price, 0)
+                    if method == "gordon":
+                        self.assertTrue(_close(r.implied_price, d0 * (1 + ke - 0.005) / 0.005))
+            with self.subTest(g=g, model="fcfe"):
+                f = run_fcfe(company, macro, DDMAssumptions(terminal_growth=g), price)
+                self.assertAlmostEqual(f.detail["terminal_growth_used"], ke - 0.005, places=12)
+                self.assertAlmostEqual(f.detail["revenue_growth_path"][-1], ke - 0.005, places=12)
+                self.assertGreater(f.terminal_value, 0)
+                self.assertTrue(any("clamped to" in n for n in f.detail["notes"]))
+
     def test_gordon_growth_uses_next_dividend(self) -> None:
         company = make_company()
         macro = MacroAssumptions()

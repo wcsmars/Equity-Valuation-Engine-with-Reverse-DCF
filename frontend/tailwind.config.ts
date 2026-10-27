@@ -19,14 +19,19 @@ const config: Config = {
           hi: "#1b2538",
         },
         line: "#243043",
+        // Text tokens meet WCAG AA (4.5:1) on every surface: ink-faint is
+        // 4.7:1 on surface-hi, 5.7:1 on surface (tests/accessibility.test.mjs).
         ink: {
           DEFAULT: "#e6edf6",
           dim: "#9babc2",
-          faint: "#62748f",
+          faint: "#8090aa",
         },
+        // brand is the accent for text, borders and sliders; filled buttons
+        // with white text use brand-dim (4.8:1) and brand-deep on hover (5.7:1).
         brand: {
           DEFAULT: "#5b9dff",
           dim: "#3b6fd1",
+          deep: "#2f63c4",
         },
         up: "#34d399", // undervalued / positive
         down: "#fb7185", // overvalued / negative

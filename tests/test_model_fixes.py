@@ -14,6 +14,7 @@ import io
 import math
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from equity_valuation import config, value_company
 from equity_valuation.cli import _print_summary
@@ -24,7 +25,12 @@ from equity_valuation.engine import (
     _fallback_football_field,
     _recommendation,
 )
-from equity_valuation.models.comps import EARNINGS_COLLAPSE_NOTE_PREFIX, _eps_cagr, run_comps
+from equity_valuation.models.comps import (
+    EARNINGS_COLLAPSE_NOTE_PREFIX,
+    FEW_PEER_VALUES_NOTE_PREFIX,
+    _eps_cagr,
+    run_comps,
+)
 from equity_valuation.models.dcf import margin_fade_target, run_dcf
 from equity_valuation.models.ddm_fcfe import (
     _dividend_cagr,
@@ -36,6 +42,7 @@ from equity_valuation.models.ddm_fcfe import (
 )
 from equity_valuation.models.sensitivity import (
     _base_latest_ebit_margin,
+    _comps_rows,
     build_football_field,
     dcf_sensitivity,
 )
@@ -44,6 +51,7 @@ from equity_valuation.models.wacc import (
     beta_adjustment,
     compute_wacc,
     effective_tax_rate_detail,
+    tax_gap_years,
 )
 from equity_valuation.schemas import (
     AnnualFinancials,
@@ -74,12 +82,19 @@ from equity_valuation.utils import (
     robust_latest_margin,
     screened_incremental_ratio,
     series_cagr,
+    share_scale_break,
     trim_outliers,
     available_model_price,
     safe_div,
 )
 
 from tests.test_synthetic import make_distressed_company
+
+# The DCF's note for a flagged company with no usable EBIT (no reference price).
+NO_EBIT_NOTE = ("EBIT margin unavailable: no operating income is reported, and a flagged "
+                "company's EBIT is not rebuilt from pretax income, so the DCF gives no "
+                "reference price instead of projecting a 0% margin -- set a target EBIT "
+                "margin to project one")
 
 
 class _OneCompanyProvider(SyntheticProvider):
@@ -458,6 +473,18 @@ class EngineBlendAndWarningTests(unittest.TestCase):
             self.assertLessEqual(r.low, r.base, r.method)
             self.assertLessEqual(r.base, r.high, r.method)
 
+    def test_fallback_single_comps_price_is_a_band(self):
+        # One comps price (low == high) is drawn +/-10%, as models.sensitivity
+        # draws it, not as a zero-width sliver.
+        report = value_company("SYNT", provider=SyntheticProvider(), peers=DEMO_PEERS)
+        report.comps.implied_price_summary = {"low": 40.0, "median": 40.0, "high": 40.0}
+        bar = next(r for r in _fallback_football_field(report) if r.method == "Comps")
+        for got, want in zip((bar.low, bar.base, bar.high), (36.0, 40.0, 44.0)):
+            self.assertAlmostEqual(got, want, places=9)
+        report.comps.implied_price_summary = {"low": 30.0, "median": 40.0, "high": 50.0}
+        bar = next(r for r in _fallback_football_field(report) if r.method == "Comps")
+        self.assertEqual((bar.low, bar.base, bar.high), (30.0, 40.0, 50.0))
+
 
 class BlendedTargetZeroTests(unittest.TestCase):
     """A blend of 0 (negative equity floored at 0) is a target; only an empty
@@ -564,7 +591,10 @@ class FinancialInstitutionTests(unittest.TestCase):
         bank = _with_fin(self._as("Banks - Diversified"), ebit=[0.0] * 5)
         dcf = run_dcf(bank, MacroAssumptions(), DCFAssumptions(), bank.market.price)
         self.assertEqual(dcf.assumptions["start_ebit_margin"], 0.0)
-        self.assertIn("EBIT margin unavailable; defaulting to 0", dcf.assumptions["notes"])
+        # With no EBIT left, the reference DCF gives no price rather than a 0%
+        # margin projection (see NoOperatingMarginTests).
+        self.assertIn(NO_EBIT_NOTE, dcf.assumptions["notes"])
+        self.assertIs(dcf.assumptions["valuation_available"], False)
         self.assertFalse(any("pretax income + interest" in n for n in dcf.assumptions["notes"]))
         grid = dcf_sensitivity(bank, MacroAssumptions(), DCFAssumptions(), bank.market.price)[1]
         self.assertTrue(all(math.isnan(v) for v in grid.row_values))
@@ -2067,7 +2097,7 @@ class LessorTests(unittest.TestCase):
         self.assertAlmostEqual(_base_latest_ebit_margin(gap), 0.32, places=12)
         # A bank's gaps stay: its interest is the cost of its lending book.
         bank = _with_kind(gap, "bank")
-        self.assertIn("EBIT margin unavailable; defaulting to 0",
+        self.assertIn(NO_EBIT_NOTE,
                       run_dcf(bank, macro, DCFAssumptions(), gap.market.price)
                       .assumptions["notes"])
         self.assertTrue(math.isnan(_base_latest_ebit_margin(bank)))
@@ -2100,8 +2130,9 @@ class CaptiveDDMAloneTests(unittest.TestCase):
         self.assertTrue(ddm_reference_only(report))
         self.assertIn("Captive finance arm: the DDM is shown for reference only and left out of "
                       "the blended target, which it would otherwise set on its own: it counts "
-                      "regular dividends only (buybacks and special dividends are ignored) and no "
-                      "second method checks it.", report.warnings)
+                      "dividends only (regular plus any recurring variable dividends; buybacks "
+                      "and one-off specials are ignored) and no second method checks it.",
+                      report.warnings)
         self.assertTrue(any(w.startswith("No blended target:") and "--peers" in w
                             for w in report.warnings))
         self.assertIn("DDM (not in blend)", [r.method for r in report.football_field])
@@ -2191,9 +2222,10 @@ class NoTargetWordingTests(unittest.TestCase):
         self.assertEqual(report.summary["recommendation"], "N/A")
         self.assertIn("Blended target rests on the DDM alone (FCFE left out for a financial "
                       "institution; no usable comps price from the peers supplied), so no "
-                      "verdict or upside is given: the DDM counts regular dividends only "
-                      "(buybacks and special dividends are ignored) and there is no second "
-                      "method to check it against.", report.warnings)
+                      "verdict or upside is given: the DDM counts dividends only (regular plus "
+                      "any recurring variable dividends; buybacks and one-off specials are "
+                      "ignored) and there is no second method to check it against.",
+                      report.warnings)
 
     def test_only_the_models_that_ran_are_named(self):
         provider = _OneCompanyProvider(self.lessor)
@@ -2382,8 +2414,8 @@ class CompsChargeInsideEBITTests(unittest.TestCase):
                                r"multiple of that EPS or EBITDA would price the charge")
         # What EV/EBITDA says on the charge year's EBITDA (net margin only
         # halved, so the screen keeps it): about half of what it says with
-        # EBIT back at its prior median (19.41 against 38.39).
-        charged = self._comps(self._company(ni_m=self.NI[:-1] + [0.0200]))
+        # EBIT back at its prior median.
+        charged = self._comps(self._company(ni_m=self.NI[:-1] + [0.0300]))
         normal = self._comps(self._company(ebit_m=self.EBIT[:-1] + [0.0670]))
         self.assertLess(charged.implied["ev_ebitda"], 0.6 * normal.implied["ev_ebitda"])
 
@@ -2405,8 +2437,8 @@ class CompsChargeInsideEBITTests(unittest.TestCase):
         self.assertIn("a peer multiple of that EPS would price the charge", note)
 
     def test_what_keeps_the_pe(self):
-        # A net margin down by half, not three quarters, with the EBIT drop.
-        kept = self._company(ni_m=self.NI[:-1] + [0.0200])
+        # A net margin down by half, not two thirds, with the EBIT drop.
+        kept = self._company(ni_m=self.NI[:-1] + [0.0300])
         self.assertIsNone(ebit_charge_collapse(kept.financials))
         self.assertIsNotNone(self._comps(kept).implied["pe"])
         self.assertIsNotNone(self._comps(kept).implied["ev_ebitda"])
@@ -2633,6 +2665,10 @@ class PeerWeightingTests(unittest.TestCase):
         self.assertEqual(provider.requested, ["P1", "P2", "P3"])
         self.assertEqual(len(result.peers), 3)
         self.assertEqual(result.stats["pe"]["median"], 20)
+        # A multiple no peer reports is named as the dashboard shows it.
+        self.assertIn("No usable peer values for EV/EBITDA after outlier trimming.", result.notes)
+        self.assertFalse(any("ev_ebitda" in n or "ev_sales" in n for n in result.notes),
+                         result.notes)
 
     def test_earnings_cagr_uses_elapsed_fiscal_years(self):
         fin = replace(make_company().financials, fiscal_years=[2019, 2022, 2025],
@@ -2689,6 +2725,1172 @@ class NumericAvailabilityTests(unittest.TestCase):
         self.assertEqual(available_model_price(SimpleNamespace(implied_price=-2.0)), -2.0)
         self.assertIsNone(available_model_price({"implied_price": 100.0,
                                                "detail": {"valuation_available": False}}))
+
+
+# --------------------------------------------------------------------------- #
+#  Comps rows, data-gap notes and model edge cases
+# --------------------------------------------------------------------------- #
+def _comps_row_methods(rows):
+    return [r.method for r in rows]
+
+
+class FootballFieldCompsRowTests(unittest.TestCase):
+    """The football field draws every positive comps price that feeds the comps
+    median: P/B joins EV/EBITDA and P/E, a non-positive EV price gets no bar,
+    and a single-price summary bar has a width."""
+
+    def test_negative_ev_price_has_no_bar(self):
+        # Net debt above the implied EV: EV/EBITDA and EV/Sales imply negative
+        # prices that the comps summary (so the blend) leaves out.
+        c = _with_bs(make_company(), total_debt=700e9)
+        report = value_company("DEBT", provider=_OneCompanyProvider(c), peers=DEMO_PEERS)
+        implied = report.comps.implied
+        self.assertLess(implied["ev_ebitda"], 0)
+        self.assertTrue(any("ev_ebitda implies non-positive equity value" in n
+                            for n in report.comps.notes))
+        methods = _comps_row_methods(report.football_field)
+        self.assertNotIn("EV/EBITDA comps", methods)
+        self.assertIn("P/E comps", methods)
+        self.assertIn("P/B comps", methods)
+        comps_rows = [r for r in report.football_field if "comps" in r.method]
+        self.assertTrue(all(r.low > 0 for r in comps_rows))
+
+    def test_pb_row_for_banks_and_operating_companies(self):
+        bank = _with_market(make_company(), industry="Banks - Diversified",
+                            sector="Financial Services")
+        report = value_company("BANK", provider=_OneCompanyProvider(bank), peers=DEMO_PEERS)
+        rows = {r.method: r for r in report.football_field if "comps" in r.method}
+        self.assertEqual(set(rows), {"P/E comps", "P/B comps"})
+        pb, stats = report.comps.implied["pb"], report.comps.stats["pb"]
+        self.assertAlmostEqual(rows["P/B comps"].base, pb, places=9)
+        self.assertAlmostEqual(rows["P/B comps"].low, pb * stats["p25"] / stats["median"], places=9)
+        self.assertAlmostEqual(rows["P/B comps"].high, pb * stats["p75"] / stats["median"],
+                               places=9)
+        # The comps value in the blend, the midpoint of the two prices, falls
+        # between the two bars here (as for JPM), so the summary "Comps" bar
+        # (P/B price / median / P/E price) is drawn as well.
+        med = report.summary["methods"]["Comps (median)"]
+        self.assertFalse(any(r.low <= med <= r.high for r in rows.values()))
+        summary_bar = next(r for r in report.football_field if r.method == "Comps")
+        self.assertEqual((summary_bar.low, summary_bar.base, summary_bar.high),
+                         (pb, med, report.comps.implied["pe"]))
+        # SYNT: a bar for each of its four comps prices; the comps median is
+        # unchanged.
+        synt = value_company("SYNT", provider=SyntheticProvider(), peers=DEMO_PEERS)
+        self.assertEqual([m for m in _comps_row_methods(synt.football_field) if "comps" in m],
+                         ["EV/EBITDA comps", "EV/Sales comps", "P/E comps", "P/B comps"])
+        self.assertAlmostEqual(synt.summary["methods"]["Comps (median)"], 46.96, places=2)
+        self.assertTrue(any(r.low <= 46.96 <= r.high for r in synt.football_field
+                            if r.method.endswith(" comps")))
+        self.assertNotIn("Comps", _comps_row_methods(synt.football_field))
+
+    def test_single_price_comps_bars_have_a_width(self):
+        # GM-shaped captive with a collapsed EPS: P/B is the only comps price,
+        # drawn with its peer spread, not as the old zero-width "Comps" bar.
+        gm = CompsChargeInsideEBITTests()._company(kind="captive_finance")
+        report = value_company("GM", provider=_OneCompanyProvider(gm), peers=DEMO_PEERS)
+        rows = [r for r in report.football_field if "omps" in r.method]
+        self.assertEqual([r.method for r in rows], ["P/B comps"])
+        self.assertLess(rows[0].low, rows[0].base)
+        self.assertLess(rows[0].base, rows[0].high)
+        # The summary fallback (no per-multiple price, e.g. a result carrying
+        # only its summary) with one price gets the +/-10% band.
+        summary_only = SimpleNamespace(stats={}, implied={},
+                                       implied_price_summary={"low": 10.0, "median": 10.0,
+                                                              "high": 10.0})
+        row = _comps_rows(summary_only)[0]
+        self.assertEqual(row.method, "Comps")
+        self.assertAlmostEqual(row.low, 9.0)
+        self.assertAlmostEqual(row.base, 10.0)
+        self.assertAlmostEqual(row.high, 11.0)
+        # An EV/Sales price without stats or bridge inputs is still drawn,
+        # with the same band.
+        only_sales = SimpleNamespace(stats={}, implied={"ev_sales": 10.0},
+                                     implied_price_summary={"low": 10.0, "median": 10.0,
+                                                            "high": 10.0})
+        row = _comps_rows(only_sales)[0]
+        self.assertEqual((row.method, row.low, row.base, row.high),
+                         ("EV/Sales comps", 9.0, 10.0, 11.0))
+
+    def test_ev_sales_bar_and_the_comps_median_are_drawn(self):
+        # GIS-shaped: EV/EBITDA's bridge gives a negative price and P/E is left
+        # out, so EV/Sales and P/B carry the comps median. Only the P/B bar
+        # was drawn; now EV/Sales has one, and since the median (their
+        # midpoint) falls between the two bars the summary "Comps" bar is
+        # drawn too, so the value in the blend is on the chart.
+        c = _with_bs(make_company(), total_debt=200e9)
+        rows = [CompRow(ticker=t, name=t, ev_ebitda=eve, ev_sales=evs, pe=None, pb=pb,
+                        currency="USD")
+                for t, eve, evs, pb in (("P1", 5.0, 6.0, 3.0), ("P2", 6.0, 8.0, 4.0),
+                                        ("P3", 7.0, 9.0, 5.0))]
+        report = value_company("GISX", provider=_PeerRowsProvider(c, rows),
+                               peers=["P1", "P2", "P3"])
+        implied = report.comps.implied
+        self.assertLess(implied["ev_ebitda"], 0)
+        self.assertGreater(implied["ev_sales"], implied["pb"])
+        bars = {r.method: r for r in report.football_field if "omps" in r.method}
+        self.assertEqual(list(bars), ["EV/Sales comps", "P/B comps", "Comps"])
+        med = report.summary["methods"]["Comps (median)"]
+        self.assertAlmostEqual(med, (implied["ev_sales"] + implied["pb"]) / 2.0, places=9)
+        self.assertGreater(med, bars["P/B comps"].high)
+        self.assertLess(med, bars["EV/Sales comps"].low)
+        summary_bar = bars["Comps"]
+        self.assertEqual((summary_bar.low, summary_bar.base, summary_bar.high),
+                         (implied["pb"], med, implied["ev_sales"]))
+        # The EV/Sales bar re-prices the bridge at the peer p25/p75 on revenue.
+        stats = report.comps.stats["ev_sales"]
+        rev = c.financials.revenue[-1]
+        net_debt = c.balance_sheet.total_debt - c.balance_sheet.cash_and_investments
+        shares = c.market.shares_outstanding
+        sales = bars["EV/Sales comps"]
+        self.assertAlmostEqual(sales.low, (stats["p25"] * rev - net_debt) / shares, places=6)
+        self.assertAlmostEqual(sales.base, implied["ev_sales"], places=9)
+        self.assertAlmostEqual(sales.high, (stats["p75"] * rev - net_debt) / shares, places=6)
+
+    def test_single_peer_multiple_bar_has_a_width(self):
+        # GM-shaped: one usable peer P/E gives p25 == median == p75, which was
+        # drawn as a zero-width bar (P/E comps 32.40 / 32.40 / 32.40).
+        comps = SimpleNamespace(
+            stats={"pe": {"p25": 6.0, "median": 6.0, "p75": 6.0},
+                   "ev_ebitda": {"p25": 8.0, "median": 8.0, "p75": 8.0}},
+            implied={"pe": 32.4, "ev_ebitda": 50.0},
+            implied_price_summary={"low": 32.4, "median": 41.2, "high": 50.0})
+        rows = {r.method: r for r in _comps_rows(comps)}
+        self.assertAlmostEqual(rows["P/E comps"].low, 32.4 * 0.9, places=9)
+        self.assertAlmostEqual(rows["P/E comps"].base, 32.4, places=9)
+        self.assertAlmostEqual(rows["P/E comps"].high, 32.4 * 1.1, places=9)
+        # An EV multiple re-priced on the bridge at p25 == p75 likewise.
+        c = make_company()
+        rows = {r.method: r for r in _comps_rows(comps, c)}
+        ev = rows["EV/EBITDA comps"]
+        self.assertAlmostEqual(ev.low, 45.0, places=9)
+        self.assertAlmostEqual(ev.high, 55.0, places=9)
+        self.assertLess(ev.low, ev.base)
+        self.assertLess(ev.base, ev.high)
+        # A real spread is left as the peers give it.
+        spread = SimpleNamespace(stats={"pe": {"p25": 5.0, "median": 6.0, "p75": 7.0}},
+                                 implied={"pe": 30.0}, implied_price_summary={})
+        row = _comps_rows(spread)[0]
+        for got, want in zip((row.low, row.base, row.high), (25.0, 30.0, 35.0)):
+            self.assertAlmostEqual(got, want, places=9)
+
+
+class CapexFadeRelativeNoteTests(unittest.TestCase):
+    """A large relative fade in a low-capex business is noted (JD: capex
+    1.54% -> 1.13% of revenue, 0.41pp but 27%, about +30% on the DCF)."""
+
+    def test_threshold(self):
+        self.assertTrue(material_capex_fade(0.0154, [0.0154, 0.0113]))
+        self.assertFalse(material_capex_fade(0.0154, [0.0154, 0.0150]))  # 2.6%
+        self.assertFalse(material_capex_fade(0.121, [0.121, 0.1203]))    # AMZN: 0.6%
+        # Very asset-light: 25% of capex 0.4% of revenue is only 0.1pp, too
+        # small to move free cash flow; the relative gate needs 0.2pp too.
+        self.assertFalse(material_capex_fade(0.004, [0.004, 0.003]))
+        self.assertTrue(material_capex_fade(0.004, [0.004, 0.0019]))
+
+    def test_jd_shaped_fade_is_noted_in_dcf_and_fcfe(self):
+        rev = [156.2e9, 161.9e9, 173.0e9, 195.4e9]
+        c = _company_from_revenue(rev, capex=[r * 0.0154 for r in rev],
+                                  dep_amort=[r * 0.0074 for r in rev])
+        dcf = run_dcf(c, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        fcfe = run_fcfe(c, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        for path, notes in ((dcf.assumptions["capex_pct_path"], dcf.assumptions["notes"]),
+                            (fcfe.detail["capex_pct_path"], fcfe.detail["notes"])):
+            fade = 0.0154 - path[-1]
+            self.assertLess(fade, 0.005)          # under the absolute gate
+            self.assertGreater(fade, 0.10 * 0.0154)  # over the relative one
+            self.assertTrue(any("growth-phase" in n for n in notes), notes)
+
+
+class TaxGapYearTests(unittest.TestCase):
+    """Tax years a provider zero-filled are gaps, not 0% years (SYNT cut to four
+    years with two of them zero-filled: 10.5% instead of 21%, DCF +14%)."""
+
+    EDGAR = "tax expense not reported on EDGAR for FY{}; filled with 0.0"
+
+    def _company(self, years, gaps, note=None):
+        c = make_company()
+        f = c.financials
+        keep = slice(len(f.revenue) - years, None)
+        cut = {k: list(getattr(f, k))[keep] for k in (
+            "fiscal_years", "revenue", "ebit", "ebitda", "net_income", "dep_amort", "capex",
+            "change_in_nwc", "interest_expense", "tax_expense", "pretax_income",
+            "dividends_paid", "diluted_shares")}
+        tax = cut["tax_expense"]
+        for i in gaps:
+            tax[i] = 0.0
+        c = replace(c, financials=AnnualFinancials(**cut))
+        if note is not None:
+            c = replace(c, source_notes=[note])
+        return c
+
+    def test_note_parsing(self):
+        notes = SimpleNamespace(source_notes=[
+            "tax expense not reported on EDGAR for FY2019-2021, FY2024; filled with 0.0",
+            "pretax income missing for FY2018; filled with 0.0",
+            "interest expense not reported on EDGAR for FY2017; filled with 0.0"])
+        self.assertEqual(tax_gap_years(notes), {2019, 2020, 2021, 2024})
+        fin = SimpleNamespace(_source_notes=[
+            "yfinance fallback: tax expense missing for FY2021, FY2022; filled with 0.0"])
+        self.assertEqual(tax_gap_years(fin), {2021, 2022})
+        self.assertEqual(tax_gap_years(SimpleNamespace(financials=fin, source_notes=[])),
+                         {2021, 2022})
+        # A wholly missing line is not a partial gap.
+        self.assertEqual(tax_gap_years(SimpleNamespace(
+            source_notes=["tax expense unavailable on EDGAR; filled with 0.0"])), frozenset())
+
+    def test_zero_filled_years_are_left_out(self):
+        clean = self._company(4, [])
+        gapped = self._company(4, [0, 1])
+        years = gapped.financials.fiscal_years
+        noted = self._company(4, [0, 1], self.EDGAR.format(f"{years[0]}-{years[1]}"))
+        macro = MacroAssumptions()
+        # Unnoted zeros still count as reported 0% years (a pass-through).
+        self.assertAlmostEqual(effective_tax_rate_detail(gapped.financials, 0.21)[0], 0.105)
+        rate, source, note = effective_tax_rate_detail(noted.financials, 0.21,
+                                                       tax_gap_years(noted))
+        # Two clean years left: the marginal rate, with both reasons named.
+        self.assertEqual((rate, source), (0.21, "marginal (fallback)"))
+        self.assertIn(f"tax expense for FY{years[0]}, FY{years[1]} was not reported", note)
+        base = run_dcf(clean, macro, DCFAssumptions(), clean.market.price)
+        dcf = run_dcf(noted, macro, DCFAssumptions(), noted.market.price)
+        self.assertAlmostEqual(dcf.assumptions["tax_rate"], 0.21, places=12)
+        self.assertAlmostEqual(dcf.implied_price, base.implied_price, places=6)
+        self.assertTrue(any("was not reported (zero-filled by the data provider)" in n
+                            for n in dcf.assumptions["notes"]))
+        self.assertAlmostEqual(compute_wacc(noted, macro).detail["tax_rate"], 0.21, places=12)
+        # With enough clean years the effective rate stands, and the note says
+        # which years were left out.
+        five = self._company(5, [0], self.EDGAR.format(make_company().financials.fiscal_years[0]))
+        rate, source, note = effective_tax_rate_detail(five.financials, 0.30, tax_gap_years(five))
+        self.assertEqual(source, "effective (historical)")
+        self.assertAlmostEqual(rate, 0.21, places=12)
+        self.assertTrue(note.startswith("effective tax rate: tax expense for FY"), note)
+
+
+class ExplicitDAKeepsCapexFadeTests(unittest.TestCase):
+    def test_setting_the_derived_da_share_changes_nothing(self):
+        # CAVA-shaped (see CapexIntensityTests): an explicit D&A share equal to
+        # the derived one used to hold 15% capex flat to the terminal year.
+        rev = [1e9 * 1.24 ** i for i in range(5)]
+        ebit = [r * 0.05 for r in rev]
+        pretax = [e * 0.95 for e in ebit]
+        c = _company_from_revenue(
+            rev, ebit=ebit, pretax_income=pretax, tax_expense=[p * 0.21 for p in pretax],
+            net_income=[p * 0.79 for p in pretax], dep_amort=[r * 0.07 for r in rev],
+            capex=[r * 0.15 for r in rev], change_in_nwc=[0.0] * 5)
+        macro, price = MacroAssumptions(), c.market.price
+        derived = run_dcf(c, macro, DCFAssumptions(), price)
+        da = derived.assumptions["da_pct_revenue"]
+        explicit = run_dcf(c, macro, DCFAssumptions(da_pct_revenue=da), price)
+        self.assertEqual(explicit.assumptions["capex_pct_path"],
+                         derived.assumptions["capex_pct_path"])
+        self.assertLess(explicit.assumptions["capex_pct_path"][-1], 0.15)
+        self.assertAlmostEqual(explicit.implied_price, derived.implied_price, places=9)
+        # An explicit capex share is still held flat.
+        flat = run_dcf(c, macro, DCFAssumptions(da_pct_revenue=da, capex_pct_revenue=0.15), price)
+        self.assertEqual(flat.assumptions["capex_pct_path"], [0.15] * 5)
+
+
+class ZeroFilledInterestTests(unittest.TestCase):
+    def test_zero_latest_interest_is_not_a_measured_rate(self):
+        c = make_company()
+        ints = list(c.financials.interest_expense)
+        c = _with_fin(c, interest_expense=ints[:-1] + [0.0])
+        w = compute_wacc(c, MacroAssumptions())
+        self.assertIsNone(w.detail["interest_expense_latest"])
+        self.assertEqual(w.detail["cost_of_debt_source"], "rf + DEFAULT_CREDIT_SPREAD")
+        self.assertIn("latest interest expense zero or not reported; cost of debt not "
+                      "derivable; using rf+spread", w.detail["notes"])
+        self.assertFalse(any("0.0000" in n for n in w.detail["notes"]))
+
+
+class TerminalClampNoteScopeTests(unittest.TestCase):
+    def test_explicit_growth_path_is_not_said_to_fade_to_the_clamped_rate(self):
+        c = make_company()
+        macro, price = MacroAssumptions(), c.market.price
+        explicit = run_dcf(c, macro, DCFAssumptions(revenue_growth=[0.05] * 5,
+                                                    terminal_growth=0.20), price)
+        self.assertEqual(explicit.assumptions["revenue_growth_path"], [0.05] * 5)
+        note = next(n for n in explicit.assumptions["notes"] if "too close to WACC" in n)
+        self.assertTrue(note.endswith("(terminal value only; the explicit revenue_growth path "
+                                      "is unchanged)"), note)
+        derived = run_dcf(c, macro, DCFAssumptions(terminal_growth=0.20), price)
+        note = next(n for n in derived.assumptions["notes"] if "too close to WACC" in n)
+        self.assertTrue(note.endswith("(used in both fade path and terminal value)"), note)
+        self.assertAlmostEqual(derived.assumptions["revenue_growth_path"][-1],
+                               derived.assumptions["terminal_growth_used"], places=12)
+
+
+class NWCGapAndSignTests(unittest.TestCase):
+    def test_zero_filled_dnwc_years_are_gaps(self):
+        ratio, dropped = screened_incremental_ratio([0, 0, 0, 2, 3], [100, 110, 120, 130, 140])
+        self.assertAlmostEqual(ratio, 5.0 / 20.0)
+        self.assertEqual(dropped, [])
+        self.assertIsNone(incremental_ratio([0.0] * 4, [100, 110, 120, 130]))
+        c = make_company()
+        dnwc = list(c.financials.change_in_nwc)
+        gapped = _with_fin(c, change_in_nwc=[0.0, 0.0, 0.0] + dnwc[3:])
+        rev = c.financials.revenue
+        dcf = run_dcf(gapped, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        self.assertAlmostEqual(dcf.assumptions["nwc_pct_revenue"],
+                               sum(dnwc[3:]) / (rev[4] - rev[2]), places=12)
+        fcfe = run_fcfe(gapped, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        self.assertAlmostEqual(fcfe.detail["nwc_pct_delta_revenue"],
+                               dcf.assumptions["nwc_pct_revenue"], places=12)
+        # An all-zero series is a gap in both models. The FCFE says so unless
+        # a provider note already flags the missing line (EDGAR and the
+        # yfinance fallback both do).
+        zero = _with_fin(c, change_in_nwc=[0.0] * 5)
+        fcfe = run_fcfe(zero, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        self.assertEqual(fcfe.detail["nwc_pct_delta_revenue"], 0.0)
+        self.assertIn("No ΔNWC history (zero or unreported in every year); incremental NWC "
+                      "set to 0% of Δrevenue.", fcfe.detail["notes"])
+        self.assertFalse(any("Unstable" in n for n in fcfe.detail["notes"]))
+        edgar_note = ("change in net working capital (IncreaseDecreaseInOperatingCapital) not "
+                      "reported on EDGAR; left as 0.0, so the derived working-capital drag is "
+                      "zero unless nwc_pct_revenue is set")
+        on_fin = replace(zero, financials=replace(zero.financials))
+        on_fin.financials._source_notes = [edgar_note]
+        for noted in (replace(zero, source_notes=[edgar_note]), on_fin):
+            fcfe = run_fcfe(noted, MacroAssumptions(), DDMAssumptions(), c.market.price)
+            self.assertEqual(fcfe.detail["nwc_pct_delta_revenue"], 0.0)
+            self.assertFalse(any("ΔNWC" in n for n in fcfe.detail["notes"]), fcfe.detail["notes"])
+        # A non-zero history that gives no usable ratio keeps its own note.
+        flat = _with_fin(c, revenue=[100e9] * 5, change_in_nwc=[1e9, 0.0, 0.0, 0.0, 0.0])
+        fcfe = run_fcfe(flat, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        self.assertTrue(any(n.startswith("Unstable/absent ΔNWC history")
+                            for n in fcfe.detail["notes"]), fcfe.detail["notes"])
+
+    def test_negative_ratio_is_floored_not_called_implausible(self):
+        c = make_company()
+        released = _with_fin(c, change_in_nwc=[-v for v in c.financials.change_in_nwc])
+        dcf = run_dcf(released, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        fcfe = run_fcfe(released, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        self.assertEqual(dcf.assumptions["nwc_pct_revenue"], 0.0)
+        self.assertEqual(fcfe.detail["nwc_pct_delta_revenue"], 0.0)
+        for notes in (dcf.assumptions["notes"], fcfe.detail["notes"]):
+            self.assertTrue(any("is negative (working capital moved opposite to revenue); "
+                                "floored at 0" in n for n in notes), notes)
+            self.assertFalse(any("implausible" in n for n in notes), notes)
+        # Below -1 is still noise.
+        rev = [100e9, 100.05e9, 100.1e9, 99.9e9, 100.2e9]
+        noisy = _with_fin(c, revenue=rev, change_in_nwc=[-1e9] * 5)
+        dcf = run_dcf(noisy, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        self.assertTrue(any("implausible" in n for n in dcf.assumptions["notes"]))
+
+
+class OneYearHorizonFadeNoteTests(unittest.TestCase):
+    """With forecast_years=1 the single year already sits at the fade target,
+    and the WARNING notes say so instead of 'starts from it'."""
+
+    def test_charge_year(self):
+        c = _f_shaped()
+        dcf = run_dcf(c, MacroAssumptions(), DCFAssumptions(forecast_years=1), c.market.price)
+        a = dcf.assumptions
+        self.assertAlmostEqual(a["ebit_margin_path"][0], 0.0282, places=9)
+        note = next(n for n in a["notes"] if n.startswith("WARNING: latest EBIT margin -4.9%"))
+        self.assertIn("with a one-year horizon the forecast year and the terminal value use "
+                      "2.8%, the last profitable year's margin (below the prior median) directly "
+                      "(the loss year is not projected) -- set a target EBIT margin", note)
+        self.assertNotIn("starts from it", note)
+        self.assertNotIn("Impairments are non-cash", note)
+        fcfe = run_fcfe(c, MacroAssumptions(), DDMAssumptions(forecast_years=1), c.market.price)
+        d = fcfe.detail
+        self.assertEqual(len(d["net_margin_path"]), 1)
+        self.assertAlmostEqual(d["net_margin_path"][0], median([0.1316, -0.0125, 0.0247, 0.0318]),
+                               places=9)
+        note = next(n for n in d["notes"] if n.startswith("WARNING: latest net margin -4.4%"))
+        self.assertIn("with a one-year horizon the forecast year and the terminal value use the "
+                      "prior median net margin 2.8% directly (the loss year is not projected).",
+                      note)
+
+    def test_collapse_year(self):
+        c = _jd_shaped()
+        dcf = run_dcf(c, MacroAssumptions(), DCFAssumptions(forecast_years=1), c.market.price)
+        note = next(n for n in dcf.assumptions["notes"]
+                    if "is below a third of the prior median" in n)
+        self.assertIn("with a one-year horizon the forecast year and the terminal value use", note)
+        self.assertIn("(the trough year is not projected) -- set a target EBIT margin", note)
+        five = run_dcf(c, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        self.assertTrue(any("the projection starts from it and fades to" in n and "by year 5" in n
+                            for n in five.assumptions["notes"]))
+
+
+class AttributedCollapseTests(unittest.TestCase):
+    """A provider-marked common-income attribution (noncontrolling or preferred
+    income, set for most large filers) no longer switches off the BP-style
+    collapse screen in comps and FCFE, or the FCFE's EBIT-spike adjustment:
+    both run on a common basis."""
+
+    REV = [181.8e9, 158.3e9, 142.5e9, 142.6e9]
+    NCI = 0.9e9  # the latest year's noncontrolling income
+
+    def _bp(self, ni_margins=(-0.0103, 0.0725, 0.0020, 0.0003), tax_latest=None):
+        ebit = [r * m for r, m in zip(self.REV, [0.1717, 0.1478, 0.0720, 0.0835])]
+        c = _company_from_revenue(self.REV, ebit=ebit, interest_expense=[3.86e9] * 4,
+                                  net_income=[r * m for r, m in zip(self.REV, ni_margins)])
+        f = c.financials
+        # Latest year: consolidated profit = common net income + NCI, after an
+        # abnormal tax charge; earlier years keep the fixture's 21% tax.
+        pretax = list(f.pretax_income)
+        pretax[-1] = ebit[-1] - 3.86e9
+        tax = list(f.tax_expense)
+        tax[-1] = (pretax[-1] - f.net_income[-1] - self.NCI) if tax_latest is None else tax_latest
+        fin = replace(f, pretax_income=pretax, tax_expense=tax)
+        fin._income_attribution_adjusted = True
+        return replace(c, financials=fin)
+
+    def test_bp_shaped_screen_runs_on_a_common_basis(self):
+        c = self._bp()
+        fin = c.financials
+        collapse = net_margin_collapse(fin)
+        noncommon = self.NCI / self.REV[-1]
+        self.assertAlmostEqual(collapse["noncommon"], noncommon, places=12)
+        consolidated = (fin.ebit[-1] - 3.86e9) * (1 - 0.21) / self.REV[-1]
+        self.assertAlmostEqual(collapse["implied"], consolidated - noncommon, places=12)
+        # Comps leave out the P/E-implied price, naming the deduction.
+        comps = run_comps(c, SyntheticProvider(), DEMO_PEERS, c.market.price)
+        self.assertIsNone(comps.implied["pe"])
+        note = next(n for n in comps.notes if n.startswith(EARNINGS_COLLAPSE_NOTE_PREFIX))
+        self.assertIn("implies after interest, tax and noncontrolling/preferred income", note)
+        # FCFE projects from the common-basis implied margin.
+        fcfe = run_fcfe(c, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        self.assertAlmostEqual(fcfe.detail["net_margin"], consolidated - noncommon, places=12)
+        note = next(n for n in fcfe.detail["notes"] if "far below" in n)
+        self.assertTrue(note.startswith("WARNING: latest net margin 0.0% is far below"), note)
+        self.assertIn(f"and noncontrolling/preferred income ({noncommon:.1%} of revenue)", note)
+        self.assertFalse(any("attribution retained" in n for n in fcfe.detail["notes"]))
+
+    def test_what_keeps_the_reported_common_margin(self):
+        # A thin margin in line with its own history (the prior-median guard).
+        thin = self._bp(ni_margins=(0.0012, 0.0010, 0.0011, 0.0009))
+        self.assertIsNone(net_margin_collapse(thin.financials))
+        self.assertIsNotNone(run_comps(thin, SyntheticProvider(), DEMO_PEERS,
+                                       thin.market.price).implied["pe"])
+        # Unreconcilable latest year (tax zero-filled): the reported margin is
+        # kept, with the attribution note, as before.
+        gap = self._bp(tax_latest=0.0)
+        self.assertIsNone(net_margin_collapse(gap.financials))
+        fcfe = run_fcfe(gap, MacroAssumptions(), DDMAssumptions(), gap.market.price)
+        f = gap.financials
+        self.assertAlmostEqual(fcfe.detail["net_margin"], f.net_income[-1] / f.revenue[-1],
+                               places=12)
+        self.assertTrue(any("Common earnings attribution retained" in n
+                            for n in fcfe.detail["notes"]))
+
+    def test_ebit_spike_is_taken_out_at_the_common_share(self):
+        # SOLV-shaped disposal gain in EBIT; common holders get 90% of
+        # consolidated profit.
+        rev = [8.10e9, 8.13e9, 8.20e9, 8.25e9, 8.33e9]
+        margins = [0.208, 0.208, 0.206, 0.126, 0.262]
+        c = _company_from_revenue(rev, ebit=[r * m for r, m in zip(rev, margins)])
+        f = c.financials
+        ni = [0.9 * (p - t) for p, t in zip(f.pretax_income, f.tax_expense)]
+        fin = replace(f, net_income=ni)
+        fin._income_attribution_adjusted = True
+        c = replace(c, financials=fin)
+        fcfe = run_fcfe(c, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        reported = ni[-1] / rev[-1]
+        self.assertAlmostEqual(fcfe.detail["net_margin"],
+                               reported - (0.262 - 0.208) * (1.0 - 0.21) * 0.9, places=9)
+        self.assertTrue(any("after-tax excess" in n and "common holders' 90% share" in n
+                            for n in fcfe.detail["notes"]), fcfe.detail["notes"])
+
+
+class DDMHighGrowthContinuityTests(unittest.TestCase):
+    """Stage-1 growth no longer jumps when the latest net income crosses zero
+    (BP.L: 3.43 at a tiny profit, 5.57 at a tiny loss)."""
+
+    def test_tiny_profit_and_tiny_loss_give_the_same_growth(self):
+        c = make_company()
+        macro, price = MacroAssumptions(), c.market.price
+        ni = list(c.financials.net_income)
+        results = {}
+        for sign in (1.0, -1.0):
+            moved = _with_fin(c, net_income=ni[:-1] + [sign * 3e5])
+            notes: list[str] = []
+            self.assertEqual(_sustainable_growth(moved.financials, moved, notes), 0.0)
+            results[sign] = run_ddm(moved, macro, DDMAssumptions(), price)
+        self.assertEqual(results[1.0].detail["high_growth"], 0.0)
+        self.assertEqual(results[-1.0].detail["high_growth"], 0.0)
+        self.assertAlmostEqual(results[1.0].implied_price, results[-1.0].implied_price, places=9)
+        self.assertTrue(any("Latest net income is not positive" in n
+                            for n in results[-1.0].detail["notes"]))
+        # Book equity is still checked first.
+        neg = _with_bs(_with_fin(c, net_income=ni[:-1] + [-1e9]), total_equity=-1e9)
+        self.assertIsNone(_sustainable_growth(neg.financials, neg))
+
+
+class DDMPayoutAtD0Tests(unittest.TestCase):
+    """Retention uses the payout of the dividend being discounted (D0), not
+    last year's cash dividends after a reset (NVDA, PGR)."""
+
+    def test_dividend_reset(self):
+        c = make_company()
+        f = c.financials
+        divs = list(f.dividends_paid)
+        reset = _with_fin(c, dividends_paid=divs[:-1] + [0.01 * f.net_income[-1]])
+        roe = f.net_income[-1] / c.balance_sheet.total_equity
+        notes: list[str] = []
+        sg = _sustainable_growth(reset.financials, reset, notes)
+        self.assertAlmostEqual(sg, roe * (1.0 - 0.30), places=12)  # D0 payout 30%
+        fy = f.fiscal_years[-1]
+        # The note states both figures and does not claim one cause: a one-off
+        # special in that year's dividends paid or a changed share count can
+        # open the same gap (BABA: 16.4% at D0 against 31.9% paid).
+        self.assertTrue(any(n == f"Retention uses the payout at the current dividend D0 (30.0% "
+                                 f"of FY{fy} net income); FY{fy} dividends paid were 1.0% of it "
+                                 "(a changed dividend rate, a one-off special dividend in that "
+                                 "year or a changed share count can explain the difference)."
+                            for n in notes), notes)
+        self.assertFalse(any("has changed since" in n for n in notes), notes)
+        # In line (the demo): no note, same growth as before.
+        notes = []
+        self.assertAlmostEqual(_sustainable_growth(f, c, notes), roe * 0.70, places=12)
+        self.assertFalse(any("Retention uses" in n for n in notes))
+        # Without a market share count, the year's dividends paid are used.
+        no_shares = _with_market(reset, shares_outstanding=None)
+        self.assertAlmostEqual(_sustainable_growth(no_shares.financials, no_shares),
+                               roe * 0.99, places=12)
+
+
+class ShareScaleBreakTests(unittest.TestCase):
+    """MCD's later 10-Ks tag FY2021-25 diluted shares in millions: the EPS CAGR
+    read 668.6%/yr (PEG 0.03) and the DDM saw a dividend break that did not
+    happen."""
+
+    MCD = [785.6e6, 764.9e6, 750.1e6, 751.8, 741.3, 732.3, 721.9, 716.4]
+
+    def _fin(self):
+        n = len(self.MCD)
+        fin = _company_from_revenue([25e9 * 1.03 ** i for i in range(n)]).financials
+        divs = [3.0e9 * 1.07 ** i for i in range(n)]
+        return replace(fin, dividends_paid=divs, diluted_shares=list(self.MCD))
+
+    def test_rule(self):
+        pos, ratio = share_scale_break(self.MCD)
+        self.assertEqual(pos, 3)
+        self.assertAlmostEqual(ratio, 751.8 / 750.1e6)
+        self.assertIsNone(share_scale_break([100.0, 50.0, 1000.0, 0.0, 990.0]))  # splits, a gap
+        self.assertIsNone(share_scale_break([]))
+
+    def test_models_fall_back_to_totals(self):
+        fin = self._fin()
+        self.assertIsNone(_eps_cagr(fin))
+        notes: list[str] = []
+        self.assertAlmostEqual(_dividend_cagr(fin, notes), 0.07, places=12)
+        self.assertTrue(any(n.startswith("Diluted share counts change scale by about "
+                                         "1,000,000x in FY") and "not a split" in n
+                            for n in notes), notes)
+        self.assertFalse(any("more than doubled" in n for n in notes))
+        c = replace(make_company(), financials=fin)
+        comps = run_comps(c, SyntheticProvider(), DEMO_PEERS, c.market.price)
+        self.assertIsNone(comps.target.peg)
+
+
+class OperatingLeaseClaimTests(unittest.TestCase):
+    """Peer EVs from the market data include operating-lease liabilities; when
+    the target's balance sheet carries them, they are claims on the same basis
+    (MCD: implied EV/EBITDA price 305.66 against 284.85). The field is
+    optional: EDGAR fills it from the operating-lease tags (see
+    test_edgar_parsing), the synthetic company leaves it None."""
+
+    def test_synthetic_company_has_no_lease(self):
+        from equity_valuation.models.comps import operating_lease_claim
+        c = make_company()
+        self.assertIsNone(c.balance_sheet.operating_lease_liability)
+        self.assertEqual(operating_lease_claim(c.balance_sheet), 0.0)
+        self.assertEqual(operating_lease_claim(None), 0.0)
+        for bad in (0.0, -5.0, float("nan")):
+            self.assertEqual(operating_lease_claim(
+                replace(c.balance_sheet, operating_lease_liability=bad)), 0.0)
+
+    def test_lease_is_added_to_ev_and_stripped_in_the_bridge(self):
+        c = make_company()
+        price = c.market.price
+        base = run_comps(c, SyntheticProvider(), DEMO_PEERS, price)
+        lease = 6e9
+        leased = replace(c, balance_sheet=replace(c.balance_sheet,
+                                                  operating_lease_liability=lease))
+        comps = run_comps(leased, SyntheticProvider(), DEMO_PEERS, price)
+        shares = c.market.shares_outstanding
+        for m in ("ev_ebitda", "ev_sales"):
+            self.assertAlmostEqual(base.implied[m] - comps.implied[m], lease / shares,
+                                   places=9, msg=m)
+        for m in ("pe", "pb"):
+            self.assertEqual(comps.implied[m], base.implied[m], m)
+        self.assertAlmostEqual(comps.target.enterprise_value - base.target.enterprise_value,
+                               lease, delta=1.0)
+        self.assertTrue(any(n.startswith("EV multiples: the peers' EVs include operating-lease "
+                                         "liabilities") and "6.00B USD" in n
+                            for n in comps.notes), comps.notes)
+        self.assertFalse(any("operating-lease" in n for n in base.notes))
+        # The DCF does not read it: its FCFF is already after lease costs.
+        self.assertEqual(run_dcf(leased, MacroAssumptions(), DCFAssumptions(), price).implied_price,
+                         run_dcf(c, MacroAssumptions(), DCFAssumptions(), price).implied_price)
+        # The football field's EV/EBITDA band re-prices on the same bridge.
+        report = value_company("LEASE", provider=_OneCompanyProvider(leased), peers=DEMO_PEERS)
+        row = next(r for r in report.football_field if r.method == "EV/EBITDA comps")
+        stats = report.comps.stats["ev_ebitda"]
+        ebitda = c.financials.ebitda[-1]
+        net_debt = c.balance_sheet.total_debt - c.balance_sheet.cash_and_investments
+        self.assertAlmostEqual(row.low, (stats["p25"] * ebitda - net_debt - lease) / shares,
+                               places=6)
+        sales = next(r for r in report.football_field if r.method == "EV/Sales comps")
+        stats = report.comps.stats["ev_sales"]
+        rev = c.financials.revenue[-1]
+        self.assertAlmostEqual(sales.high, (stats["p75"] * rev - net_debt - lease) / shares,
+                               places=6)
+
+    def test_no_lease_note_when_ev_multiples_give_no_price(self):
+        # JPM: its comps said a 9.47B operating-lease liability "is added to its
+        # EV and subtracted in the EV-to-equity bridge", then that EV/EBITDA
+        # and EV/Sales give no price. An equity-only target gets the second
+        # note alone; an ordinary one keeps the first.
+        price = make_company().market.price
+        for kind in ("bank", "insurer", "captive_finance", "lessor"):
+            target = _with_kind(_with_bs(make_company(), operating_lease_liability=6e9), kind)
+            comps = run_comps(target, SyntheticProvider(), DEMO_PEERS, price)
+            self.assertTrue(comps.peers, kind)
+            self.assertFalse(any(n.startswith("EV multiples:") for n in comps.notes),
+                             (kind, comps.notes))
+            self.assertTrue(any(n.startswith("Equity multiples only") for n in comps.notes), kind)
+        plain = _with_bs(make_company(), operating_lease_liability=6e9)
+        comps = run_comps(plain, SyntheticProvider(), DEMO_PEERS, price)
+        self.assertTrue(any(n.startswith("EV multiples:") for n in comps.notes), comps.notes)
+
+
+class EBITSpikeWarningTests(unittest.TestCase):
+    """The FCFE note for a net margin moved by a one-off EBIT margin is
+    WARNING-prefixed when the move flips the margin's sign or reaches 5pp
+    (GIS: -0.5% -> 9.4%, which replaced the WARNING charge-year fade)."""
+
+    REV = [8.10e9, 8.13e9, 8.20e9, 8.25e9, 8.33e9]
+
+    def _notes(self, margins, net_latest=None):
+        rev = self.REV
+        c = _company_from_revenue(rev, ebit=[r * m for r, m in zip(rev, margins)])
+        if net_latest is not None:
+            c = _with_fin(c, net_income=c.financials.net_income[:-1] + [net_latest * rev[-1]])
+        fcfe = run_fcfe(c, MacroAssumptions(), DDMAssumptions(), c.market.price)
+        return fcfe.detail, [n for n in fcfe.detail["notes"] if "after-tax excess" in n]
+
+    def test_solv_sized_move_keeps_the_plain_note(self):
+        # 5.4pp of EBIT x 79% = 4.3pp of net margin, same sign.
+        _, notes = self._notes([0.208, 0.208, 0.206, 0.126, 0.262])
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith("Latest EBIT margin 26.2%"), notes)
+
+    def test_large_move_is_a_warning(self):
+        # 9.2pp of EBIT x 79% = 7.3pp of net margin.
+        detail, notes = self._notes([0.208, 0.208, 0.206, 0.200, 0.300])
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith("WARNING: latest EBIT margin 30.0%"), notes)
+
+    def test_sign_flip_is_a_warning(self):
+        # GIS-shaped: a charge inside EBIT and a small net loss; the EBIT
+        # shortfall's after-tax amount turns the loss into a profit, so the
+        # charge-year fade does not run.
+        detail, notes = self._notes([0.17, 0.17, 0.17, 0.17, 0.10], net_latest=-0.005)
+        self.assertAlmostEqual(detail["net_margin"], -0.005 + 0.07 * (1.0 - 0.21), places=9)
+        self.assertNotIn("net_margin_path", detail)
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith("WARNING: latest EBIT margin 10.0%"), notes)
+        self.assertIn("-0.5% -> 5.0%", notes[0])
+        report = SimpleNamespace(warnings=[])
+        _add_notes(report, "FCFE", notes)
+        self.assertTrue(report.warnings[0].startswith("WARNING: FCFE: latest EBIT margin"))
+
+
+class TaxGapNoteWordingTests(unittest.TestCase):
+    """``wacc.tax_gap_years`` reads the providers' gap notes, so a partial tax
+    gap run through the real EDGAR and yfinance-fallback parsers (offline
+    fixtures from their own test modules) must come back as gap years: a
+    wording change there would otherwise switch the rule off silently."""
+
+    def test_edgar_partial_tax_gap(self):
+        from tests.test_edgar_parsing import _base_usd, _parse
+        usd = _base_usd()
+        usd["IncomeTaxExpenseBenefit"] = [e for e in usd["IncomeTaxExpenseBenefit"]
+                                          if e["end"][:4] not in ("2022", "2023")]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.tax_expense[3:5], [0.0, 0.0])
+        self.assertEqual(tax_gap_years(fin), {2022, 2023}, notes)
+        rate, _source, note = effective_tax_rate_detail(fin, 0.30, tax_gap_years(fin))
+        self.assertIn("FY2022, FY2023", note)
+        # The clean fixture has no gap years.
+        clean, _bs, _notes = _parse(_base_usd())
+        self.assertEqual(tax_gap_years(clean), frozenset())
+
+    def test_yfinance_fallback_partial_tax_gap(self):
+        from tests.test_market_data import NaN, balance, cashflow, client, income, ticker
+        tk = ticker({"currency": "USD", "financialCurrency": "USD"},
+                    fin=income(**{"Tax Provision": [42, NaN, -34, 30, NaN]}),
+                    cf=cashflow(), bs=balance())
+        fin, _bs = client({"X": tk}).get_annual_financials_fallback("X")
+        self.assertEqual(fin.fiscal_years[2], 2023)
+        self.assertEqual(fin.tax_expense[2], 0.0)
+        self.assertEqual(tax_gap_years(fin), {2023}, fin._source_notes)
+
+
+
+# --------------------------------------------------------------------------- #
+#  Thin peer sets, flagged companies without EBIT, corporate actions and
+#  charge years inside EBIT
+# --------------------------------------------------------------------------- #
+def _peer(ticker, ev_ebitda=None, ev_sales=None, pe=None, pb=None, peg=None):
+    return CompRow(ticker=ticker, name=ticker, market_cap=5e10, enterprise_value=5.2e10,
+                   ev_ebitda=ev_ebitda, ev_sales=ev_sales, pe=pe, pb=pb, peg=peg,
+                   currency="USD")
+
+
+class CompsMinPeerValuesTests(unittest.TestCase):
+    """A multiple gives an implied price only from at least
+    ``config.COMPS_MIN_PEER_VALUES`` (3) usable peer values: below that the
+    outlier trim cannot act, and one peer's multiple (or the mean of two)
+    would set the price. GM's discovered peers gave a P/E from TSLA alone
+    (about 430x) and 'Undervalued +1061%'."""
+
+    FULL = dict(ev_ebitda=20.0, ev_sales=4.8, pe=21.0, pb=5.8, peg=1.8)
+
+    def _comps(self, company, rows):
+        return run_comps(company, _PeerRowsProvider(company, rows),
+                         [r.ticker for r in rows], company.market.price)
+
+    def _note(self, comps):
+        return next(n for n in comps.notes if n.startswith(FEW_PEER_VALUES_NOTE_PREFIX))
+
+    def test_threshold(self):
+        self.assertEqual(config.COMPS_MIN_PEER_VALUES, 3)
+
+    def test_one_or_two_peers_give_no_price(self):
+        company = make_company()
+        for n in (1, 2):
+            with self.subTest(peers=n):
+                rows = [_peer(f"P{i}", **self.FULL) for i in range(n)]
+                comps = self._comps(company, rows)
+                self.assertTrue(all(v is None for v in comps.implied.values()), comps.implied)
+                self.assertIsNone(comps.implied_price_summary["median"])
+                # The peer statistics are still shown.
+                self.assertEqual(comps.stats["pe"]["n"], n)
+                self.assertAlmostEqual(comps.stats["pe"]["median"], 21.0)
+                values = "1 usable value" if n == 1 else "2 usable values"
+                self.assertEqual(
+                    self._note(comps),
+                    "Too few peer values (at least 3 needed): "
+                    f"EV/EBITDA has {values}, EV/Sales has {values}, P/E has {values} and "
+                    f"P/B has {values}, so they give no implied price: a multiple from "
+                    "fewer than 3 peers is their valuation, not a peer median.")
+                self.assertIn("No implied prices could be derived from the peer medians.",
+                              comps.notes)
+                report = value_company("SYNT", provider=_PeerRowsProvider(company, rows),
+                                       peers=[r.ticker for r in rows])
+                self.assertNotIn("Comps (median)", report.summary["methods"])
+                self.assertIn(f"Comps: {self._note(comps)}", report.warnings)
+
+    def test_the_note_follows_the_configured_threshold(self):
+        company = make_company()
+        rows = [_peer(f"P{i}", **self.FULL) for i in range(3)]
+        with mock.patch.object(config, "COMPS_MIN_PEER_VALUES", 4):
+            comps = self._comps(company, rows)
+        note = self._note(comps)
+        self.assertTrue(note.startswith("Too few peer values (at least 4 needed): "), note)
+        self.assertTrue(note.endswith("a multiple from fewer than 4 peers is their valuation, "
+                                      "not a peer median."), note)
+
+    def test_only_the_thin_multiple_is_dropped(self):
+        company = make_company()
+        rows = [_peer("P1", **self.FULL),
+                _peer("P2", **{**self.FULL, "pe": None, "ev_ebitda": 22.0}),
+                _peer("P3", **{**self.FULL, "pe": -8.0, "ev_ebitda": 18.0})]
+        comps = self._comps(company, rows)
+        self.assertIsNone(comps.implied["pe"])
+        for m in ("ev_ebitda", "ev_sales", "pb"):
+            self.assertIsNotNone(comps.implied[m], m)
+        self.assertIn("P/E has 1 usable value, so it gives no implied price", self._note(comps))
+        self.assertNotIn("EV/EBITDA", self._note(comps))
+
+    def test_values_trimmed_below_three_give_no_price(self):
+        # Three P/Es, one more than 3x the median: two are left after the trim.
+        company = make_company()
+        rows = [_peer("P1", **self.FULL), _peer("P2", **{**self.FULL, "pe": 18.0}),
+                _peer("P3", **{**self.FULL, "pe": 70.0})]
+        comps = self._comps(company, rows)
+        self.assertEqual(comps.stats["pe"]["n"], 2)
+        self.assertIsNone(comps.implied["pe"])
+        self.assertIn("P/E has 2 usable values", self._note(comps))
+
+    def test_three_values_keep_the_demo_pins(self):
+        report = value_company("SYNT", provider=SyntheticProvider(), peers=DEMO_PEERS)
+        self.assertTrue(all(report.comps.stats[m]["n"] == 3 for m in config.COMPS_MULTIPLES))
+        self.assertFalse(any(n.startswith(FEW_PEER_VALUES_NOTE_PREFIX)
+                             for n in report.comps.notes))
+        self.assertAlmostEqual(report.comps.implied_price_summary["median"], 46.96, places=2)
+        self.assertAlmostEqual(report.summary["blended_target"], 32.40, places=2)
+
+    def test_captive_finance_target_with_a_single_pe_peer(self):
+        # GM-shaped: comps use P/E and P/B only. Of F, RIVN and TSLA only TSLA
+        # has a P/E (430x); all three have a P/B.
+        gm = _with_kind(_with_market(make_company(), industry="Auto Manufacturers",
+                                     sector="Consumer Cyclical"), "captive_finance")
+        rows = [_peer("F", ev_ebitda=9.0, ev_sales=0.9, pe=None, pb=1.1),
+                _peer("RIVN", ev_sales=3.0, pe=None, pb=2.0),
+                _peer("TSLA", ev_ebitda=110.0, ev_sales=15.0, pe=430.0, pb=5.0)]
+        comps = self._comps(gm, rows)
+        self.assertIsNone(comps.implied["pe"])
+        self.assertIsNotNone(comps.implied["pb"])
+        self.assertEqual(comps.implied_price_summary["median"], comps.implied["pb"])
+        note = self._note(comps)
+        self.assertIn("P/E has 1 usable value, so it gives no implied price", note)
+        # The EV multiples give a captive no price anyway, so they are not named.
+        self.assertNotIn("EV/", note)
+        # What the single peer would have given: a price over 20x the market's.
+        with mock.patch.object(config, "COMPS_MIN_PEER_VALUES", 1):
+            single = self._comps(gm, rows)
+        self.assertGreater(single.implied["pe"], 20 * gm.market.price)
+        report = value_company("GM", provider=_PeerRowsProvider(gm, rows),
+                               peers=[r.ticker for r in rows])
+        self.assertAlmostEqual(report.summary["methods"]["Comps (median)"],
+                               comps.implied["pb"], places=9)
+        self.assertTrue(any(w.startswith(f"Comps: {FEW_PEER_VALUES_NOTE_PREFIX}")
+                            for w in report.warnings))
+
+
+class NoOperatingMarginTests(unittest.TestCase):
+    """A flagged company with no usable EBIT (GS: revenue net of interest
+    expense but no operating income line) gets no reference DCF price instead
+    of a 0% margin projection (GS: -1,063 a share). Its FCFE projects the net
+    margin, which it still has."""
+
+    def setUp(self):
+        base = _with_market(make_company(), industry="Capital Markets",
+                            sector="Financial Services")
+        n = len(base.financials.revenue)
+        self.bank = _with_kind(_with_fin(base, ebit=[0.0] * n), "bank")
+
+    def test_reference_dcf_is_unavailable(self):
+        dcf = run_dcf(self.bank, MacroAssumptions(), DCFAssumptions(), self.bank.market.price)
+        a = dcf.assumptions
+        self.assertIs(a["valuation_available"], False)
+        self.assertEqual(dcf.implied_price, 0.0)
+        self.assertIsNone(available_model_price(dcf))
+        self.assertIn(NO_EBIT_NOTE, a["notes"])
+        self.assertNotIn("EBIT margin unavailable; defaulting to 0", a["notes"])
+        # Every sensitivity cell is blank too.
+        for grid in dcf_sensitivity(self.bank, MacroAssumptions(), DCFAssumptions(),
+                                    self.bank.market.price):
+            self.assertTrue(all(math.isnan(c) for row in grid.grid for c in row))
+
+    def test_engine_shows_no_dcf_price_and_keeps_the_fcfe(self):
+        report = value_company("GS", provider=_OneCompanyProvider(self.bank), peers=DEMO_PEERS)
+        self.assertNotIn("DCF", [r.method.split(" ")[0] for r in report.football_field])
+        self.assertIn("DCF", report.summary["excluded_from_blend"])
+        self.assertIn(f"DCF: {NO_EBIT_NOTE}", report.warnings)
+        fin = self.bank.financials
+        self.assertAlmostEqual(report.fcfe.detail["net_margin"],
+                               fin.net_income[-1] / fin.revenue[-1], places=12)
+        self.assertIsNotNone(available_model_price(report.fcfe))
+
+    def test_an_explicit_target_margin_still_projects(self):
+        dcf = run_dcf(self.bank, MacroAssumptions(), DCFAssumptions(target_ebit_margin=0.30),
+                      self.bank.market.price)
+        self.assertIs(dcf.assumptions["valuation_available"], True)
+        self.assertGreater(dcf.implied_price, 0)
+        self.assertIn("EBIT margin unavailable; defaulting to 0", dcf.assumptions["notes"])
+
+    def test_an_unflagged_company_keeps_the_zero_margin_default(self):
+        n = len(make_company().financials.revenue)
+        c = _with_fin(make_company(), ebit=[0.0] * n, pretax_income=[0.0] * n)
+        dcf = run_dcf(c, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        self.assertIs(dcf.assumptions["valuation_available"], True)
+        self.assertIn("EBIT margin unavailable; defaulting to 0", dcf.assumptions["notes"])
+
+    def test_a_lessor_with_no_pretax_income_says_so(self):
+        # A lessor's EBIT is rebuilt from pretax income + interest, so the
+        # bank wording (not rebuilt) would be wrong for it.
+        n = len(make_company().financials.revenue)
+        lessor = _with_kind(_with_fin(make_company(), ebit=[0.0] * n,
+                                      pretax_income=[0.0] * n), "lessor")
+        dcf = run_dcf(lessor, MacroAssumptions(), DCFAssumptions(), lessor.market.price)
+        self.assertIs(dcf.assumptions["valuation_available"], False)
+        self.assertIn(
+            "EBIT margin unavailable: no operating income is reported, nor pretax income to "
+            "rebuild it from (pretax income plus interest), so the DCF gives no reference "
+            "price instead of projecting a 0% margin -- set a target EBIT margin to project "
+            "one", dcf.assumptions["notes"])
+        self.assertNotIn(NO_EBIT_NOTE, dcf.assumptions["notes"])
+
+    def test_no_terminal_diagnostics_for_the_unpriced_projection(self):
+        # The bank's 0%-margin projection has a negative terminal FCFF (capex
+        # above D&A), but no price is given, so no note reviews it.
+        dcf = run_dcf(self.bank, MacroAssumptions(), DCFAssumptions(), self.bank.market.price)
+        self.assertLess(dcf.assumptions["terminal_fcff"], 0)
+        self.assertEqual(dcf.assumptions["notes"], [NO_EBIT_NOTE])
+        report = value_company("GS", provider=_OneCompanyProvider(self.bank), peers=DEMO_PEERS)
+        self.assertFalse(any("first stable-year FCFF is negative" in w
+                             for w in report.warnings))
+        # Nor, under the value-driver method, a note on the RONIC it used.
+        vd = run_dcf(self.bank, MacroAssumptions(), DCFAssumptions(terminal_method="value_driver"),
+                     self.bank.market.price)
+        self.assertEqual(vd.assumptions["notes"], [NO_EBIT_NOTE])
+        # A priced projection keeps the note.
+        priced = run_dcf(self.bank, MacroAssumptions(),
+                         DCFAssumptions(target_ebit_margin=0.001), self.bank.market.price)
+        self.assertIn("first stable-year FCFF is negative, so the Gordon terminal value "
+                      "capitalises a perpetual cash outflow; review the EBIT margin and "
+                      "reinvestment drivers", priced.assumptions["notes"])
+
+    def test_no_driver_notes_for_the_unpriced_projection(self):
+        # JPM: "capex %revenue unavailable; defaulting to 0"; GS: "capex 9.8% of
+        # revenue is growth-phase". Neither describes a price the reports show.
+        n = len(self.bank.financials.revenue)
+        rev = self.bank.financials.revenue
+        # (A dataclass copy drops the kind marker, so it is set again.)
+        no_lines = _with_kind(_with_fin(self.bank, capex=[0.0] * n, dep_amort=[0.0] * n,
+                                        ebitda=[0.0] * n), "bank")
+        growth = _with_kind(_with_fin(self.bank, capex=[r * 0.20 for r in rev]), "bank")
+        drivers = ("capex %revenue unavailable", "D&A %revenue unavailable", "growth-phase")
+        for company in (no_lines, growth):
+            dcf = run_dcf(company, MacroAssumptions(), DCFAssumptions(), company.market.price)
+            self.assertIsNone(available_model_price(dcf))
+            self.assertEqual(dcf.assumptions["notes"], [NO_EBIT_NOTE])
+            # A projection with a price keeps them.
+            priced = run_dcf(company, MacroAssumptions(), DCFAssumptions(target_ebit_margin=0.30),
+                             company.market.price)
+            self.assertTrue(any(d in note for d in drivers
+                                for note in priced.assumptions["notes"]),
+                            priced.assumptions["notes"])
+
+    def test_the_financial_warning_says_the_dcf_has_no_reference_price(self):
+        report = value_company("GS", provider=_OneCompanyProvider(self.bank), peers=DEMO_PEERS)
+        fi = [w for w in report.warnings if w.startswith("Financial institution (")]
+        self.assertEqual(len(fi), 1, report.warnings)
+        self.assertTrue(fi[0].endswith(
+            "do not describe the business. The FCFE is shown for reference only and left out "
+            "of the blended target; the DCF has no reference price (no operating income is "
+            "reported)."), fi[0])
+        self.assertNotIn("Both are shown", fi[0])
+        # A captive-finance group in the same position; without the FCFE too.
+        captive = _with_kind(self.bank, "captive_finance")
+        report = value_company("GM", provider=_OneCompanyProvider(captive), peers=DEMO_PEERS)
+        cf = [w for w in report.warnings if w.startswith("Captive finance arm: ")
+              and "FCFF DCF" in w]
+        self.assertEqual(len(cf), 1, report.warnings)
+        self.assertTrue(cf[0].endswith(
+            "describe neither business, so the FCFE is shown for reference only and left out "
+            "of the blended target; the DCF has no reference price (no operating income is "
+            "reported)."), cf[0])
+        report = value_company("GS", provider=_OneCompanyProvider(self.bank), peers=DEMO_PEERS,
+                               run_fcfe=False)
+        fi = [w for w in report.warnings if w.startswith("Financial institution (")]
+        self.assertTrue(fi[0].endswith("do not describe the business. The DCF has no reference "
+                                       "price (no operating income is reported)."), fi[0])
+        # A priced reference DCF keeps the usual wording.
+        report = value_company("GS", provider=_OneCompanyProvider(self.bank), peers=DEMO_PEERS,
+                               dcf_assumptions=DCFAssumptions(target_ebit_margin=0.30))
+        fi = [w for w in report.warnings if w.startswith("Financial institution (")]
+        self.assertTrue(fi[0].endswith("Both are shown for reference only and left out of the "
+                                       "blended target."), fi[0])
+
+
+class CorporateActionVerdictTests(unittest.TestCase):
+    """After a corporate action the data layer flags as likely a spin-off (HON
+    after the Aerospace spin-off), the statements may still include the
+    business that left, while the price and share count no longer do: the
+    target is kept for reference, with no verdict or upside."""
+
+    @staticmethod
+    def _note(fy_end=None):
+        import datetime
+
+        from equity_valuation.data.provider import _corporate_action_warning
+
+        c = make_company()
+        return _corporate_action_warning([(datetime.date(2025, 6, 29), 0.9535)],
+                                         c.financials, fy_end or datetime.date(2024, 12, 31),
+                                         c.market.shares_outstanding)
+
+    def _report(self, notes):
+        company = replace(make_company(), source_notes=list(notes))
+        return value_company("SYNT", provider=_OneCompanyProvider(company), peers=DEMO_PEERS)
+
+    def test_the_data_layer_note_has_the_engine_prefix(self):
+        from equity_valuation.engine import CORPORATE_ACTION_NOTE_PREFIX
+
+        self.assertTrue(self._note().startswith(CORPORATE_ACTION_NOTE_PREFIX))
+
+    def test_verdict_and_upside_are_withheld(self):
+        report = self._report([self._note()])
+        s = report.summary
+        self.assertAlmostEqual(s["blended_target"], 32.40, places=2)  # kept
+        self.assertEqual(s["recommendation"], "N/A")
+        self.assertIsNone(s["blended_upside"])
+        self.assertEqual(s["verdict_withheld"], "a corporate action after FY2024 (likely a "
+                                                "spin-off)")
+        self.assertIn(self._note(), report.warnings)
+        self.assertIn(
+            "Corporate action: no verdict or upside is given. The blended target is shown for "
+            "reference only: Yahoo records a corporate action after FY2024 that is not a plain "
+            "split, so the FY2024 statements behind it may still include a business the "
+            "company no longer owns, while the price and share count no longer do.",
+            report.warnings)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _print_summary(report)
+        row = next(ln for ln in out.getvalue().splitlines()
+                   if ln.lstrip().startswith("Blended target"))
+        self.assertTrue(row.rstrip().endswith("n/a"), row)
+
+    def test_other_notes_keep_the_verdict(self):
+        for notes in ([], ["WARNING: Yahoo's share count is stale"],
+                      ["Synthetic demo data: no live market or filing data."]):
+            with self.subTest(notes=notes):
+                s = self._report(notes).summary
+                self.assertEqual(s["recommendation"], "Overvalued")
+                self.assertAlmostEqual(s["blended_upside"], -0.207, places=3)
+                self.assertIsNone(s["verdict_withheld"])
+
+    def test_no_target_stays_without_a_reason(self):
+        company = replace(make_company(), source_notes=[self._note()])
+        report = value_company("SYNT", provider=_OneCompanyProvider(company), run_dcf=False,
+                               run_comps=False, run_ddm=False, run_fcfe=False)
+        self.assertIsNone(report.summary["blended_target"])
+        self.assertEqual(report.summary["recommendation"], "N/A")
+        self.assertIsNone(report.summary["verdict_withheld"])
+        self.assertFalse(any(w.startswith("Corporate action:") for w in report.warnings))
+
+    def test_a_ddm_only_bank_gives_its_reason(self):
+        bank = _with_market(make_company(), industry="Banks - Diversified",
+                            sector="Financial Services")
+        report = value_company("BANK", provider=_OneCompanyProvider(bank), run_comps=False)
+        self.assertEqual(report.summary["verdict_withheld"], "the target rests on the DDM alone")
+
+
+class ChargeInsideEBITCutoffTests(unittest.TestCase):
+    """With the EBIT margin a one-off drop or a collapse (a charge year the
+    DCF already starts from the median for), a net margin under a third of its
+    prior median drops the P/E: GM FY2025 on EDGAR's income available to
+    common stockholders is 1.72% against 5.76% (0.30 of it), which a quarter
+    missed. Next to a one-off EBIT gain the cut-off stays a quarter."""
+
+    NI = [0.0789, 0.0634, 0.0518, 0.0321, 0.0172]
+
+    def setUp(self):
+        self.case = CompsChargeInsideEBITTests()
+
+    def test_gm_as_filed_drops_the_pe(self):
+        gm = self.case._company(ni_m=self.NI, kind="captive_finance")
+        charge = ebit_charge_collapse(gm.financials)
+        self.assertEqual(charge["ebit_move"], "drop")
+        self.assertAlmostEqual(charge["prior_median"], 0.0576, places=12)
+        self.assertAlmostEqual(charge["latest"] / charge["prior_median"], 0.2986, places=4)
+        self.assertAlmostEqual(charge["net_share"], MARGIN_COLLAPSE_SHARE, places=12)
+        comps = self.case._comps(gm)
+        self.assertIsNone(comps.implied["pe"])
+        self.assertEqual(comps.implied_price_summary["median"], comps.implied["pb"])
+        self.assertIn("the latest net margin 1.72% is under a third of its prior median "
+                      "5.76%, and the latest EBIT margin 1.6% is a one-off drop from its "
+                      "prior median 6.7%", self.case._note(comps))
+
+    def test_an_operating_company_loses_pe_and_ev_ebitda(self):
+        comps = self.case._comps(self.case._company(ni_m=self.NI))
+        for m in ("pe", "ev_ebitda"):
+            self.assertIsNone(comps.implied[m], m)
+        self.assertIsNotNone(comps.implied["ev_sales"])
+
+    def test_a_collapse_year_uses_the_third_too(self):
+        c = self.case._company(ebit_m=CompsChargeInsideEBITTests.EBIT[:-1] + [0.0180],
+                               ni_m=self.NI)
+        charge = ebit_charge_collapse(c.financials)
+        self.assertEqual(charge["ebit_move"], "collapse")
+        self.assertIsNone(self.case._comps(c).implied["pe"])
+
+    def test_the_gain_case_keeps_a_quarter(self):
+        gain = self.case._company(ebit_m=CompsChargeInsideEBITTests.EBIT[:-1] + [0.1400],
+                                  ni_m=self.NI)
+        self.assertIsNone(ebit_charge_collapse(gain.financials))
+        self.assertIsNotNone(self.case._comps(gain).implied["pe"])
+        # Under a quarter it is caught, and the note says "a quarter".
+        deep = self.case._company(ebit_m=CompsChargeInsideEBITTests.EBIT[:-1] + [0.1400],
+                                  ni_m=self.NI[:-1] + [0.0140])
+        charge = ebit_charge_collapse(deep.financials)
+        self.assertEqual(charge["net_share"], 0.25)
+
+    def test_a_net_margin_above_a_third_keeps_the_pe(self):
+        kept = self.case._company(ni_m=self.NI[:-1] + [0.0200])  # 0.35 of 5.76%
+        self.assertIsNone(ebit_charge_collapse(kept.financials))
+        self.assertIsNotNone(self.case._comps(kept).implied["pe"])
+
+
+
+class RevenueGrowthStartTests(unittest.TestCase):
+    """``DCFAssumptions.revenue_growth_start`` sets year-1 growth and fades to
+    the terminal growth the DCF uses, clamp included, as the derived path
+    does; an explicit list keeps an unclamped rate."""
+
+    def setUp(self):
+        self.c = make_company()
+        self.macro = MacroAssumptions()
+        self.price = self.c.market.price
+
+    def _run(self, **kw):
+        return run_dcf(self.c, self.macro, DCFAssumptions(**kw), self.price)
+
+    def test_the_derived_start_reproduces_the_default(self):
+        base = self._run()
+        y1 = base.assumptions["revenue_growth_path"][0]
+        same = self._run(revenue_growth_start=y1)
+        self.assertEqual(same.assumptions["revenue_growth_path"],
+                         base.assumptions["revenue_growth_path"])
+        self.assertAlmostEqual(same.implied_price, 33.38, places=2)
+
+    def test_the_path_ends_at_the_clamped_terminal_growth(self):
+        clamped = self._run(terminal_growth=0.20)
+        g_used = clamped.assumptions["terminal_growth_used"]
+        self.assertLess(g_used, 0.20)
+        given = self._run(terminal_growth=0.20, revenue_growth_start=0.08)
+        path = given.assumptions["revenue_growth_path"]
+        self.assertAlmostEqual(path[0], 0.08, places=12)
+        self.assertEqual(path[-1], g_used)
+        self.assertAlmostEqual(given.implied_price, clamped.implied_price, places=6)
+        self.assertTrue(any("used in both fade path and terminal value" in n
+                            for n in given.assumptions["notes"]))
+
+    def test_an_explicit_list_wins_and_one_year_keeps_the_rate(self):
+        listed = self._run(revenue_growth=[0.03] * 5, revenue_growth_start=0.10)
+        self.assertEqual(listed.assumptions["revenue_growth_path"], [0.03] * 5)
+        one = self._run(forecast_years=1, revenue_growth_start=0.10)
+        self.assertEqual(one.assumptions["revenue_growth_path"], [0.10])
+
+    def test_invalid_start_raises(self):
+        for bad in (-1.0, -2.0, float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self._run(revenue_growth_start=bad)
+
+
+class NonFiniteTerminalValueNoteTests(unittest.TestCase):
+    """An absurd exit multiple overflows the terminal value: the note names
+    that cause, not a missing share count."""
+
+    def test_overflow_names_the_exit_multiple(self):
+        c = make_company()
+        dcf = run_dcf(c, MacroAssumptions(),
+                      DCFAssumptions(terminal_method="exit_multiple", exit_ev_ebitda=1e308),
+                      c.market.price)
+        self.assertIs(dcf.assumptions["valuation_available"], False)
+        self.assertEqual(dcf.implied_price, 0.0)
+        notes = dcf.assumptions["notes"]
+        self.assertIn("enterprise/equity value is not finite (the terminal value overflowed; "
+                      "check the exit EV/EBITDA multiple); implied price set to 0", notes)
+        self.assertNotIn("share count unavailable; implied price set to 0", notes)
+
+    def test_a_missing_share_count_keeps_its_note(self):
+        c = _with_fin(_with_market(make_company(), shares_outstanding=None),
+                      diluted_shares=[None] * 5)
+        dcf = run_dcf(c, MacroAssumptions(), DCFAssumptions(), c.market.price)
+        self.assertIn("share count unavailable; implied price set to 0",
+                      dcf.assumptions["notes"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+# Development and CI tools, installed on top of the runtime requirements:
+#   pip install -r requirements.txt -r backend/requirements-backend.txt -r requirements-dev.txt
+# or, equivalently, `pip install -e '.[backend,dev]'`.
+#
+# Lint gate (`ruff check equity_valuation backend tests`, rules in
+# pyproject.toml). Pinned so a new release cannot turn the gate red by itself.
+ruff==0.17.0
+# Coverage gate; `coverage report` enforces fail_under from pyproject.toml.
+coverage[toml]>=7.6
+# The API tests' TestClient needs httpx2: Starlette's fallback to httpx is
+# deprecated, and httpx would otherwise arrive only through anthropic.
+httpx2>=2.0
+# tests/test_packaging.py builds the wheel offline with the installed
+# setuptools (no build isolation); 77 matches pyproject.toml's build backend.
+setuptools>=77

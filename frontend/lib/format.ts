@@ -1,5 +1,7 @@
 // Formatting helpers shared by every panel. All tolerate null/undefined/NaN.
 
+import type { Digest } from "./types";
+
 const SYMBOLS: Record<string, string> = {
   USD: "$",
   EUR: "€",
@@ -8,7 +10,9 @@ const SYMBOLS: Record<string, string> = {
   CAD: "C$",
   AUD: "A$",
   CHF: "CHF ",
-  CNY: "¥",
+  // Yuan and yen both write "¥"; peer rows keep each peer's own currency, so
+  // the yuan takes the "CN¥" form to stay distinguishable.
+  CNY: "CN¥",
   HKD: "HK$",
   INR: "₹",
 };
@@ -43,6 +47,13 @@ export function fmtMoney(
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   })}`;
+}
+
+// Decimals for a share price shown beside a reference price (the current
+// price): cents unless the price is in the thousands, where they are noise.
+// Whole units would make most cells of a sub-$20 stock's grid read the same.
+export function priceDecimals(ref: number | null | undefined): number {
+  return isNum(ref) && Math.abs(ref) >= 1000 ? 0 : 2;
 }
 
 // Compact magnitude without sign or symbol: 391.0B, 1.2T, 540.0M. The unit is
@@ -112,6 +123,13 @@ export function fmtBytes(n: number | null | undefined): string {
   return `${(n / 1e6).toFixed(1)} MB`;
 }
 
+// A message ending in exactly one sentence stop, so text that already ends
+// in "." (or "!", "?", "…") is not given a second one.
+export function withFullStop(s: string): string {
+  const t = s.trimEnd();
+  return /[.!?…]$/.test(t) ? t : `${t}.`;
+}
+
 export function fmtDate(s: string | null | undefined): string {
   if (!s) return "";
   // A date-only ISO string ("2024-12-31") parses as UTC midnight, which
@@ -127,11 +145,61 @@ export function fmtDate(s: string | null | undefined): string {
   });
 }
 
+// The research-log entry for a digest. The log is the context every later
+// note, chat and digest receives, so it carries the digest's cited facts (each
+// with its source), risks and catalysts as well as its summary; the summary
+// alone would leave the note nothing to cite.
+export function digestLogEntry(source: string, digest: Partial<Digest>): string {
+  const text = (x: unknown) => (typeof x === "string" ? x.trim() : "");
+  const texts = (x: unknown) => (Array.isArray(x) ? x.map(text).filter(Boolean) : []);
+  const lines = [`[${source}] ${text(digest.summary)}`.trimEnd()];
+  for (const f of Array.isArray(digest.key_facts) ? digest.key_facts : []) {
+    const fact = text(f?.fact);
+    if (fact) lines.push(`- ${fact} (source: ${text(f?.source) || source})`);
+  }
+  for (const r of texts(digest.risks)) lines.push(`- Risk: ${r}`);
+  for (const c of texts(digest.catalysts)) lines.push(`- Catalyst: ${c}`);
+  return lines.join("\n");
+}
+
+// The research log with `entry` appended as its own paragraph.
+export function appendLogEntry(log: string, entry: string): string {
+  return (log ? log + "\n\n" : "") + entry;
+}
+
+// A research log saved before digest entries carried their facts holds one
+// "[source] summary" paragraph per digest. Each such paragraph that is still
+// exactly as it was written becomes that saved digest's full entry
+// (digestLogEntry), so notes for tickers researched earlier get the cited
+// facts too. Any other text, including an edited or removed line, is kept as
+// it is, and a log already upgraded is returned unchanged.
+export function upgradeDigestLog(
+  log: string,
+  digests: readonly { source?: unknown; digest?: Partial<Digest> | null }[] | null | undefined
+): string {
+  if (!log || !Array.isArray(digests)) return log;
+  const full = new Map<string, string>();
+  for (const d of digests) {
+    const summary = d?.digest?.summary;
+    if (typeof d?.source !== "string" || typeof summary !== "string") continue;
+    const old = `[${d.source}] ${summary}`;
+    if (!full.has(old)) full.set(old, digestLogEntry(d.source, d.digest ?? {}));
+  }
+  if (full.size === 0) return log;
+  return log.split("\n\n").map((p) => full.get(p) ?? p).join("\n\n");
+}
+
+// The verdict bands' tolerance: engine._recommendation counts an upside
+// within 1e-12 of +/-15% as on the band (math.isclose), so a target at
+// exactly 1.15x the price, which reads 0.15 minus float noise, is
+// "Undervalued" there and is coloured as such here.
+const BAND_TOLERANCE = 1e-12;
+
 // Map an upside/recommendation to a semantic color class.
 export function toneForUpside(upside: number | null | undefined): string {
   if (!isNum(upside)) return "text-ink-dim";
-  if (upside >= 0.15) return "text-up";
-  if (upside <= -0.15) return "text-down";
+  if (upside >= 0.15 - BAND_TOLERANCE) return "text-up";
+  if (upside <= -0.15 + BAND_TOLERANCE) return "text-down";
   return "text-flat";
 }
 
@@ -163,11 +231,15 @@ export function toneForRecommendation(rec: string | null | undefined): string {
 // The engine's blended_target is null when no method gives a usable value, or
 // when it gives no target at all (a captive-finance group or a lessor whose
 // only method left is the DDM asks for peers instead). blended_upside is also
-// null when the verdict is withheld (a blend that rests on the DDM alone).
+// null when the verdict is withheld (a blend that rests on the DDM alone, or a
+// corporate action after the latest fiscal year; verdict_withheld says which).
 // A null is shown as text, never as a figure, and is not coloured. These rules
 // copy equity_valuation/report/excel.py, which the Excel and HTML reports, the
 // memo and deck and the AI context share; a Python test pins the copy.
 export const NO_TARGET_SUPPLY_PEERS = "No target (supply peers)";
+// The same, where a table cell has no room for the reason (the header's
+// verdict explainer gives it).
+export const NO_TARGET_SHORT = "No target";
 
 interface BlendFields {
   methods?: Record<string, number | null> | null;
@@ -178,15 +250,16 @@ interface BlendFields {
   excluded_from_blend?: Record<string, string> | null;
   financial_institution?: string | null;
   financial_kind?: string | null;
+  verdict_withheld?: string | null;
 }
 
 // The report's trading comps (null when comps did not run).
-type CompsFields = { peers?: unknown[] | null } | null | undefined;
+type CompsFields = { peers?: unknown[] | null; notes?: string[] | null } | null | undefined;
 
 // No target because the company is flagged (a bank, a captive-finance group,
 // a lessor, ...) and every method it has is reference only, and no usable
-// peers were supplied: trading comps would give a target (peers are never
-// found automatically). Not when peers were supplied but comps gave no price,
+// peers were supplied: trading comps would give a target (the engine never
+// finds peers itself). Not when peers were supplied but comps gave no price,
 // nor when an ordinary company's methods gave no valuation: those read "n/a".
 export function needsPeers(s: BlendFields, comps?: CompsFields): boolean {
   if (isNum(s.blended_target)) return false;
@@ -196,9 +269,15 @@ export function needsPeers(s: BlendFields, comps?: CompsFields): boolean {
   return !(comps && comps.peers && comps.peers.length > 0);
 }
 
-export function fmtBlendedTarget(s: BlendFields, comps?: CompsFields): string {
+// `short`: "No target" without the reason, for a narrow table cell.
+export function fmtBlendedTarget(
+  s: BlendFields,
+  comps?: CompsFields,
+  opts: { short?: boolean } = {}
+): string {
   if (isNum(s.blended_target)) return fmtMoney(s.blended_target, s.currency);
-  return needsPeers(s, comps) ? NO_TARGET_SUPPLY_PEERS : "n/a";
+  if (!needsPeers(s, comps)) return "n/a";
+  return opts.short ? NO_TARGET_SHORT : NO_TARGET_SUPPLY_PEERS;
 }
 
 // The upside is shown only beside a target, as the engine gives it.
@@ -321,4 +400,278 @@ export function betaStat(
       `Yahoo's 5-year monthly beta ${fmtNum(raw, 3)}, Blume-adjusted toward 1 ` +
       `(${BLUME_RAW_WEIGHT} × raw + ${BLUME_MARKET_WEIGHT}) to ${fmtNum(beta, 3)} for CAPM.`,
   };
+}
+
+// A rate with one decimal, or two when the second is needed (2.5%, 3.0%,
+// 2.25%): assumption steps run in quarter points.
+export function fmtRate(x: number | null | undefined): string {
+  if (!isNum(x)) return "—";
+  const tenths = x * 1000;
+  return fmtPct(x, { decimals: Math.abs(tenths - Math.round(tenths)) < 1e-6 ? 1 : 2 });
+}
+
+// --- Engine text in the dashboard ------------------------------------------ //
+// The engine's warnings and notes are written for the command line. Rewrite
+// the phrases that name a CLI flag so they point at the dashboard control
+// that does the same thing; any other text is returned unchanged.
+const CLI_PHRASES: [RegExp, string][] = [
+  [/pass --peers to supply them/g, "add peers in the Trading comps box"],
+  [/Supply peers with --peers/g, "Add peers in the Trading comps box"],
+  [/supply peers with --peers/g, "add peers in the Trading comps box"],
+  [/--comps-basis ttm in the CLI/g, "the TTM toggle in the Trading comps box"],
+];
+
+export function uiText(text: string): string {
+  return CLI_PHRASES.reduce((t, [re, to]) => t.replace(re, to), text);
+}
+
+// Warnings as the dashboard shows them: rewritten (uiText), each once.
+export function uiWarnings(warnings: readonly string[] | null | undefined): string[] {
+  return [...new Set((warnings || []).filter((w) => typeof w === "string").map(uiText))];
+}
+
+// The warnings that explain a DCF with no price, for its empty card: the
+// DCF's own ("DCF: ...", "WARNING: DCF: ...", "DCF excluded from ...") and,
+// for a flagged company (`flagged`), the engine's note on why its FCFF DCF
+// is reference only. A bank's report carries a dozen other notes that would
+// bury the one that matters ("EBIT margin unavailable ... set a target EBIT
+// margin"). Every warning when none of them is there; rewritten (uiWarnings).
+const FLAG_NOTE = /^(Financial institution|Captive finance arm|Debt-funded lessor)\b/;
+
+export function dcfWarnings(
+  warnings: readonly string[] | null | undefined,
+  flagged: boolean
+): string[] {
+  const all = uiWarnings(warnings);
+  const own = all.filter((w) => /^(WARNING: )?DCF[: ]/.test(w)
+    || (flagged && FLAG_NOTE.test(w) && w.includes("DCF")));
+  return own.length > 0 ? own : all;
+}
+
+// The engine copies some comps notes into the warnings as "Comps: <note>"
+// (peers not used, equity multiples only, ...) and adds comps warnings of its
+// own (no usable peers, a failed fetch). For the comps card: the comps
+// warnings, without the "Comps" label (and capitalised), that do not repeat
+// one of its notes, rewritten (uiText) and each once.
+export function compsWarnings(
+  warnings: readonly string[] | null | undefined,
+  notes: readonly string[] | null | undefined
+): string[] {
+  const seen = new Set((notes || []).map(uiText));
+  const out: string[] = [];
+  for (const w of warnings || []) {
+    if (typeof w !== "string") continue;
+    const m = /^(WARNING: )?Comps( failed)?: (.*)$/s.exec(w);
+    if (!m) continue;
+    const body = m[2] ? `Comps failed: ${m[3]}` : m[3].charAt(0).toUpperCase() + m[3].slice(1);
+    const text = uiText(`${m[1] ?? ""}${body}`);
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+
+// --- Peer status ------------------------------------------------------------ //
+// A tone (ui.Badge's) and a reason for what comps did with each requested
+// peer (comps.peer_status).
+export function peerStatusTone(status: string): "up" | "down" | "flat" | "neutral" {
+  switch (status) {
+    case "used":
+      return "up";
+    case "not found":
+    case "not fetched":
+      return "down";
+    case "no usable multiple":
+      return "flat";
+    default:
+      return "neutral";
+  }
+}
+
+export function peerStatusReason(status: string): string {
+  switch (status) {
+    case "used":
+      return "Used in the peer multiples.";
+    case "not found":
+      return "Not used: no market data came back for this ticker. Check the symbol.";
+    case "no usable multiple":
+      return "Not used: its data has no positive EV/EBITDA, EV/Sales, P/E or P/B.";
+    case "is target":
+      return "Not used: this is the company being valued.";
+    case "not fetched":
+      return "Not used: the peer data could not be fetched. Try again later.";
+    default:
+      return `Status: ${status}.`;
+  }
+}
+
+// --- Why there is no verdict ------------------------------------------------ //
+// Who a flagged company is (summary.financial_kind), with its article.
+const KIND_WHOM: Record<string, string> = {
+  bank: "a bank",
+  insurer: "an insurer",
+  reit: "a REIT",
+  lender: "a lender",
+  captive_finance: "a company with a consolidated captive finance arm",
+  lessor: "a debt-funded lessor",
+  financial: "a financial institution",
+};
+
+export function financialWhom(s: BlendFields): string | null {
+  const kind = s.financial_kind;
+  if (kind) return KIND_WHOM[kind] ?? "a financial institution";
+  return s.financial_institution ? "a financial institution" : null;
+}
+
+// Flagged kinds whose trading comps price on P/E and P/B only (a copy of
+// equity_valuation/models/comps.py's EQUITY_MULTIPLES_ONLY_KINDS; a test pins
+// it). Their debt funds the business (deposits, a loan book, a finance arm's
+// receivables, a leased fleet), so EV/EBITDA and EV/Sales mean little: a
+// bank's EBIT is zero by design and its EBITDA is D&A alone.
+export const EQUITY_MULTIPLES_ONLY_KINDS = [
+  "bank", "insurer", "lender", "financial", "captive_finance", "lessor",
+];
+
+// Usable peer values a comps multiple needs for an implied price (a copy of
+// equity_valuation/config.py's COMPS_MIN_PEER_VALUES; a test pins it).
+export const COMPS_MIN_PEER_VALUES = 3;
+// Start of the comps note naming the multiples with too few peer values
+// (equity_valuation/models/comps.py FEW_PEER_VALUES_NOTE_PREFIX).
+export const FEW_PEER_VALUES_NOTE_PREFIX = "Too few peer values";
+
+// True when the engine prices the company on equity multiples only (a flag
+// without a kind, from an older backend, counts as "financial").
+export function equityMultiplesOnly(s: BlendFields): boolean {
+  if (s.financial_kind) return EQUITY_MULTIPLES_ONLY_KINDS.includes(s.financial_kind);
+  return Boolean(s.financial_institution);
+}
+
+// Column headers for a projection table. The FCFE numbers its years by fiscal
+// year (2026, ...), the DCF by forecast index (1..n): an index is mapped onto
+// the latest fiscal year in the financials, so both tables label the same
+// periods alike (equity_valuation/report/excel.py's _year_labels does the
+// same); without one it stays "Y1", "Y2", ...
+export function projectionYearLabels(
+  years: readonly unknown[] | null | undefined,
+  fiscalYears?: readonly unknown[] | null
+): string[] {
+  const fys = (fiscalYears || []).filter(isNum).map((y) => Math.trunc(y));
+  const lastFy = fys.length > 0 ? fys[fys.length - 1] : null;
+  return (years || []).map((y) => {
+    if (!isNum(y)) return String(y ?? "—");
+    if (y >= 1000) return String(Math.trunc(y));
+    return lastFy != null ? String(lastFy + Math.trunc(y)) : `Y${Math.trunc(y)}`;
+  });
+}
+
+// --- DDM ------------------------------------------------------------------- //
+// A DDM variant's display name, as the segmented control, the HTML report and
+// the workbook write it (excel.DDM_METHOD_LABELS, which a test pins); an
+// unknown identifier is shown as it is.
+export const DDM_METHOD_LABELS: Record<string, string> = {
+  two_stage: "Two-stage",
+  h_model: "H-model",
+  gordon: "Gordon growth",
+};
+
+export function ddmMethodLabel(method: unknown): string {
+  if (typeof method !== "string" || !method) return "—";
+  return DDM_METHOD_LABELS[method] ?? method;
+}
+
+function joinNames(names: string[]): string {
+  return names.length <= 1
+    ? names.join("")
+    : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+// A line under the header verdict when there is no verdict ("N/A"), no
+// blended target, or methods left out of the blend, built only from the
+// summary's structured fields (excluded_from_blend and its reasons,
+// financial_kind, verdict_withheld, needsPeers), never from warning text. `addPeers` asks for an
+// "Add peers" action: the blend has no comps, and trading comps would give
+// (or add to) a target. Null when there is nothing to explain.
+export function verdictExplanation(
+  s: BlendFields,
+  comps?: CompsFields
+): { text: string; addPeers: boolean } | null {
+  const excluded = s.excluded_from_blend || {};
+  const outNames = Object.keys(excluded);
+  const noTarget = !isNum(s.blended_target);
+  const noVerdict = s.recommendation === "N/A";
+  if (!noVerdict && !noTarget && outNames.length === 0) return null;
+
+  const methods = s.methods || {};
+  const hasComps = Object.keys(methods).some((n) => n.startsWith("Comps"));
+  const inBlend = Object.entries(methods)
+    .filter(([n, v]) => isNum(v) && !Object.prototype.hasOwnProperty.call(excluded, n))
+    .map(([n]) => n);
+  const whom = financialWhom(s);
+  // Peers were supplied but gave no comps value.
+  const peersGaveNone = !hasComps && Boolean(comps && comps.peers && comps.peers.length > 0);
+  // ...because too few peers had each multiple: the comps notes say so (each
+  // multiple needs at least COMPS_MIN_PEER_VALUES usable peer values; GM's F,
+  // RIVN and TSLA gave one P/E and two P/Bs). Other causes, such as a missing
+  // share count, are not fixed by adding peers.
+  const tooFewPeers = peersGaveNone
+    && Boolean(comps?.notes?.some((n) => n.startsWith(FEW_PEER_VALUES_NOTE_PREFIX)));
+  // The engine keeps a failed method as 0.00 with an exclusion reason.
+  const failed = (n: string) => /^(no valuation|non-finite)/.test(excluded[n] ?? "");
+  const sentences: string[] = [];
+
+  if (needsPeers(s, comps)) {
+    sentences.push(`No target: every method left for ${whom ?? "this company"} is reference only.`);
+  } else if (noTarget) {
+    // "No usable value" only when no method has one: a flagged company's
+    // DCF, DDM and FCFE can all have values that are reference only.
+    const anyValue = Object.entries(methods).some(([n, v]) => isNum(v) && !failed(n));
+    let line = !anyValue
+      ? "No target: no method gave a usable value"
+      : inBlend.length === 0 && whom != null
+        ? `No target: every method left for ${whom} is reference only`
+        : "No target";
+    if (tooFewPeers) {
+      line += `, and the peers supplied give no comps value (each multiple needs at least ${COMPS_MIN_PEER_VALUES} usable peer values)`;
+    } else if (peersGaveNone) {
+      line += ", and the peers supplied give no usable comps price";
+    }
+    sentences.push(`${line}.`);
+  } else if (noVerdict) {
+    // The engine's reason: a corporate action (it withholds any target's
+    // verdict), else a DDM-only blend.
+    const withheld = typeof s.verdict_withheld === "string" ? s.verdict_withheld : "";
+    if (withheld.startsWith("a corporate action")) {
+      sentences.push(`No verdict: Yahoo records ${withheld}, so the latest statements may `
+        + "still include a business the company no longer owns.");
+    } else if (inBlend.length === 1 && inBlend[0] === "DDM") {
+      sentences.push(
+        "No verdict: the target rests on the DDM alone, which counts dividends but not buybacks.");
+    } else {
+      sentences.push(withheld
+        ? `No verdict: ${withheld}; the target is shown for reference.`
+        : "No verdict.");
+    }
+  }
+  if (outNames.length > 0) {
+    // One entry per reason the engine gives.
+    const byReason = new Map<string, string[]>();
+    for (const n of outNames) {
+      const why = excluded[n] || "reference only";
+      byReason.set(why, [...(byReason.get(why) ?? []), n]);
+    }
+    const groups = [...byReason].map(([why, names]) => `${joinNames(names)} (${why})`);
+    sentences.push(`Left out of the target: ${groups.join("; ")}.`);
+  }
+  const addPeers = !hasComps;
+  if (addPeers && tooFewPeers) {
+    sentences.push(whom
+      ? `Add more peers: with enough usable peer values, comps give a P/E and P/B value for ${whom}.`
+      : "Add more peers: with enough usable peer values, comps add a trading-comps value.");
+  } else if (addPeers && !peersGaveNone) {
+    sentences.push(whom
+      ? `Peers give a P/E and P/B comps value for ${whom}.`
+      : "Peers add a trading-comps value.");
+  }
+  return { text: sentences.join(" "), addPeers };
 }

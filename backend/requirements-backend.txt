@@ -4,7 +4,7 @@
 # is pure ASGI and does not itself need a newer FastAPI or Starlette.
 fastapi>=0.132
 uvicorn[standard]>=0.29
-# messages.create(output_config=...) needs 0.77+; 0.78 is the first release
+# messages.create/stream(output_config=...) needs 0.77+; 0.78 is the first release
 # whose types include the adaptive thinking config the service sends.
 anthropic>=0.78
 # Office artifacts (research memo / briefing deck)

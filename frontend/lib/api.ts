@@ -9,6 +9,7 @@ import type {
   Filing,
   FilingsList,
   PdfAttachment,
+  PeerSuggestions,
   Report,
   ResearchNote,
   ResearchState,
@@ -68,16 +69,31 @@ export async function errorDetail(res: Response): Promise<string> {
   return d == null ? fallback : String(d);
 }
 
+// A failed API response: the backend's message (errorDetail) and its HTTP
+// status, so a caller can tell a missing ticker (404) from a refused input.
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 // --- request size ------------------------------------------------------------ //
-// The backend caps request bodies by route and answers 413 above the cap:
-// /api/ai/* carries base64 PDFs and takes up to 50 MiB, which is also the Next
-// proxy's cap (middlewareClientMaxBodySize in next.config.mjs); every other
-// route takes plain JSON and up to 8 MiB. Checking here fails fast, before a
-// large upload, with a message that says what to do. The limits are decimal
-// (1 MB = 1,000,000 bytes, as file browsers usually show sizes), so they sit
-// just below the server caps. PDFs travel base64-encoded inside the JSON
-// body, so each one costs about 4/3 of its file size.
-export const MAX_UPLOAD_BYTES = 50_000_000;
+// /api/ai/* carries base64 PDFs. The binding cap is the Anthropic Messages
+// API's 32 MB request limit: the backend refuses (413) an AI request it would
+// send over 32,000,000 bytes, before calling the API. MAX_UPLOAD_BYTES keeps
+// about 1 MB below that for what the backend adds (the system prompt, the
+// output schema, the valuation context and the research log). The backend's
+// and the Next proxy's 50 MiB body caps (middlewareClientMaxBodySize in
+// next.config.mjs) are transport limits only. Every other route takes plain
+// JSON and up to 8 MiB. Checking here fails fast, before a large upload, with
+// a message that says what to do. The limits are decimal (1 MB = 1,000,000
+// bytes, as file browsers usually show sizes). PDFs travel base64-encoded
+// inside the JSON body, so each one costs about 4/3 of its file size.
+export const MAX_UPLOAD_BYTES = 31_000_000;
 const MAX_JSON_BYTES = 8_000_000;
 
 // UTF-8 size of a request body as sent.
@@ -145,7 +161,7 @@ async function postJSON<T>(path: string, body: unknown, timeoutMs?: number): Pro
     body: payload,
     ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   });
-  if (!res.ok) throw new Error(await errorDetail(res));
+  if (!res.ok) throw new ApiError(await errorDetail(res), res.status);
   return res.json() as Promise<T>;
 }
 
@@ -165,6 +181,27 @@ export async function fetchEnrichment(ticker: string): Promise<Enrichment> {
   const res = await fetch(apiUrl(`/api/enrichment/${encodeURIComponent(ticker)}`));
   if (!res.ok) return { enabled: false };
   return res.json() as Promise<Enrichment>;
+}
+
+// Suggested peers for the comps card's "Suggest peers" button: Yahoo's
+// industry list within a market-cap band, with notes asking for review. Only
+// suggestions; the caller fills the peer box and nothing is applied. The
+// backend answers a failed lookup with no peers and a note, so only an
+// implausible ticker (400) or an unreachable backend throws.
+export async function fetchPeerSuggestions(ticker: string): Promise<PeerSuggestions> {
+  const res = await fetch(apiUrl(`/api/peers/${encodeURIComponent(ticker)}`));
+  if (!res.ok) throw new Error(await errorDetail(res));
+  const body = (await res.json()) as Partial<PeerSuggestions> | null;
+  return {
+    ticker: typeof body?.ticker === "string" ? body.ticker : ticker,
+    industry_key: body?.industry_key ?? null,
+    industry: body?.industry ?? null,
+    peers: Array.isArray(body?.peers)
+      ? body.peers.filter((p) => p && typeof p.ticker === "string" && p.ticker.trim())
+      : [],
+    notes: Array.isArray(body?.notes) ? body.notes.filter((n) => typeof n === "string") : [],
+    source: typeof body?.source === "string" ? body.source : undefined,
+  };
 }
 
 export async function postDigest(args: {

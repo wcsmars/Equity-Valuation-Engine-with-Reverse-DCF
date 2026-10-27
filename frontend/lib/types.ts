@@ -20,6 +20,16 @@ export interface MarketData {
   fifty_two_week_high: number | null;
   sector: string | null;
   industry: string | null;
+  // Yahoo's industry identifier (what "Suggest peers" reads), and its
+  // trailing-twelve-month figures (read only by comps; null when Yahoo
+  // reports in another currency). Optional: older backends omit them.
+  industry_key?: string | null;
+  ttm_revenue?: number | null;
+  ttm_ebitda?: number | null;
+  ttm_net_income?: number | null;
+  ttm_as_of?: string | null; // ISO date of the latest quarter
+  fiscal_year_end?: string | null; // ISO date
+  ttm_currency?: string | null;
 }
 
 export interface AnnualFinancials {
@@ -45,6 +55,10 @@ export interface BalanceSheet {
   total_equity: number;
   minority_interest: number;
   preferred_equity: number;
+  // Operating-lease liabilities total_debt leaves out (EDGAR filers), which
+  // comps add to the target's EV on the peers' basis; null when unknown or
+  // already in total_debt. Not part of net_debt.
+  operating_lease_liability?: number | null;
   net_debt: number;
 }
 
@@ -75,6 +89,35 @@ export interface WACC {
   detail: Record<string, unknown>;
 }
 
+// The DCF's echo of what it resolved (DCFResult.assumptions). Only the keys
+// the dashboard reads are named; the rest pass through.
+export interface DCFAssumptionsEcho {
+  [key: string]: unknown;
+  forecast_years?: number;
+  revenue_growth_path?: number[];
+  target_ebit_margin?: number | null;
+  start_ebit_margin?: number | null;
+  tax_rate?: number | null;
+  terminal_method?: "gordon" | "exit_multiple" | "value_driver";
+  terminal_growth?: number;
+  terminal_growth_used?: number;
+  exit_ev_ebitda?: number | null;
+  // Terminal-value check of the first stable year (all null for an exit
+  // multiple): NOPAT, the net reinvestment the drivers carry into it (capex -
+  // D&A + change in NWC), its share of NOPAT, the return on new invested
+  // capital that growth implies (g / rate; null unless both are positive),
+  // the RONIC a value-driver terminal value used, and the latest ROIC.
+  terminal_nopat?: number | null;
+  terminal_net_reinvestment?: number | null;
+  terminal_reinvestment_rate?: number | null;
+  implied_terminal_ronic?: number | null;
+  terminal_ronic_used?: number | null;
+  latest_roic?: number | null;
+  wacc?: number;
+  valuation_available?: boolean;
+  notes?: string[];
+}
+
 export interface DCF {
   wacc: WACC;
   years: number[];
@@ -93,7 +136,7 @@ export interface DCF {
   implied_price: number | null;
   current_price: number;
   upside: number | null;
-  assumptions: Record<string, unknown>;
+  assumptions: DCFAssumptionsEcho;
 }
 
 export interface CompRow {
@@ -116,8 +159,16 @@ export interface StatRow {
   max: number | null;
   p25: number | null;
   p75: number | null;
-  n?: number;
+  n?: number; // peers with a usable value of this multiple
 }
+
+// What comps did with each requested peer (upper-case ticker).
+export type PeerStatus =
+  | "used"
+  | "not found"
+  | "no usable multiple"
+  | "is target"
+  | "not fetched";
 
 export interface Comps {
   target: CompRow;
@@ -130,6 +181,8 @@ export interface Comps {
     high?: number | null;
   };
   notes: string[];
+  // Each requested peer's fate, in request order; empty without peers.
+  peer_status?: Record<string, PeerStatus | string>;
 }
 
 export interface DDM {
@@ -181,9 +234,13 @@ export interface Summary {
   // is the DDM: it asks for peers instead).
   blended_target: number | null;
   // null when there is no target, no price, or the verdict is withheld (a
-  // blend that rests on the DDM alone); the UI then shows "n/a", uncoloured.
+  // blend that rests on the DDM alone, or a corporate action after the latest
+  // fiscal year); the UI then shows "n/a", uncoloured.
   blended_upside: number | null;
   recommendation: string;
+  // Why there is a target but no verdict, e.g. "a corporate action after FY2025
+  // (likely a spin-off)" or "the target rests on the DDM alone"; else null.
+  verdict_withheld?: string | null;
   // Methods shown for reference but left out of the blended target, with the
   // engine's reason (e.g. a bank's, captive-finance group's or lessor's DCF
   // and FCFE, or a low-payout DDM).
@@ -196,12 +253,32 @@ export interface Summary {
   financial_kind?: string | null;
 }
 
+// Reverse DCF: the value of one driver at which the DCF equals the price,
+// other inputs held. The top-level keys solve year-1 revenue growth; `margin`
+// the target EBIT margin and `wacc` the discount rate (null when not solved).
+export interface ReverseDCFMargin {
+  converged: boolean;
+  implied_target_ebit_margin: number | null;
+  current_target_ebit_margin?: number | null;
+  start_ebit_margin?: number | null;
+  note?: string | null;
+}
+
+export interface ReverseDCFWacc {
+  converged: boolean;
+  implied_wacc: number | null;
+  current_wacc?: number | null;
+  note?: string | null;
+}
+
 export interface ReverseDCF {
   converged: boolean;
   implied_growth_y1: number | null;
   current_assumption_y1?: number | null;
   implied_revenue_growth?: number[];
   note?: string;
+  margin?: ReverseDCFMargin | null;
+  wacc?: ReverseDCFWacc | null;
 }
 
 export interface Report {
@@ -219,7 +296,27 @@ export interface Report {
   football_field: FootballRow[];
   warnings: string[];
   assumptions_used: AssumptionsUsed;
+  // The same echo for an empty request (the engine's defaults), so the
+  // header can flag custom inputs. Optional: older backends omit it.
+  assumptions_default?: AssumptionsUsed;
   reverse_dcf?: ReverseDCF | null;
+}
+
+// --- Peer suggestions (GET /api/peers/{ticker}) ---------------------------- //
+export interface PeerSuggestion {
+  ticker: string;
+  name?: string | null;
+  market_weight?: number | null;
+  size_ratio?: number | null; // market weight vs the target's
+}
+
+export interface PeerSuggestions {
+  ticker: string;
+  industry_key?: string | null;
+  industry?: string | null;
+  peers: PeerSuggestion[];
+  notes: string[];
+  source?: string;
 }
 
 // --- FMP enrichment ------------------------------------------------------- //
@@ -247,6 +344,10 @@ export interface Enrichment {
 }
 
 // --- Editable assumptions (sent to /api/valuation) ------------------------ //
+export type TerminalMethod = "gordon" | "exit_multiple" | "value_driver";
+export type DDMMethod = "gordon" | "two_stage" | "h_model";
+export type CompsBasis = "fy" | "ttm";
+
 export interface Assumptions {
   rf?: number; // risk-free rate (decimal)
   erp?: number; // equity risk premium (decimal)
@@ -254,12 +355,17 @@ export interface Assumptions {
   cost_of_debt?: number;
   forecast_years?: number;
   terminal_growth?: number; // decimal
-  terminal_method?: "gordon" | "exit_multiple";
+  terminal_method?: TerminalMethod;
+  terminal_ronic?: number; // decimal; value-driver RONIC, unset => WACC
   exit_ev_ebitda?: number; // multiple
   target_ebit_margin?: number; // decimal
   revenue_growth_y1?: number; // decimal; near-term growth, fades to terminal
   revenue_growth?: number[]; // explicit path restored from saved research
   peers?: string; // comma-separated tickers
+  ddm_method?: DDMMethod;
+  ddm_high_growth_rate?: number; // decimal; unset => the DDM derives it
+  ddm_high_growth_years?: number;
+  comps_basis?: CompsBasis; // target figures comps use (fiscal year or TTM)
 }
 
 // The engine's echo of what it actually used (parse_assumptions). Optional
@@ -271,12 +377,18 @@ export interface AssumptionsUsed {
   cost_of_debt: number | null;
   forecast_years: number;
   terminal_growth: number;
-  terminal_method: "gordon" | "exit_multiple";
+  terminal_method: TerminalMethod;
   exit_ev_ebitda: number | null;
   target_ebit_margin: number | null;
   revenue_growth_y1: number | null;
   revenue_growth: number[] | null;
   peers: string | null;
+  // Optional: older backends do not echo them.
+  terminal_ronic?: number | null;
+  ddm_method?: DDMMethod;
+  ddm_high_growth_rate?: number | null;
+  ddm_high_growth_years?: number;
+  comps_basis?: CompsBasis;
 }
 
 // --- AI researcher -------------------------------------------------------- //
@@ -311,6 +423,14 @@ export interface Digest {
   risks: string[];
   catalysts: string[];
   suggested_assumptions: AssumptionSuggestion[];
+  // Suggestions the backend removed (an unknown field, a value that is not a
+  // number or is outside the field's range); the summary already names them.
+  // Optional: absent when nothing was removed.
+  dropped_suggestions?: {
+    field: string | null;
+    suggested_value: unknown;
+    reason: string;
+  }[];
 }
 
 // A digest plus where it came from (pasted text, a named filing, a call…).

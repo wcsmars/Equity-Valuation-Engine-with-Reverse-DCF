@@ -1,0 +1,65 @@
+# Packaging, lint and coverage settings.
+#
+#   python -m pip install -e '.[backend,dev]'   # engine, API extras and dev tools
+#   equity-valuation --demo                     # same as python -m equity_valuation --demo
+#
+# The dependency lists stay in requirements.txt (engine),
+# backend/requirements-backend.txt (FastAPI backend) and requirements-dev.txt
+# (lint, coverage and test tools). The metadata below reads those files, so
+# run_dev.sh, CI and `pip install` share one list each.
+
+[build-system]
+# 77 is the first setuptools with SPDX `license` expressions.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "equity-valuation"
+description = "Automated equity valuation: FCFF DCF, trading comps, DDM and FCFE from SEC EDGAR and Yahoo Finance data, with Excel and HTML reports."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Chung Shing Mars Wong" }]
+keywords = ["valuation", "dcf", "equity research", "trading comps", "sec edgar"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dynamic = ["version", "dependencies", "optional-dependencies"]
+
+[project.urls]
+Repository = "https://github.com/wcsmars/Equity-Valuation-Engine-with-Reverse-DCF"
+
+[project.scripts]
+equity-valuation = "equity_valuation.cli:main"
+
+[tool.setuptools.dynamic]
+# Read statically from equity_valuation/__init__.py, so building does not
+# import the engine (or need pandas).
+version = { attr = "equity_valuation.__version__" }
+dependencies = { file = ["requirements.txt"] }
+optional-dependencies.backend = { file = ["backend/requirements-backend.txt"] }
+optional-dependencies.dev = { file = ["requirements-dev.txt"] }
+
+[tool.setuptools.packages.find]
+# Only the valuation engine ships in the wheel. The FastAPI backend, the
+# dashboard, the desktop shell and the tests run from a checkout.
+include = ["equity_valuation*"]
+
+[tool.ruff.lint]
+# Syntax errors and pyflakes checks (unused imports and variables, undefined
+# names). Style families such as UP or B would mean rewriting most modules.
+select = ["E9", "F"]
+
+[tool.coverage.run]
+source = ["equity_valuation", "backend"]
+
+[tool.coverage.report]
+# Line coverage of both test suites (`make coverage`, CI). Measured at 94.2%
+# when the gate was added; the floor sits three points lower so a small
+# refactor does not trip it, while a dropped test module does.
+fail_under = 91

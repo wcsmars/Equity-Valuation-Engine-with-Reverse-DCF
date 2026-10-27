@@ -2,9 +2,12 @@
 
     python -m equity_valuation AAPL
     python -m equity_valuation AAPL --peers MSFT,GOOGL,META --out output
+    python -m equity_valuation KO --auto-peers   # peers from Yahoo's industry list
+    python -m equity_valuation NVDA --peers AMD,AVGO,QCOM --comps-basis ttm
     python -m equity_valuation --demo          # synthetic company, no network
     python -m equity_valuation MSFT --rf 0.043 --erp 0.05 --terminal-growth 0.025 \
         --forecast-years 6 --no-ddm --excel --html
+    python -m equity_valuation --demo --terminal-method value_driver --terminal-ronic 0.15
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import os
 import re
 import sys
 
-from . import config
+from . import __version__, config
 from .schemas import DCFAssumptions, DDMAssumptions, MacroAssumptions
 from .utils import available_model_price, is_num
 
@@ -30,6 +33,13 @@ def _fmt_pct(x):
     if not is_num(x):
         return "n/a"
     return f"{x * 100:+.1f}%"
+
+
+def _fmt_rate(x):
+    """A rate without a forced sign: '17.5%', '-3.0%'."""
+    if not is_num(x):
+        return "n/a"
+    return f"{x * 100:.1f}%"
 
 
 # Matches the dashboard API, which clamps forecast_years to this range.
@@ -71,6 +81,24 @@ def _positive(text: str) -> float:
     return x
 
 
+# A return on new invested capital at or above this is read as a percentage
+# typed by mistake (15 for 15%); returns up to 500% are accepted as decimals,
+# with a note from 100% up (3 is read as 300%, not 3%).
+MAX_TERMINAL_RONIC = 5.0
+
+
+def _ronic(text: str) -> float:
+    """argparse type for --terminal-ronic: a decimal > 0 and < MAX_TERMINAL_RONIC."""
+    x = _number(text)
+    if x >= MAX_TERMINAL_RONIC:
+        raise argparse.ArgumentTypeError(
+            f"{text} looks like a percentage; RONIC is a decimal (use {x / 100:g} for {x:g}%)"
+        )
+    if x <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {text}")
+    return x
+
+
 def _forecast_years(text: str) -> int:
     try:
         n = int(text)
@@ -92,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         "2 for invalid arguments.",
     )
     p.add_argument("ticker", nargs="?", help="Target ticker, e.g. AAPL")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument(
         "--demo",
         action="store_true",
@@ -101,7 +130,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--peers",
         default=None,
-        help="Comma-separated peer tickers for comps (comps are skipped if omitted).",
+        help="Comma-separated peer tickers for comps (comps are skipped if omitted, "
+        "unless --auto-peers).",
+    )
+    p.add_argument(
+        "--auto-peers",
+        action="store_true",
+        help="Suggest peers from Yahoo's industry list when --peers is omitted "
+        "(review the list).",
+    )
+    p.add_argument(
+        "--comps-basis",
+        choices=["fy", "ttm"],
+        default="fy",
+        help="Target figures the peers' trailing multiples are applied to: fy, the "
+        "latest fiscal year (default; a note flags a trailing net income or EBITDA "
+        "more than 15%% away, or a trailing loss), or ttm, Yahoo's trailing twelve "
+        "months for revenue, EBITDA and net income, not screened for one-off items "
+        "(the DCF stays on the fiscal year).",
     )
     p.add_argument("--out", default=config.DEFAULT_OUTPUT_DIR, help="Output directory.")
 
@@ -124,9 +170,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--terminal-growth", type=_rate(), default=config.DEFAULT_TERMINAL_GROWTH,
                    help="Long-run growth rate (decimal) for the DCF, DDM and FCFE "
                    "terminal values.")
-    p.add_argument("--terminal-method", choices=["gordon", "exit_multiple"], default="gordon")
+    p.add_argument("--terminal-method", choices=["gordon", "exit_multiple", "value_driver"],
+                   default="gordon",
+                   help="DCF terminal value: Gordon growth (default), an exit EV/EBITDA "
+                   "multiple, or value_driver, NOPAT x (1 - g / RONIC) / (WACC - g), "
+                   "which ties reinvestment to the return on new capital.")
     p.add_argument("--exit-ev-ebitda", type=_positive, default=None,
                    help="Exit EV/EBITDA multiple (required if terminal-method=exit_multiple).")
+    p.add_argument("--terminal-ronic", type=_ronic, default=None,
+                   help="Return on new invested capital (decimal, e.g. 0.15; 1.5 is 150%%) for "
+                   "--terminal-method value_driver; must exceed --terminal-growth. "
+                   "Default: WACC (growth adds no value).")
     p.add_argument("--target-ebit-margin", type=_rate(), default=None,
                    help="Terminal EBIT margin (decimal, e.g. 0.25) to fade toward.")
 
@@ -146,7 +200,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _print_summary(report) -> None:
     s = report.summary
-    sym = config.CURRENCY_SYMBOLS.get(s.get("currency"), "")
+    # An unmapped quote currency prints its ISO code ("SEK 33.74"), so a price
+    # never shows without a unit.
+    sym = config.currency_symbol(s.get("currency"))
     line = "=" * 64
     print(line)
     print(f"  {s['name']}  ({s['ticker']})")
@@ -180,11 +236,41 @@ def _print_summary(report) -> None:
     print(f"  {'Blended target':<{width}} {_fmt_money(s['blended_target'], sym):>14}   "
           f"{_fmt_pct(s['blended_upside']):>8}")
     print(line)
+    reverse = getattr(report, "reverse_dcf", None)
+    if isinstance(reverse, dict):
+        _print_reverse_dcf(reverse)
+        print(line)
     if report.warnings:
         print("  Notes:")
         for w in report.warnings:
             print(f"    - {w}")
         print(line)
+
+
+def _print_reverse_dcf(reverse: dict) -> None:
+    """The reverse-DCF block (``report.reverse_dcf``): per driver, the value the
+    market price implies and the model's own value; an unsolved driver prints
+    n/a and the solver's note beneath. With no driver solved at all (a
+    reference-only DCF, no valid price) the single note is printed instead."""
+    print("  Reverse DCF (what the price implies, other inputs held):")
+    margin, wacc = reverse.get("margin"), reverse.get("wacc")
+    if not reverse.get("converged") and margin is None and wacc is None:
+        print(f"    {reverse.get('note') or 'n/a'}")
+        return
+    rows = [
+        ("Year-1 revenue growth", reverse, "implied_growth_y1", "current_assumption_y1"),
+        ("Target EBIT margin", margin, "implied_target_ebit_margin",
+         "current_target_ebit_margin"),
+        ("Discount rate (WACC)", wacc, "implied_wacc", "current_wacc"),
+    ]
+    for label, leg, implied_key, model_key in rows:
+        if not isinstance(leg, dict):
+            print(f"    {label:<24}{'n/a':>8}")
+            continue
+        implied = leg.get(implied_key) if leg.get("converged") else None
+        print(f"    {label:<24}{_fmt_rate(implied):>8}   (model {_fmt_rate(leg.get(model_key))})")
+        if leg.get("note"):
+            print(f"      {leg['note']}")
 
 
 def main(argv=None) -> int:
@@ -195,6 +281,29 @@ def main(argv=None) -> int:
     if args.exit_ev_ebitda is not None and args.terminal_method != "exit_multiple":
         print("note: --exit-ev-ebitda is ignored unless --terminal-method exit_multiple.",
               file=sys.stderr)
+    if args.terminal_ronic is not None and args.terminal_method != "value_driver":
+        print("note: --terminal-ronic is ignored unless --terminal-method value_driver.",
+              file=sys.stderr)
+    elif args.terminal_ronic is not None:
+        # The model would fall back to WACC; an explicit input is an error.
+        if args.terminal_ronic <= args.terminal_growth:
+            parser.error(f"--terminal-ronic {args.terminal_ronic:g} must exceed "
+                         f"--terminal-growth {args.terminal_growth:g}.")
+        if args.terminal_ronic >= 1.0:
+            # Accepted (see MAX_TERMINAL_RONIC), but say how it was read.
+            print(f"note: --terminal-ronic {args.terminal_ronic:g} is read as "
+                  f"{args.terminal_ronic:.0%}; use {args.terminal_ronic / 100:g} for "
+                  f"{args.terminal_ronic:g}%.", file=sys.stderr)
+    if args.comps_basis != "fy" and args.no_comps:
+        print("note: --comps-basis is ignored with --no-comps.", file=sys.stderr)
+    if args.auto_peers and args.no_comps:
+        print("note: --auto-peers is ignored with --no-comps.", file=sys.stderr)
+    elif args.auto_peers and args.peers:
+        print("note: --auto-peers is ignored when --peers is given.", file=sys.stderr)
+    # Checked before the valuation runs: an empty --out (an unset "$OUTDIR")
+    # would otherwise fail only at makedirs, after a possibly networked run.
+    if not args.out:
+        parser.error("--out must not be empty.")
     if os.path.exists(args.out) and not os.path.isdir(args.out):
         parser.error(f"--out {args.out} exists and is not a directory.")
 
@@ -207,13 +316,16 @@ def main(argv=None) -> int:
         args.ticker = DEMO_TICKER
         provider = SyntheticProvider()
         if not args.peers:
-            args.peers = ",".join(DEMO_PEERS)
+            # With --auto-peers the engine "discovers" the same synthetic
+            # peers through the provider, offline.
+            args.peers = None if args.auto_peers else ",".join(DEMO_PEERS)
         elif not {t.strip().upper() for t in args.peers.split(",") if t.strip()} \
                 <= set(DEMO_PEERS):
             # The synthetic provider would attach made-up multiples to real tickers.
             parser.error(f"--demo uses its synthetic peers ({','.join(DEMO_PEERS)}); "
                          "omit --peers.")
-    elif not args.ticker:
+    elif not (args.ticker or "").strip():
+        # A blank ticker ("   ") is an argument error, not a failed valuation.
         parser.error("a ticker is required (or use --demo for the offline example).")
 
     macro = MacroAssumptions(
@@ -229,6 +341,7 @@ def main(argv=None) -> int:
         exit_ev_ebitda=args.exit_ev_ebitda,
         target_ebit_margin=args.target_ebit_margin,
         tax_rate=args.tax,
+        terminal_ronic=args.terminal_ronic,
     )
     # Same terminal growth for DDM/FCFE as for the DCF, as the dashboard does.
     ddm_assumptions = DDMAssumptions(
@@ -251,6 +364,8 @@ def main(argv=None) -> int:
             run_ddm=not args.no_ddm,
             run_fcfe=not args.no_fcfe,
             run_sensitivity=not args.no_sensitivity,
+            auto_peers=args.auto_peers,
+            comps_basis=args.comps_basis,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: could not value {args.ticker}: {exc}", file=sys.stderr)

@@ -2,7 +2,7 @@
 
 // SEC filings + earnings-call transcripts the AI can read on demand. Each row
 // has a "Digest" action that sends the document to the analyst, which returns
-// a cited brief (Digest) the orchestrator appends to AI Research.
+// a cited brief (Digest) that the page appends to AI Research.
 
 import React, { useEffect, useState } from "react";
 import type { Digest, Filing, FilingsList, Report, TranscriptMeta } from "@/lib/types";

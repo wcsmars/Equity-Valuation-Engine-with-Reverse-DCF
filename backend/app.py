@@ -1,5 +1,6 @@
-"""FastAPI app: valuation + filings intelligence + FMP enrichment + AI research
-+ Office exports + watchlist/persistence. All JSON except the export downloads.
+"""FastAPI app: valuation + peer suggestions + filings intelligence + FMP
+enrichment + AI research + Office exports + watchlist/persistence. All JSON
+except the export downloads.
 
 Run from the repo root:
     uvicorn backend.app:app --reload --port 8000
@@ -24,8 +25,8 @@ from equity_valuation.data.base import DataError
 
 from . import ai_service, exports, filings, store
 from .fmp_client import FMPClient
-from .serialization import build_ai_context
-from .valuation_service import AssumptionError, SnapshotError, run_valuation
+from .serialization import _sanitize, build_ai_context
+from .valuation_service import AssumptionError, SnapshotError, discover_peers, run_valuation
 
 app = FastAPI(title="Equity Research Automation API", version="2.0.0")
 
@@ -53,8 +54,10 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Request-body caps. /api/ai/* carries base64 PDFs and matches the Next
 # proxy's 50 MB body cap (frontend/next.config.mjs), which it must not exceed:
-# the proxy cuts longer bodies short. Every other route takes plain JSON, the
-# largest being one ticker's saved research state.
+# the proxy cuts longer bodies short. This is a transport cap only: what goes
+# on to the Anthropic API must also fit its 32 MB request limit, which
+# ai_service checks before sending (HTTP 413). Every other route takes plain
+# JSON, the largest being one ticker's saved research state.
 MAX_BODY_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 50 * 1024 * 1024
 _UPLOAD_PREFIX = "/api/ai/"
@@ -293,7 +296,11 @@ def _context(report: Optional[dict], extra: Optional[str]) -> str:
         except Exception:  # noqa: BLE001
             pass
     if extra and extra.strip():
-        parts.append("USER RESEARCH NOTES / FED MATERIAL SO FAR:\n" + extra.strip())
+        # The research log holds model-written summaries of third-party
+        # documents. Fenced, and the system prompt treats it as reference
+        # data, so instructions planted in a document carry no authority.
+        parts.append("USER RESEARCH NOTES / FED MATERIAL SO FAR:\n"
+                     + ai_service.fence("research_log", extra.strip()))
     return "\n\n".join(parts)
 
 
@@ -312,6 +319,17 @@ def _anthropic_http(exc: Exception) -> Optional[HTTPException]:
     msg = msg.strip()
     if msg and msg[-1] not in ".!?":
         msg += "."
+    slow = HTTPException(
+        status_code=504,
+        detail="The Anthropic API took too long to respond. Try again, or "
+        "send less material.",
+    )
+    if isinstance(exc, anthropic.APITimeoutError) and (
+            exc.__cause__ is None or type(exc.__cause__).__name__ == "ReadTimeout"):
+        # Sent, then no response in time: a slow or stalled API, not the
+        # user's network. Connect, write (upload) and pool timeouts are local
+        # or network trouble and fall through to the 503 below.
+        return slow
     if isinstance(exc, anthropic.APIConnectionError):
         what = "timed out" if isinstance(exc, anthropic.APITimeoutError) else "failed"
         return HTTPException(
@@ -320,12 +338,18 @@ def _anthropic_http(exc: Exception) -> Optional[HTTPException]:
         )
     if not isinstance(exc, anthropic.APIStatusError):
         return HTTPException(status_code=502, detail=f"Anthropic API error: {msg}")
-    code = exc.status_code
+    # A streamed call that fails after the API answered HTTP 200 (overloaded,
+    # rate limited, server error) gets an `error` event, which the SDK raises
+    # with status_code 200; error_status() reads the status it stands for off
+    # the event's error.type, so it maps like the plain HTTP error would.
+    in_stream = exc.status_code < 400
+    code = ai_service.error_status(exc)
     if code in (401, 403):
         return HTTPException(
             status_code=502,
             detail=f"Anthropic rejected the API key (HTTP {code}): {msg} "
-            "Check ANTHROPIC_API_KEY in Settings.",
+            "Replace it under API keys at the top of the dashboard, or edit "
+            "ANTHROPIC_API_KEY in .env.",
         )
     if code == 404:
         return HTTPException(
@@ -357,12 +381,19 @@ def _anthropic_http(exc: Exception) -> Optional[HTTPException]:
             status_code=503,
             detail=f"The Anthropic API is overloaded or unavailable: {msg} Try again shortly.",
         )
+    if code == 504:
+        return slow
+    if in_stream:
+        return HTTPException(status_code=502,
+                             detail=f"Anthropic API error during the response: {msg}")
     return HTTPException(status_code=502, detail=f"Anthropic API error (HTTP {code}): {msg}")
 
 
 def _http(exc: Exception) -> HTTPException:
     if isinstance(exc, SnapshotError):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ai_service.AIRequestTooLargeError):
+        return HTTPException(status_code=413, detail=str(exc))
     if isinstance(exc, ai_service.AIError):
         return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, AssumptionError):
@@ -397,22 +428,71 @@ def health() -> dict[str, Any]:
     }
 
 
+# A plausible exchange ticker (BRK.B, BRK-B, 7203.T): checked before any
+# lookup so arbitrary text never reaches the data provider.
+_TICKER_RE = re.compile(r"[A-Za-z0-9.\-]{1,12}")
+
+# How the market-data client words "Yahoo has no price for this symbol"
+# (YFinanceClient.get_market_data), almost always a mistyped or delisted
+# ticker. The API answers it in plain words instead of the client's.
+_NO_QUOTE_PREFIX = "No obtainable price for "
+
+
+def _request_ticker(raw: Any) -> str:
+    """The upper-cased ticker of a valuation or export request, or HTTP 400
+    before any lookup: 'A ticker is required.' when it is empty, 'Invalid
+    ticker.' when it is not a plausible exchange ticker (``_TICKER_RE``)."""
+    ticker = (raw or "").strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="A ticker is required.")
+    if _TICKER_RE.fullmatch(ticker) is None:
+        raise HTTPException(status_code=400, detail="Invalid ticker.")
+    return ticker.upper()
+
+
+def _data_http(ticker: str, exc: DataError) -> HTTPException:
+    """A DataError from loading `ticker` as HTTP 404. No quote at all reads
+    'No market data for X; check the symbol...'; any other failure (no usable
+    fundamentals, a missing exchange rate) keeps the provider's reason."""
+    if str(exc).startswith(_NO_QUOTE_PREFIX):
+        return HTTPException(
+            status_code=404,
+            detail=f"No market data for {ticker}; check the symbol, or try again "
+            "shortly if the market-data service is unreachable.",
+        )
+    return HTTPException(status_code=404, detail=f"Could not load {ticker}: {exc}")
+
+
 @app.post("/api/valuation")
 def valuation(req: ValuationRequest) -> dict:
     payload = req.model_dump()
-    ticker = (payload.pop("ticker", "") or "").strip().upper()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="A ticker is required.")
+    ticker = _request_ticker(payload.pop("ticker", ""))
     try:
         return run_valuation(ticker, payload)
     except AssumptionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except DataError as exc:
-        raise HTTPException(
-            status_code=404, detail=f"Could not load {ticker}: {exc}"
-        ) from exc
+        raise _data_http(ticker, exc) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/peers/{ticker}")
+def peers(ticker: str) -> dict:
+    """Suggested peers for the dashboard's 'Suggest peers' button
+    (``valuation_service.discover_peers``: Yahoo's industry list within a
+    market-cap band). Suggestions only: nothing is applied, and the notes ask
+    for review. An implausible ticker is a 400; a failed lookup is still a
+    200 with no peers and a note saying why, so the button never errors."""
+    if _TICKER_RE.fullmatch(ticker) is None:
+        raise HTTPException(status_code=400, detail="Invalid ticker.")
+    symbol = ticker.upper()
+    try:
+        return _sanitize(discover_peers(symbol))
+    except Exception as exc:  # noqa: BLE001 - suggestions are optional
+        return {"ticker": symbol, "industry_key": None, "industry": None, "peers": [],
+                "notes": [f"No peers discovered: peer discovery failed ({exc})."],
+                "source": "the data provider"}
 
 
 @app.get("/api/enrichment/{ticker}")
@@ -543,10 +623,8 @@ def export(kind: str, req: ExportRequest):
         raise HTTPException(status_code=404, detail=f"Unknown export '{kind}'.")
     fn, media = _EXPORTERS[kind]
     payload = req.model_dump()
-    ticker = (payload.pop("ticker", "") or "").strip().upper()
+    ticker = _request_ticker(payload.pop("ticker", ""))
     note = payload.pop("note", None)
-    if not ticker:
-        raise HTTPException(status_code=400, detail="A ticker is required.")
     try:
         # Exporters write a fixed output/{TICKER}_*.ext path. Build and read the
         # file under a lock, then send the bytes: a concurrent export of the
@@ -564,6 +642,8 @@ def export(kind: str, req: ExportRequest):
             headers={"Content-Disposition":
                      f'attachment; filename="{os.path.basename(path)}"'},
         )
+    except DataError as exc:
+        raise _data_http(ticker, exc) from exc
     except Exception as exc:  # noqa: BLE001
         raise _http(exc) from exc
 
@@ -612,11 +692,13 @@ def _upsert_env_file(updates: dict[str, str]) -> None:
     """Set KEY=value lines in the project .env. Every existing assignment of a
     key (including `export KEY=` and duplicates) is replaced by one line, so a
     later duplicate can't win when the launcher sources the file. The write is
-    atomic (temp file + os.replace) and the file is owner-only (0600)."""
+    atomic (temp file + os.replace) and the file is owner-only (0600). Bytes
+    that are not UTF-8 (a .env saved as Latin-1 by another editor) are kept
+    exactly as they were (surrogateescape); new values are ASCII."""
     env_path = Path(os.path.realpath(_ENV_PATH))  # keep a symlinked .env a symlink
     lines: list[str] = []
     if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
+        lines = env_path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
     for key, value in updates.items():
         pat = re.compile(rf"\s*(?:export\s+)?{re.escape(key)}\s*=")
         out: list[str] = []
@@ -633,7 +715,7 @@ def _upsert_env_file(updates: dict[str, str]) -> None:
         lines = out
     fd, tmp = tempfile.mkstemp(dir=str(env_path.parent), prefix=".env.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
             f.write("\n".join(lines) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -670,7 +752,7 @@ def settings(req: SettingsRequest) -> dict:
     with _settings_lock:
         try:
             _upsert_env_file(updates)
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             raise HTTPException(
                 status_code=500, detail=f"Could not write .env: {exc}"
             ) from exc

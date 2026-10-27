@@ -2,7 +2,6 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type {
-  AssumptionsUsed,
   Assumptions,
   AssumptionSuggestion,
   Digest,
@@ -27,18 +26,34 @@ import {
   type ExportKind,
 } from "@/lib/api";
 import {
+  appendLogEntry,
+  digestLogEntry,
   fmtBlendedTarget,
   fmtBlendedUpside,
-  fmtDate,
   fmtMoney,
-  fmtPct,
   toneForBlendedUpside,
   toneForRecommendation,
-  toneForUpside,
-  watchlistUpside,
+  upgradeDigestLog,
+  withFullStop,
 } from "@/lib/format";
-import { NoteOrder, chainSave, settledWithin } from "@/lib/sync";
-import { Badge, Button, Spinner, cx } from "@/components/ui";
+import {
+  SUGGESTION_KEYS,
+  assumptionsFromUsed,
+  customFields,
+  isPlausibleTicker,
+  peersOnly,
+} from "@/lib/assumptions";
+import {
+  HeldDigests,
+  LoadGate,
+  NoteOrder,
+  chainSave,
+  digestLanding,
+  waitForSaves,
+} from "@/lib/sync";
+import { Alert, Badge, Button, Spinner, TabBar, cx } from "@/components/ui";
+import { ApiKeysForm, ApiKeysToggle } from "@/components/ApiKeys";
+import { WatchlistGrid, WatchToggle } from "@/components/Watchlist";
 
 import ValuationSummary from "@/components/ValuationSummary";
 import DCFPanel from "@/components/DCFPanel";
@@ -50,6 +65,7 @@ import FinancialsPanel from "@/components/FinancialsPanel";
 import FilingsPanel from "@/components/FilingsPanel";
 import NewsPanel from "@/components/NewsPanel";
 import AIResearchPanel from "@/components/AIResearchPanel";
+import VerdictExplainer from "@/components/VerdictExplainer";
 
 const TABS = [
   "Overview",
@@ -62,39 +78,19 @@ const TABS = [
 ] as const;
 type Tab = (typeof TABS)[number];
 
-function assumptionsFromUsed(used?: AssumptionsUsed): Assumptions {
-  if (!used) return {};
-  return {
-    rf: used.rf,
-    erp: used.erp,
-    tax_rate: used.tax_rate ?? undefined,
-    cost_of_debt: used.cost_of_debt ?? undefined,
-    forecast_years: used.forecast_years,
-    terminal_growth: used.terminal_growth,
-    terminal_method: used.terminal_method,
-    exit_ev_ebitda: used.exit_ev_ebitda ?? undefined,
-    target_ebit_margin: used.target_ebit_margin ?? undefined,
-    revenue_growth_y1: used.revenue_growth_y1 ?? undefined,
-    revenue_growth: used.revenue_growth_y1 == null ? used.revenue_growth ?? undefined : undefined,
-    peers: used.peers ?? undefined,
-  };
-}
-
 // Longest a ticker load waits for earlier saves to land before re-reading
 // saved research (a local save takes milliseconds; this only bounds a save
 // that never answers).
 const SAVE_WAIT_MS = 10_000;
 
-const FIELD_TO_KEY: Record<AssumptionSuggestion["field"], keyof Assumptions> = {
-  terminal_growth: "terminal_growth",
-  forecast_years: "forecast_years",
-  target_ebit_margin: "target_ebit_margin",
-  risk_free_rate: "rf",
-  equity_risk_premium: "erp",
-  tax_rate: "tax_rate",
-  exit_ev_ebitda: "exit_ev_ebitda",
-  revenue_growth_y1: "revenue_growth_y1",
-};
+// Most peers FMP's list fills into an empty peer box when a ticker loads.
+const MAX_AUTO_PEERS = 8;
+
+// The HTTP status a failed API call carries (lib/api's ApiError), else null.
+function httpStatus(e: unknown): number | null {
+  const status = (e as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? status : null;
+}
 
 const EXPORTS: { kind: ExportKind; label: string }[] = [
   { kind: "excel", label: "Excel model" },
@@ -114,6 +110,12 @@ export default function Home() {
   const [recomputing, setRecomputing] = useState(false);
   const [enrichLoading, setEnrichLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The failed load behind the error banner, for its Retry buttons: shown
+  // only while that error is the one on screen.
+  const [loadFailure, setLoadFailure] = useState<{
+    message: string;
+    status: number | null;
+  } | null>(null);
   const [researchNotes, setResearchNotes] = useState("");
   const [digests, setDigests] = useState<DigestEntry[]>([]);
   const [note, setNote] = useState<ResearchNote | null>(null);
@@ -135,6 +137,14 @@ export default function Home() {
   // Ticker whose saved research couldn't be read (autosave is paused for it).
   const [restoreFailedFor, setRestoreFailedFor] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
+  // The header's "Custom inputs" list is open.
+  const [showCustom, setShowCustom] = useState(false);
+  // The comps card's peer input, focused by the header's "Add peers" action
+  // once the Valuation tab (which holds the card) has rendered: a request
+  // bumps peerFocus and sets peerFocusPending, which the effect consumes.
+  const peerInputRef = useRef<HTMLInputElement | null>(null);
+  const [peerFocus, setPeerFocus] = useState(0);
+  const peerFocusPending = useRef(false);
 
   const autoPeeredFor = useRef<string>("");
   // Autosave only runs for this ticker: set once its saved research has been
@@ -157,8 +167,29 @@ export default function Home() {
   // Per-ticker order of note requests, so an older note that finishes after
   // a newer one never replaces it.
   const noteOrder = useRef(new NoteOrder());
-  const loadSeq = useRef(0); // guards against a stale load finishing late
+  // Ticker loads and the view on screen (see LoadGate): work captures
+  // loads.current.view when it starts and lands only while it is unchanged,
+  // so it keeps landing on the ticker on screen until a load really replaces
+  // it, and a stale load or recompute that finishes late is dropped.
+  const loads = useRef(new LoadGate());
+  const loadRunning = useRef(false); // a switched-to load is still fetching
+  // The newest load asked for, until it lands or is refused: Analyze for a
+  // ticker still loading does nothing, while another ticker replaces it
+  // (LoadGate drops the older load).
+  const requested = useRef<{ ticker: string; load: number } | null>(null);
   const recomputeSeq = useRef(0); // only the newest recompute may land
+  // Digests that finished while a load was re-reading saved research, or was
+  // waiting while the research on screen was not autosaved (digestLanding).
+  const held = useRef(new HeldDigests<DigestEntry>());
+  // The research log and digests as last rendered, for a save made outside
+  // the autosave (a digest that lands while a load waits, see onDigested).
+  const shownResearch = useRef<{ notes: string; digests: DigestEntry[] }>({
+    notes: "",
+    digests: [],
+  });
+  useEffect(() => {
+    shownResearch.current = { notes: researchNotes, digests };
+  }, [researchNotes, digests]);
 
   const queueResearchSave = useCallback((t: string, state: ResearchState) => {
     const save = chainSave(lastSave.current, () => saveResearchState(t, state));
@@ -169,7 +200,20 @@ export default function Home() {
         if (lastSave.current === save) unsaved.current = false;
         setSaveError(null);
       },
-      (e) => setSaveError(`Couldn't save research for ${t}: ${e instanceof Error ? e.message : String(e)}`)
+      (e) => setSaveError(withFullStop(
+        `Couldn't save research for ${t}: ${e instanceof Error ? e.message : String(e)}`
+      ))
+    );
+  }, []);
+
+  // Adds finished digests to the research on screen: the digest history and
+  // the research log, which carries each digest's cited facts, risks and
+  // catalysts (the log is the context later notes, chats and digests get).
+  const appendDigests = useCallback((entries: DigestEntry[]) => {
+    if (entries.length === 0) return;
+    setDigests((prev) => [...prev, ...entries]);
+    setResearchNotes((prev) =>
+      entries.reduce((log, e) => appendLogEntry(log, digestLogEntry(e.source, e.digest)), prev)
     );
   }, []);
 
@@ -249,21 +293,58 @@ export default function Home() {
   const loadTicker = useCallback(async (sym: string, resetAssumptions = false) => {
     const t = sym.trim().toUpperCase();
     if (!t) return;
-    const seq = ++loadSeq.current;
-    // Write any debounced edits of the ticker on screen before its state is
-    // cleared (and before a reload of the same ticker re-reads it).
-    pendingSave.current?.();
-    // Preserve the visible edits if saving failed or timed out. Reading old
-    // server state and autosaving it would otherwise silently lose them.
-    setLoading(true);
-    setError(null);
-    const saved = await settledWithin(lastSave.current, SAVE_WAIT_MS);
-    if (seq !== loadSeq.current) return;
-    if (!saved) {
-      setError("Research has not finished saving. Your current edits are still here; retry saving before loading another ticker.");
-      setLoading(false);
+    // The backend refuses anything else (400 "Invalid ticker."); say so
+    // before any request, and keep the ticker on screen.
+    if (!isPlausibleTicker(t)) {
+      setLoadFailure(null);
+      setError(`"${sym.trim()}" is not a ticker: use up to 12 letters, digits, dots or hyphens (e.g. BRK-B, 7203.T).`);
       return;
     }
+    // First write the debounced edits of the ticker on screen, and wait until
+    // every save sent so far has landed (waitForSaves), before its state is
+    // cleared (or a reload of the same ticker re-reads it). Until then the
+    // ticker on screen stays live: a recompute, note or digest that finishes
+    // meanwhile still lands on it (a note or digest is also saved at once, so
+    // the wait covers it). The view switches only after the wait, so a
+    // refused or superseded load leaves that work intact, and work started on
+    // the old view can never land on the new one.
+    const load = loads.current.start();
+    requested.current = { ticker: t, load };
+    const done = () => {
+      if (requested.current?.load === load) requested.current = null;
+    };
+    // The input shows the ticker being loaded, however it was asked for (the
+    // watchlist, Retry, Reset to defaults).
+    setInput(t);
+    setLoading(true);
+    setError(null);
+    setLoadFailure(null);
+    const wait = await waitForSaves({
+      flush: () => pendingSave.current?.(),
+      last: () => lastSave.current,
+      pending: () => pendingSave.current !== null,
+      superseded: () => loads.current.isSuperseded(load),
+    }, SAVE_WAIT_MS);
+    // The view switches here, after the wait, and only when every save has
+    // landed (LoadGate.settle); otherwise seq is null.
+    const seq = loads.current.settle(load, wait);
+    if (seq === null) {
+      if (wait === "superseded") return; // the newer load takes over
+      // Preserve the visible edits if saving failed or timed out. Reading old
+      // server state and autosaving it would otherwise silently lose them.
+      // Digests held while waiting go to the research still on screen.
+      const onScreen = tickerRef.current;
+      if (onScreen && restoreDoneFor.current === onScreen) {
+        appendDigests(held.current.take(onScreen));
+      }
+      setError("Research has not finished saving. Your current edits are still here; retry saving before loading another ticker.");
+      if (!loadRunning.current) setLoading(false);
+      done();
+      return;
+    }
+    loadRunning.current = true;
+    held.current.keepOnly(t);
+    setLoading(true); // an older load may have finished while this one waited
     setReport(null);
     setEnrichment(null);
     setEnrichLoading(false);
@@ -274,6 +355,8 @@ export default function Home() {
     setNoteLoading(false);
     setRecomputing(false);
     setRestoreFailedFor("");
+    setShowCustom(false);
+    peerFocusPending.current = false;
     autoPeeredFor.current = "";
     stateLoadedFor.current = "";
     restoreDoneFor.current = "";
@@ -288,17 +371,21 @@ export default function Home() {
     let restored = false;
     try {
       const st = await fetchResearchState(t);
-      if (seq !== loadSeq.current) return; // a newer load superseded us
-      setResearchNotes(st.notes ?? "");
+      if (seq !== loads.current.view) return; // a newer load superseded us
+      // A log saved before digest entries carried their cited facts gets
+      // them back from the saved digests (see upgradeDigestLog).
+      setResearchNotes(upgradeDigestLog(st.notes ?? "", st.digests));
       setDigests(st.digests ?? []);
       setNote(st.note ?? null);
-      if (!resetAssumptions && st.assumptions && Object.keys(st.assumptions).length > 0) {
-        savedAssumptions = st.assumptions;
+      if (st.assumptions && Object.keys(st.assumptions).length > 0) {
+        // "Retry with default assumptions" drops the saved DCF drivers but
+        // keeps the peer set (see peersOnly).
+        savedAssumptions = resetAssumptions ? peersOnly(st.assumptions) : st.assumptions;
       }
       setAssumptions(savedAssumptions);
       restored = true;
     } catch {
-      if (seq !== loadSeq.current) return;
+      if (seq !== loads.current.view) return;
       // Value the ticker anyway, but keep autosave off so the blank state
       // can't overwrite research we merely failed to read.
       setRestoreFailedFor(t);
@@ -309,43 +396,53 @@ export default function Home() {
     const late = lateNote.current;
     lateNote.current = null;
     if (late?.ticker === t) setNote(late.note);
+    // Digests for this ticker that finished while it was being re-read.
+    appendDigests(held.current.take(t));
 
     try {
       const rep = await fetchValuation(t, savedAssumptions);
-      if (seq !== loadSeq.current) return;
+      if (seq !== loads.current.view) return;
       setReport(rep);
       setAssumptions(assumptionsFromUsed(rep.assumptions_used));
       setTab("Overview");
       if (restored) stateLoadedFor.current = t;
     } catch (e) {
-      if (seq !== loadSeq.current) return;
-      setError(e instanceof Error ? e.message : String(e));
+      if (seq !== loads.current.view) return;
+      // The backend's message as it is ("No market data for X; check the
+      // symbol…" for a 404); the status decides which retries make sense.
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      setLoadFailure({ message, status: httpStatus(e) });
     } finally {
-      if (seq === loadSeq.current) setLoading(false);
+      if (seq === loads.current.view) {
+        setLoading(false);
+        loadRunning.current = false;
+      }
+      done();
     }
     setEnrichLoading(true);
     fetchEnrichment(t)
       .then((en) => {
-        if (seq === loadSeq.current) setEnrichment(en);
+        if (seq === loads.current.view) setEnrichment(en);
       })
       .catch(() => {
-        if (seq === loadSeq.current) setEnrichment({ enabled: false });
+        if (seq === loads.current.view) setEnrichment({ enabled: false });
       })
       .finally(() => {
-        if (seq === loadSeq.current) setEnrichLoading(false);
+        if (seq === loads.current.view) setEnrichLoading(false);
       });
-  }, []);
+  }, [appendDigests]);
 
   const recompute = useCallback(
     async (override?: Assumptions) => {
       if (!ticker || ticker !== tickerRef.current) return;
       const a = override ?? assumptions;
-      const seq = loadSeq.current;
+      const seq = loads.current.view;
       const rseq = ++recomputeSeq.current;
       // Drop the result if another ticker was loaded or a newer recompute
       // started meanwhile — it would overwrite the newer report.
       const current = () =>
-        seq === loadSeq.current && rseq === recomputeSeq.current;
+        seq === loads.current.view && rseq === recomputeSeq.current;
       setRecomputing(true);
       setError(null);
       try {
@@ -372,7 +469,7 @@ export default function Home() {
     const fmpPeers = (enrichment.peers || []).filter((p) => p && p !== ticker);
     if (!hasPeers && fmpPeers.length > 0 && !assumptions.peers) {
       autoPeeredFor.current = ticker;
-      const next = { ...assumptions, peers: fmpPeers.slice(0, 8).join(",") };
+      const next = { ...assumptions, peers: fmpPeers.slice(0, MAX_AUTO_PEERS).join(",") };
       setAssumptions(next);
       recompute(next);
     }
@@ -401,6 +498,21 @@ export default function Home() {
     };
   }, [ticker, researchNotes, digests, note, assumptions, queueResearchSave]);
 
+  // "Add peers": the Valuation tab holds the comps card; focus its peer input
+  // once that tab has rendered (the ref is attached by then).
+  const addPeers = useCallback(() => {
+    peerFocusPending.current = true;
+    setTab("Valuation");
+    setPeerFocus((n) => n + 1);
+  }, []);
+  useEffect(() => {
+    if (!peerFocusPending.current || tab !== "Valuation") return;
+    peerFocusPending.current = false;
+    const el = peerInputRef.current;
+    el?.focus();
+    el?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+  }, [peerFocus, tab]);
+
   // Keep the watchlist snapshot fresh whenever a watched ticker reloads.
   // Reads through watchlistRef so a just-removed ticker isn't re-added by a
   // recompute that was already in flight.
@@ -420,7 +532,7 @@ export default function Home() {
 
   const applySuggestion = useCallback(
     (sug: AssumptionSuggestion) => {
-      const key = FIELD_TO_KEY[sug.field];
+      const key = SUGGESTION_KEYS[sug.field];
       const next: Assumptions = { ...assumptions, [key]: sug.suggested_value };
       if (sug.field === "revenue_growth_y1") next.revenue_growth = undefined;
       if (sug.field === "exit_ev_ebitda") next.terminal_method = "exit_multiple";
@@ -431,24 +543,39 @@ export default function Home() {
     [assumptions, recompute]
   );
 
-  // Digests can take a minute+; if the user switched to another ticker while
-  // one was in flight, drop the result instead of appending it to the wrong
-  // company's research. Panels are keyed by ticker, so the closure's `ticker`
-  // is the ticker the digest was started for.
-  const viewSequence = loadSeq.current;
+  // Digests can take a minute+. Panels are keyed by ticker, so the closure's
+  // `ticker` is the ticker the digest was started for. A digest is never added
+  // to another company's research. While a load waits for saves it is added
+  // and saved at once, so the wait covers it before the view switches; while
+  // this ticker's saved research is being re-read it is held until that
+  // settles, so re-analyzing the same ticker keeps it (see digestLanding).
   const onDigested = useCallback(
     (source: string, digest: Digest) => {
-      if (tickerRef.current !== ticker || loadSeq.current !== viewSequence) return;
-      setDigests((prev) => [
-        ...prev,
-        { source, digest, at: new Date().toISOString() },
-      ]);
-      setResearchNotes((prev) =>
-        (prev ? prev + "\n\n" : "") + `[${source}] ${digest.summary}`
-      );
+      const entry: DigestEntry = { source, digest, at: new Date().toISOString() };
+      const landing = digestLanding({
+        ticker,
+        onScreen: tickerRef.current,
+        loadWaiting: loads.current.waiting,
+        restored: restoreDoneFor.current === ticker,
+        autosaved: stateLoadedFor.current === ticker,
+      });
+      if (landing === "hold") held.current.hold(ticker, entry);
+      if (landing === "drop" || landing === "hold") return;
+      appendDigests([entry]);
+      if (landing === "save") {
+        // Send the debounced edits first, then the research with this digest
+        // added, so the newest save is the one the waiting load covers.
+        pendingSave.current?.();
+        const next = {
+          notes: appendLogEntry(shownResearch.current.notes, digestLogEntry(source, digest)),
+          digests: [...shownResearch.current.digests, entry],
+        };
+        shownResearch.current = next;
+        queueResearchSave(ticker, next);
+      }
       setTab("AI Research");
     },
-    [ticker, viewSequence]
+    [ticker, appendDigests, queueResearchSave]
   );
 
   // A note takes about a minute. If another load started meanwhile, never
@@ -460,7 +587,7 @@ export default function Home() {
   // for the same ticker is dropped (noteOrder).
   const generateNote = useCallback(async () => {
     if (!report || !ticker) return;
-    const seq = loadSeq.current;
+    const seq = loads.current.view;
     const t = ticker;
     const order = noteOrder.current.start(t);
     setNoteLoading(true);
@@ -471,8 +598,14 @@ export default function Home() {
         extra_context: researchNotes,
       });
       if (!noteOrder.current.keep(t, order)) return;
-      if (seq === loadSeq.current) {
+      if (seq === loads.current.view) {
         setNote(n);
+        // A load waiting for saves could switch away (or re-read this
+        // ticker) before the autosave picks the note up; send it now so the
+        // wait covers it.
+        if (loads.current.waiting) {
+          queueResearchSave(t, { note: n });
+        }
       } else {
         queueResearchSave(t, { note: n });
         if (tickerRef.current === t) {
@@ -481,10 +614,10 @@ export default function Home() {
         }
       }
     } catch (e) {
-      if (seq === loadSeq.current)
+      if (seq === loads.current.view)
         setError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (seq === loadSeq.current) setNoteLoading(false);
+      if (seq === loads.current.view) setNoteLoading(false);
     }
   }, [report, researchNotes, ticker, queueResearchSave]);
 
@@ -545,6 +678,9 @@ export default function Home() {
   }, [changeWatchlist]);
 
   const s = report?.summary;
+  // Inputs this report was run with that differ from the engine's defaults
+  // (saved research restores them silently, so the header says so).
+  const custom = report ? customFields(report.assumptions_used, report.assumptions_default) : [];
 
   return (
     <div className="mx-auto max-w-7xl px-4 pb-16 pt-5">
@@ -559,6 +695,9 @@ export default function Home() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
+            // Analyze stays enabled while a ticker loads, so another ticker
+            // can replace it; the one already loading is not asked for twice.
+            if (input.trim().toUpperCase() === requested.current?.ticker) return;
             loadTicker(input);
           }}
           className="flex items-center gap-2"
@@ -570,7 +709,7 @@ export default function Home() {
             className="w-56 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint focus:border-brand focus:outline-none"
             autoFocus
           />
-          <Button type="submit" disabled={loading}>
+          <Button type="submit">
             {loading ? <Spinner /> : "Analyze"}
           </Button>
         </form>
@@ -589,19 +728,23 @@ export default function Home() {
           >
             AI {status.anthropic_enabled ? "configured" : "off"}
           </span>
-          {(!status.fmp_enabled || !status.anthropic_enabled) && (
-            <button
-              onClick={() => setShowKeys((v) => !v)}
-              className="rounded-md border border-brand/40 bg-brand/10 px-2 py-0.5 font-medium text-brand transition hover:bg-brand/20"
-            >
-              {showKeys ? "Close" : "Add API keys"}
-            </button>
-          )}
+          {/* Always offered, so a wrong or revoked key can be replaced. */}
+          <ApiKeysToggle
+            status={status}
+            open={showKeys}
+            onToggle={() => setShowKeys((v) => !v)}
+          />
         </div>
       )}
 
       {showKeys && status && (
-        <form
+        <ApiKeysForm
+          status={status}
+          anthropicKey={keyAnthropic}
+          fmpKey={keyFmp}
+          setAnthropicKey={setKeyAnthropic}
+          setFmpKey={setKeyFmp}
+          saving={savingKeys}
           onSubmit={async (e) => {
             e.preventDefault();
             setSavingKeys(true);
@@ -623,15 +766,15 @@ export default function Home() {
               // FMP just connected: refresh enrichment for the loaded ticker.
               const activeTicker = tickerRef.current;
               if (activeTicker) {
-                const seq = loadSeq.current;
+                const seq = loads.current.view;
                 setEnrichLoading(true);
                 fetchEnrichment(activeTicker)
                   .then((en) => {
-                    if (seq === loadSeq.current) setEnrichment(en);
+                    if (seq === loads.current.view) setEnrichment(en);
                   })
                   .catch(() => {})
                   .finally(() => {
-                    if (seq === loadSeq.current) setEnrichLoading(false);
+                    if (seq === loads.current.view) setEnrichLoading(false);
                   });
               }
             } catch (err2) {
@@ -640,64 +783,46 @@ export default function Home() {
               setSavingKeys(false);
             }
           }}
-          className="mt-2 flex flex-wrap items-end gap-3 rounded-xl border border-line bg-surface px-4 py-3"
-        >
-          {!status.anthropic_enabled && (
-            <label className="flex flex-col gap-1 text-[11px] text-ink-dim">
-              Anthropic API key (AI researcher)
-              <input
-                type="password"
-                value={keyAnthropic}
-                onChange={(e) => setKeyAnthropic(e.target.value)}
-                placeholder="sk-ant-…"
-                className="w-72 rounded-lg border border-line bg-surface-raised px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint focus:border-brand focus:outline-none"
-              />
-            </label>
-          )}
-          {!status.fmp_enabled && (
-            <label className="flex flex-col gap-1 text-[11px] text-ink-dim">
-              FMP API key (news, transcripts, estimates)
-              <input
-                type="password"
-                value={keyFmp}
-                onChange={(e) => setKeyFmp(e.target.value)}
-                placeholder="optional"
-                className="w-72 rounded-lg border border-line bg-surface-raised px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint focus:border-brand focus:outline-none"
-              />
-            </label>
-          )}
-          <Button type="submit" disabled={savingKeys || (!keyAnthropic && !keyFmp)}>
-            {savingKeys ? <Spinner /> : "Save keys"}
-          </Button>
-          <span className="text-[11px] text-ink-faint">
-            Stored in the server&apos;s local .env and sent only to the selected API provider.
-          </span>
-        </form>
+        />
       )}
 
       {error && (
-        <div className="mt-4 rounded-lg border border-down/40 bg-down/10 px-4 py-3 text-sm text-down">
+        <Alert className="mt-4">
           {error}
-          {!report && !loading && ticker && (
-            <Button variant="ghost" className="ml-3" onClick={() => loadTicker(ticker, true)}>
-              Retry with default assumptions
-            </Button>
+          {/* A plain retry keeps the saved assumptions; the second drops the
+              saved DCF drivers (the usual cause of a refused valuation) but
+              keeps the peer set. Neither is offered for an error that is not
+              a failed load, and no assumption brings back market data that
+              is missing (404). */}
+          {!report && !loading && ticker && loadFailure?.message === error && (
+            <>
+              <Button variant="ghost" className="ml-3" onClick={() => loadTicker(ticker)}>
+                Retry
+              </Button>
+              {loadFailure.status !== 404 && (
+                <Button variant="ghost" className="ml-2" onClick={() => loadTicker(ticker, true)}>
+                  Retry with default assumptions
+                </Button>
+              )}
+            </>
           )}
-        </div>
+        </Alert>
       )}
 
       {saveError && (
-        <div role="alert" className="mt-3 rounded-lg border border-flat/40 bg-flat/10 px-4 py-3 text-sm text-flat">
-          {saveError}. Keep this page open until saving succeeds.
+        <Alert tone="flat" className="mt-3">
+          {saveError} Keep this page open until saving succeeds.
           {ticker && stateLoadedFor.current === ticker && (
             <Button variant="ghost" className="ml-3" onClick={() => queueResearchSave(ticker, {
               notes: researchNotes, digests, note, assumptions,
             })}>Retry save</Button>
           )}
-        </div>
+        </Alert>
       )}
 
-      {!report && !loading && !error && (
+      {/* Shown under an error too, so a mistyped ticker does not hide the
+          watchlist. */}
+      {!report && !loading && (
         <div className="mt-16 text-center">
           <h1 className="text-2xl font-semibold text-ink">
             Type a ticker for an instant multi-model valuation.
@@ -714,65 +839,11 @@ export default function Home() {
               <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-ink-faint">
                 Watchlist
               </h2>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {watchlist.map((w) => {
-                  // No upside (and no colour) without a target or when the
-                  // verdict was withheld.
-                  const up = watchlistUpside(w);
-                  const hasTarget = Number.isFinite(w.blended_target as number);
-                  return (
-                    <div
-                      key={w.ticker}
-                      onClick={() => loadTicker(w.ticker)}
-                      className="group cursor-pointer rounded-xl border border-line bg-surface px-4 py-3 transition hover:border-brand"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-ink">
-                            {w.ticker}
-                          </span>
-                          <span className="truncate text-xs text-ink-faint">
-                            {w.name}
-                          </span>
-                        </div>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            removeFromWatchlist(w.ticker);
-                          }}
-                          className="text-ink-faint opacity-0 transition hover:text-down group-hover:opacity-100"
-                          title="Remove"
-                        >
-                          ×
-                        </button>
-                      </div>
-                      <div className="num mt-1 flex items-baseline gap-2 text-sm">
-                        <span className="text-ink">
-                          {fmtMoney(w.price, w.currency)}
-                        </span>
-                        <span className="text-ink-faint">→</span>
-                        <span className={toneForUpside(up)}>
-                          {hasTarget
-                            ? `${fmtMoney(w.blended_target, w.currency)} (${
-                                up == null ? "n/a" : fmtPct(up, { signed: true })
-                              })`
-                            : "no target"}
-                        </span>
-                      </div>
-                      <div className="mt-1 flex items-center justify-between text-[11px]">
-                        <span
-                          className={toneForRecommendation(w.recommendation)}
-                        >
-                          {w.recommendation}
-                        </span>
-                        <span className="text-ink-faint">
-                          {fmtDate(w.updated_at)}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              <WatchlistGrid
+                items={watchlist}
+                onOpen={(t) => loadTicker(t)}
+                onRemove={removeFromWatchlist}
+              />
             </div>
           )}
         </div>
@@ -788,23 +859,18 @@ export default function Home() {
       {report && s && (
         <>
           {/* Company header */}
-          <div className="mt-5 flex flex-wrap items-end justify-between gap-4 rounded-xl border border-line bg-surface px-5 py-4">
+          {/* relative: the Custom inputs list is placed against this card,
+              not its button, so it stays on screen at every width. */}
+          <div className="relative mt-5 flex flex-wrap items-end justify-between gap-4 rounded-xl border border-line bg-surface px-5 py-4">
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-xl font-semibold text-ink">{s.name}</h2>
                 <Badge tone="neutral">{s.ticker}</Badge>
-                <button
-                  onClick={toggleWatch}
-                  className={cx(
-                    "text-lg leading-none transition",
-                    watching
-                      ? "text-flat"
-                      : "text-ink-faint hover:text-flat"
-                  )}
-                  title={watching ? "Remove from watchlist" : "Add to watchlist"}
-                >
-                  {watching ? "★" : "☆"}
-                </button>
+                <WatchToggle
+                  ticker={s.ticker}
+                  watching={watching}
+                  onToggle={toggleWatch}
+                />
                 {report.company.market.sector && (
                   <span className="text-xs text-ink-faint">
                     {report.company.market.sector}
@@ -842,50 +908,129 @@ export default function Home() {
                 ))}
               </div>
             </div>
-            <div className="flex items-end gap-6">
-              <div className="text-right">
-                <div className="text-[11px] uppercase tracking-wider text-ink-faint">
-                  Blended fair value
-                </div>
-                {/* A null target reads "n/a" or "No target (supply peers)";
-                    a withheld verdict leaves the upside "n/a", uncoloured. */}
-                <div
-                  className={cx(
-                    "num font-semibold text-ink",
-                    Number.isFinite(s.blended_target as number)
-                      ? "text-2xl"
-                      : "text-base"
-                  )}
-                >
-                  {fmtBlendedTarget(s, report.comps)}
-                </div>
-                <div
-                  className={cx(
-                    "num text-sm font-medium",
-                    toneForBlendedUpside(s)
-                  )}
-                >
-                  {fmtBlendedUpside(s)} vs price
-                </div>
-              </div>
-              <div className="text-right">
-                <div className="text-[11px] uppercase tracking-wider text-ink-faint">
-                  Verdict
-                </div>
-                <div
-                  className={cx(
-                    "text-lg font-semibold",
-                    toneForRecommendation(s.recommendation)
-                  )}
-                >
-                  {s.recommendation}
-                </div>
-                {recomputing && (
-                  <div className="mt-1 flex items-center justify-end gap-1 text-xs text-ink-faint">
-                    <Spinner className="h-3 w-3" /> recomputing
+            <div className="flex flex-col items-end gap-1.5">
+              <div className="flex items-end gap-6">
+                <div className="text-right">
+                  <div className="text-[11px] uppercase tracking-wider text-ink-faint">
+                    Blended fair value
                   </div>
-                )}
+                  {/* A null target reads "n/a" or "No target (supply peers)";
+                      a withheld verdict leaves the upside "n/a", uncoloured. */}
+                  <div
+                    className={cx(
+                      "num font-semibold text-ink",
+                      Number.isFinite(s.blended_target as number)
+                        ? "text-2xl"
+                        : "text-base"
+                    )}
+                  >
+                    {fmtBlendedTarget(s, report.comps)}
+                  </div>
+                  <div
+                    className={cx(
+                      "num text-sm font-medium",
+                      toneForBlendedUpside(s)
+                    )}
+                  >
+                    {fmtBlendedUpside(s)} vs price
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[11px] uppercase tracking-wider text-ink-faint">
+                    Verdict
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    {/* Saved research restores custom inputs silently; say
+                        which ones drive this verdict, with a way back. */}
+                    {custom.length > 0 && (
+                      <div
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") setShowCustom(false);
+                        }}
+                      >
+                        <button
+                          type="button"
+                          aria-expanded={showCustom}
+                          // The list exists only while open.
+                          aria-controls={showCustom ? "custom-inputs" : undefined}
+                          onClick={() => setShowCustom((v) => !v)}
+                          title="This valuation uses inputs that differ from the engine's defaults"
+                          className="rounded-md border border-flat/40 bg-flat/10 px-2 py-0.5 text-[11px] font-medium text-flat transition hover:border-flat"
+                        >
+                          {`Custom inputs (${custom.length})`}
+                        </button>
+                        {showCustom && (
+                          <div
+                            id="custom-inputs"
+                            role="region"
+                            aria-label="Custom inputs"
+                            // Placed against the header card: a 320 px panel
+                            // aligned to the button ran off the left edge
+                            // wherever the card wraps and the button sits
+                            // mid-row (phones, and tablets up to about 1000
+                            // px). Card-wide there; from lg up, 320 px under
+                            // the card's right edge, beside the verdict.
+                            className="absolute inset-x-3 top-full z-20 mt-1 rounded-lg border border-line bg-surface p-3 text-left shadow-lg lg:left-auto lg:right-5 lg:w-80"
+                          >
+                            <p className="text-[11px] text-ink-faint">
+                              This valuation uses inputs that differ from the
+                              engine&apos;s defaults. They are saved with this
+                              ticker&apos;s research and come back when it loads.
+                            </p>
+                            <ul className="mt-2 space-y-1 text-xs">
+                              {custom.map((c) => (
+                                <li key={c.key} className="flex items-baseline justify-between gap-3">
+                                  <span className="shrink-0 text-ink-dim">{c.label}</span>
+                                  <span className="num min-w-0 break-words text-right text-ink">
+                                    {c.to}{" "}
+                                    <span className="text-ink-faint">(default {c.from})</span>
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                            <Button
+                              variant="ghost"
+                              className="mt-3 w-full"
+                              disabled={loading}
+                              onClick={() => {
+                                setShowCustom(false);
+                                loadTicker(ticker, true);
+                              }}
+                            >
+                              Reset to defaults
+                            </Button>
+                            {custom.some((c) => c.key === "peers") && (
+                              <p className="mt-1 text-[11px] text-ink-faint">
+                                Reset keeps the peer set; edit it in the Trading
+                                comps box.
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <div
+                      className={cx(
+                        "text-lg font-semibold",
+                        toneForRecommendation(s.recommendation)
+                      )}
+                    >
+                      {s.recommendation}
+                    </div>
+                  </div>
+                  {recomputing && (
+                    <div className="mt-1 flex items-center justify-end gap-1 text-xs text-ink-faint">
+                      <Spinner className="h-3 w-3" /> recomputing
+                    </div>
+                  )}
+                </div>
               </div>
+              {/* Why there is no verdict, no target or a smaller blend. */}
+              <VerdictExplainer
+                summary={s}
+                comps={report.comps}
+                onAddPeers={addPeers}
+              />
             </div>
           </div>
 
@@ -898,27 +1043,20 @@ export default function Home() {
           )}
 
           {/* Tabs */}
-          <div className="mt-4 flex flex-wrap gap-1 border-b border-line">
-            {TABS.map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className={cx(
-                  "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition",
-                  tab === t
-                    ? "border-brand text-ink"
-                    : "border-transparent text-ink-faint hover:text-ink-dim"
-                )}
-              >
-                {t}
-                {t === "AI Research" && digests.length > 0 && (
-                  <span className="num ml-1.5 rounded-full bg-brand/15 px-1.5 text-[10px] text-brand">
-                    {digests.length}
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
+          <TabBar
+            className="mt-4"
+            label="Report sections"
+            tabs={TABS}
+            value={tab}
+            onChange={setTab}
+            badge={(t) =>
+              t === "AI Research" && digests.length > 0 && (
+                <span className="num ml-1.5 rounded-full bg-brand/15 px-1.5 text-[10px] text-brand">
+                  {digests.length}
+                </span>
+              )
+            }
+          />
 
           <div className="mt-4">
             {tab === "Overview" && <ValuationSummary report={report} />}
@@ -939,8 +1077,15 @@ export default function Home() {
                     setAssumptions={setAssumptions}
                     onRecompute={recompute}
                     recomputing={recomputing}
+                    inputRef={peerInputRef}
                   />
-                  <DDMFCFEPanel report={report} />
+                  <DDMFCFEPanel
+                    report={report}
+                    assumptions={assumptions}
+                    setAssumptions={setAssumptions}
+                    onRecompute={recompute}
+                    recomputing={recomputing}
+                  />
                 </div>
                 <SensitivityPanel report={report} />
               </div>

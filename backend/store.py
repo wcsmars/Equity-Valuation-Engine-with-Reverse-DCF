@@ -28,6 +28,10 @@ _MAX_TICKER_LEN = 32
 _MAX_TEXT_FIELD = 200  # watchlist name / currency / recommendation
 _MAX_RESEARCH_BYTES = 8 * 1024 * 1024  # one ticker's saved research state
 _MAX_STORE_BYTES = 64 * 1024 * 1024  # the whole file; only growth past it is refused
+# Nesting depth of a saved value. The dashboard's deepest (a digest's facts)
+# is about 4; the API's JSON serializer gives up near 255, so a deeper value
+# would save but make every later read of it fail.
+_MAX_DEPTH = 64
 
 
 class StoreError(RuntimeError):
@@ -152,10 +156,28 @@ def _check_ticker(ticker: str) -> str:
     return ticker
 
 
+def _utf8(text: str) -> str:
+    """`text` with any lone UTF-16 surrogate (e.g. half an emoji cut by a
+    client, sent as "\\ud83d") replaced by '?'. JSON can carry one and the file
+    can hold it escaped, but the API cannot encode it in a response, so every
+    later read of the record would fail."""
+    return text if text.isascii() else text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _too_deep(value, depth: int = 0) -> bool:
+    if depth > _MAX_DEPTH:
+        return True
+    if isinstance(value, dict):
+        return any(_too_deep(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return any(_too_deep(v, depth + 1) for v in value)
+    return False
+
+
 def _text(value):
     """A watchlist text field: strings are cut to length, anything else
     becomes null."""
-    return value[:_MAX_TEXT_FIELD] if isinstance(value, str) else None
+    return _utf8(value[:_MAX_TEXT_FIELD]) if isinstance(value, str) else None
 
 
 def _number(value):
@@ -169,12 +191,16 @@ def _number(value):
 
 def _finite(value):
     """`value` with every NaN/Infinity, at any depth, replaced by null, as a
-    browser's JSON.stringify would send it. Python's JSON parser accepts those
-    tokens from other clients, but a strict JSON file can't hold them."""
+    browser's JSON.stringify would send it, and every string (keys included)
+    passed through _utf8. Python's JSON parser accepts those tokens and lone
+    surrogates from other clients, but a strict JSON file or an API response
+    can't hold them. _load applies it too, so an older store repairs itself."""
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return _utf8(value)
     if isinstance(value, dict):
-        return {k: _finite(v) for k, v in value.items()}
+        return {(_utf8(k) if isinstance(k, str) else k): _finite(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_finite(v) for v in value]
     return value
@@ -190,7 +216,7 @@ def upsert_watchlist(snapshot: dict) -> list[dict]:
     """Add or refresh one ticker's snapshot {ticker, name, currency, price,
     blended_target, recommendation}. Fields keep their expected types (text
     cut to 200 characters, finite numbers or null), so an entry stays small."""
-    ticker = str(snapshot.get("ticker", "")).upper().strip()
+    ticker = _utf8(str(snapshot.get("ticker", ""))).upper().strip()
     if not ticker:
         return get_watchlist()
     _check_ticker(ticker)
@@ -229,10 +255,14 @@ def get_research(ticker: str) -> dict:
 def save_research(ticker: str, state: dict) -> dict:
     """Persist {notes, digests, note, assumptions} for a ticker (partial ok).
     Omitted fields stay unchanged; explicit null clears a field.
-    NaN/Infinity anywhere in the state are saved as null. An empty or overlong
-    ticker, or a state over _MAX_RESEARCH_BYTES, is refused whole
+    NaN/Infinity anywhere in the state are saved as null and lone surrogates
+    as '?'. An empty or overlong ticker, a state nested deeper than
+    _MAX_DEPTH, or one over _MAX_RESEARCH_BYTES, is refused whole
     (StoreLimitError), never truncated, so the last good save survives."""
-    ticker = _check_ticker(ticker.upper().strip())
+    ticker = _check_ticker(_utf8(ticker).upper().strip())
+    if _too_deep(state):
+        raise StoreLimitError(
+            f"Saved research is nested more than {_MAX_DEPTH} levels deep.", status_code=400)
     with _lock:
         data = _load()
         cur = data["research"].get(ticker, {})

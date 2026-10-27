@@ -19,6 +19,8 @@ Design notes:
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Optional
 
 from .. import config
@@ -32,6 +34,7 @@ from ..schemas import (
 )
 from ..utils import (
     MAINTENANCE_CAPEX_KINDS,
+    MARGIN_COLLAPSE_SHARE,
     MARGIN_SPIKE_WINDOW,
     NWC_ONE_OFF_REVENUE_SHARE,
     charge_year_margin,
@@ -48,8 +51,9 @@ from ..utils import (
     safe_div,
     screened_incremental_ratio,
     series_cagr,
+    share_scale_break,
 )
-from .wacc import effective_tax_rate_detail
+from .wacc import effective_tax_rate_detail, tax_gap_years
 
 # Minimum spread required between the cost of equity and a perpetual growth rate
 # for a Gordon-style terminal/perpetuity to be finite and well-behaved. The
@@ -66,6 +70,12 @@ _MAX_MEANINGFUL_ROE = 1.0
 # is in line (BP FY2025: 0.03% against 3.7%, after impairments below operating
 # profit and an 83% tax charge). See ``_latest_net_margin``.
 NET_MARGIN_COLLAPSE_SHARE = 0.25
+
+# The note for a net margin adjusted by a one-off EBIT margin's after-tax
+# excess is WARNING-prefixed when the adjustment flips the margin's sign or
+# moves it by at least this much (5pp, the spike screen's own minimum gap,
+# ``utils.MARGIN_SPIKE_MIN_GAP``). See ``_latest_net_margin``.
+EBIT_SPIKE_WARNING_SHIFT = 0.05
 
 # Total dividends paid that fall by more than half, or more than double, from
 # one year to the next mark a break in the paying history: a cut or suspension
@@ -165,13 +175,15 @@ def _latest_net_margin(
     fin: AnnualFinancials,
     notes: Optional[list[str]] = None,
     tax_rate: Optional[float] = None,
+    gap_years: Optional[frozenset] = None,
 ) -> Optional[float]:
     """Latest net income / revenue, guarding None/zero revenue.
 
     Adjustments, each with a note, keep one unusual year from being held for
     the whole projection. Both taxes use the rate the DCF applies to NOPAT: an
     explicit ``tax_rate`` (``macro.tax_rate``, the CLI's ``--tax``) when set,
-    else ``wacc.effective_tax_rate_detail``'s rate.
+    else ``wacc.effective_tax_rate_detail``'s rate (``gap_years``: the tax
+    years the provider zero-filled, ``wacc.tax_gap_years``).
       * When the tax history is too thin or distorted for an effective rate
         (``effective_tax_rate_detail`` falls back to the marginal rate:
         NOL-shielded years, an allowance release) and the latest year is
@@ -187,6 +199,8 @@ def _latest_net_margin(
         margin), the after-tax excess of the latest EBIT margin over that
         median is taken off. (SOLV FY2025: a divestiture gain in operating
         income, while the net margin looks in line with carve-out years.)
+        The note is WARNING-prefixed when this flips the margin's sign or
+        moves it by ``EBIT_SPIKE_WARNING_SHIFT`` or more.
       * Otherwise, when neither applied, the EBIT margin is positive and in
         line, but the reported net margin is below
         ``NET_MARGIN_COLLAPSE_SHARE`` of the margin that EBIT
@@ -202,9 +216,20 @@ def _latest_net_margin(
         margin actually used.
     A loss year that the EBIT margin shares (a charge year in operating
     profit) is kept here; ``run_fcfe`` fades it (``_charge_year_net_target``).
-    When the provider marks a common-earnings attribution adjustment, only
-    like-for-like historical net margins are compared: consolidated EBIT and
-    pretax income cannot reconstruct cash flow belonging to common holders.
+    When the provider marks a common-earnings attribution adjustment
+    (noncontrolling interests or preferred holders take part of consolidated
+    profit), net income is never rebuilt from consolidated pretax income, and
+    the EBIT-based rules run on a common basis: the EBIT spike's after-tax
+    excess is scaled by common holders' share of consolidated profit in the
+    prior years (``_common_profit_share``), and the collapse screen takes the
+    latest noncontrolling and preferred income off the margin EBIT implies and
+    also needs the net margin under a quarter of its own prior median
+    (``net_margin_collapse``). The flag is set for most large filers (any
+    noncontrolling income, KO, WMT, BP), so switching the rules off for it
+    left BP FY2025's collapsed margin in place. Only when the latest year's
+    noncontrolling and preferred income cannot be reconciled (pretax income
+    or tax unreported) is the reported common margin kept as it is, with a
+    note.
     """
     ni = getattr(fin, "net_income", None) or []
     rev = getattr(fin, "revenue", None) or []
@@ -214,7 +239,8 @@ def _latest_net_margin(
     if not is_num(latest) or ni[-1] == 0 or rev[-1] <= 0:
         return latest
     pretax = (getattr(fin, "pretax_income", None) or [None])[-1]
-    tax, tax_source, _ = effective_tax_rate_detail(fin, config.DEFAULT_MARGINAL_TAX_RATE)
+    tax, tax_source, _ = effective_tax_rate_detail(fin, config.DEFAULT_MARGINAL_TAX_RATE,
+                                                   gap_years)
     thin_history = tax_source != "effective (historical)"
     if is_num(tax_rate):
         tax, rate_label = float(tax_rate), "the set tax rate"
@@ -237,28 +263,48 @@ def _latest_net_margin(
                 f"median {spike['prior_median']:.1%} (likely a one-off gain or charge); "
                 f"projecting from the {spike['years']}-year median {spike['median']:.1%}.")
             return robust
+    reconciled = attributed and _noncommon_income_margin(fin) is not None
+    if reconciled and thin_history and is_num(pretax) and pretax > 0:
+        notes.append("Common earnings attribution retained: the tax history is too thin for "
+                     "an effective rate, but net income is not rebuilt from consolidated "
+                     "pretax income, which includes noncontrolling or preferred holders' "
+                     "income.")
+    common_share = 1.0
     if attributed:
-        # The provider has established (or warned about) a distinct common-
-        # earnings basis. Consolidated EBIT/pretax would put preferred holders'
-        # or noncontrolling shareholders' income back into common FCFE.
-        notes.append("Common earnings attribution retained; consolidated pretax income "
-                     "and EBIT are not used to rebuild the net margin.")
-        return margin
+        if not reconciled:
+            # Consolidated EBIT would put preferred holders' or noncontrolling
+            # shareholders' income back into common FCFE, and the latest year's
+            # share of it cannot be taken back out.
+            notes.append("Common earnings attribution retained; consolidated pretax income "
+                         "and EBIT are not used to adjust the net margin (the latest year's "
+                         "noncontrolling and preferred income cannot be reconciled).")
+            return margin
+        common_share = _common_profit_share(fin)
     ebit = getattr(fin, "ebit", None) or []
     op_spike = None
     if ebit and is_num(ebit[-1]) and ebit[-1] != 0:
         _, op_spike = robust_latest_margin(ebit, rev)
         if op_spike is not None:
-            excess = (op_spike["latest"] - op_spike["median"]) * (1.0 - tax)
+            excess = (op_spike["latest"] - op_spike["median"]) * (1.0 - tax) * common_share
+            share_text = (f", at common holders' {common_share:.0%} share of consolidated "
+                          "profit" if common_share < 1.0 else "")
+            adjusted = margin - excess
+            # WARNING-prefixed, like the collapse and charge-year notes, when it
+            # flips the margin's sign or moves it by EBIT_SPIKE_WARNING_SHIFT or
+            # more: it then overrides the reported figure enough to move the
+            # verdict (GIS: -0.5% -> 9.4%, in place of the charge-year fade).
+            warn = margin * adjusted <= 0 or abs(excess) >= EBIT_SPIKE_WARNING_SHIFT
             notes.append(
-                f"Latest EBIT margin {op_spike['latest']:.1%} is out of line with the prior "
+                ("WARNING: latest" if warn else "Latest")
+                + f" EBIT margin {op_spike['latest']:.1%} is out of line with the prior "
                 f"median {op_spike['prior_median']:.1%} (likely a one-off gain or charge); "
                 f"net margin adjusted by its after-tax excess over the {op_spike['years']}-year "
-                f"median (taxed at {tax:.1%}; {margin:.1%} -> {margin - excess:.1%}).")
-            margin -= excess
+                f"median (taxed at {tax:.1%}{share_text}; {margin:.1%} -> "
+                f"{adjusted:.1%}).")
+            margin = adjusted
     # Only the reported margin is tested (a rebuilt one already has a normal
     # tax charge, and the rules do not stack).
-    collapse = (net_margin_collapse(fin, tax)
+    collapse = (net_margin_collapse(fin, tax, gap_years)
                 if margin == latest and op_spike is None else None)
     if collapse is not None:
         implied, prior_med = collapse["implied"], collapse["prior_median"]
@@ -276,13 +322,51 @@ def _latest_net_margin(
                 source += f" (prior median {prior_med:.1%} is no better)"
         # WARNING-prefixed like the charge-year notes: it overrides the
         # reported figure and can move the verdict (BP.L, GIS).
+        after = f"interest and tax at {tax:.1%}"
+        if collapse["noncommon"] > 0:
+            after = (f"interest, tax at {tax:.1%} and noncontrolling/preferred income "
+                     f"({collapse['noncommon']:.1%} of revenue)")
         notes.append(
             f"WARNING: latest net margin {margin:.1%} is far below the {implied:.1%} its EBIT "
-            f"margin {collapse['ebit_margin']:.1%} implies after interest and tax at {tax:.1%} "
+            f"margin {collapse['ebit_margin']:.1%} implies after {after} "
             "(items below operating profit such as impairments, or an abnormal tax "
             f"charge); projecting from {source}, {new:.1%}.")
         margin = new
     return margin
+
+
+def _noncommon_income_margin(fin: Optional[AnnualFinancials]) -> Optional[float]:
+    """The latest year's noncontrolling and preferred income as a share of
+    revenue, floored at 0: consolidated profit (pretax income less tax) minus
+    common net income. None when the latest pretax income, tax or revenue is
+    unusable (missing, or the providers' 0.0 gap filler)."""
+    def last(name):
+        return (getattr(fin, name, None) or [None])[-1]
+
+    ni, rev, pretax, tx = (last("net_income"), last("revenue"), last("pretax_income"),
+                           last("tax_expense"))
+    if not all(is_num(v) for v in (ni, rev, pretax, tx)) or rev <= 0 or pretax == 0 or tx == 0:
+        return None
+    return max(0.0, (pretax - tx - ni) / rev)
+
+
+def _common_profit_share(fin: AnnualFinancials) -> float:
+    """Common holders' share of consolidated profit (pretax income less tax):
+    the median of common net income over that profit across the prior years
+    in the ``MARGIN_SPIKE_WINDOW`` where both are positive (zero-filled pretax
+    or tax years left out), capped at 1; 1.0 when no year is usable. The
+    latest year is left out, since a one-off moves it."""
+    ni = getattr(fin, "net_income", None) or []
+    pretax = getattr(fin, "pretax_income", None) or []
+    taxes = getattr(fin, "tax_expense", None) or []
+    n = min(len(ni), len(pretax), len(taxes))
+    shares = []
+    for i in range(max(0, n - MARGIN_SPIKE_WINDOW), n - 1):
+        c, p, t = ni[i], pretax[i], taxes[i]
+        if (is_num(c) and is_num(p) and is_num(t) and p != 0 and t != 0
+                and c > 0 and p - t > 0):
+            shares.append(min(1.0, c / (p - t)))
+    return median(shares) if shares else 1.0
 
 
 def _prior_median_margin(numerators, denominators) -> Optional[float]:
@@ -294,7 +378,9 @@ def _prior_median_margin(numerators, denominators) -> Optional[float]:
 
 
 def net_margin_collapse(
-    fin: Optional[AnnualFinancials], tax_rate: Optional[float] = None
+    fin: Optional[AnnualFinancials],
+    tax_rate: Optional[float] = None,
+    gap_years: Optional[frozenset] = None,
 ) -> Optional[dict]:
     """Detail dict when the latest reported net margin has collapsed below
     operating profit, else None.
@@ -306,16 +392,24 @@ def net_margin_collapse(
     implies, (EBIT - interest) x (1 - tax) / revenue: impairments of
     investments or an abnormal tax charge below operating profit (BP FY2025:
     0.03% against 3.7%). ``tax_rate`` is the rate to apply (the CLI's
-    ``--tax``), else ``wacc.effective_tax_rate_detail``'s rate. The dict has
-    ``latest``, ``implied``, ``ebit_margin``, ``tax`` and ``prior_median``
-    (the median net margin of the prior years in the window, or None). A year
-    whose EBIT margin is itself out of line is screened for the comps by
+    ``--tax``), else ``wacc.effective_tax_rate_detail``'s rate (``gap_years``:
+    the tax years the provider zero-filled). The dict has ``latest``,
+    ``implied``, ``ebit_margin``, ``tax``, ``prior_median`` (the median net
+    margin of the prior years in the window, or None) and ``noncommon``. A
+    year whose EBIT margin is itself out of line is screened for the comps by
     ``ebit_charge_collapse``.
-    A provider-marked common-income attribution difference disables this
-    consolidated-profit comparison.
+    When the provider marks a common-income attribution difference
+    (``_income_attribution_adjusted``: noncontrolling interests or preferred
+    holders take part of consolidated profit), the comparison is made on a
+    common basis: the latest year's noncontrolling and preferred income
+    (``noncommon``, a share of revenue: consolidated profit, pretax income
+    less tax, minus common net income) comes off the implied margin, and the
+    latest net margin must also be under ``NET_MARGIN_COLLAPSE_SHARE`` of its
+    prior median, common against common. None when that income cannot be
+    reconciled (``_noncommon_income_margin``). ``noncommon`` is 0.0 for an
+    unflagged filer.
     """
-    if getattr(fin, "_income_attribution_adjusted", False):
-        return None
+    attributed = bool(getattr(fin, "_income_attribution_adjusted", False))
     ni = getattr(fin, "net_income", None) or []
     rev = getattr(fin, "revenue", None) or []
     ebit = getattr(fin, "ebit", None) or []
@@ -326,17 +420,26 @@ def net_margin_collapse(
         return None
     if not (is_num(ebit[-1]) and ebit[-1] > 0) or robust_latest_margin(ebit, rev)[1] is not None:
         return None
+    noncommon = 0.0
+    if attributed:
+        noncommon = _noncommon_income_margin(fin)
+        if noncommon is None:
+            return None
     if is_num(tax_rate):
         tax = float(tax_rate)
     else:
-        tax, _, _ = effective_tax_rate_detail(fin, config.DEFAULT_MARGINAL_TAX_RATE)
+        tax, _, _ = effective_tax_rate_detail(fin, config.DEFAULT_MARGINAL_TAX_RATE, gap_years)
     interest = (getattr(fin, "interest_expense", None) or [None])[-1]
     interest = abs(interest) if is_num(interest) else 0.0
-    implied = (ebit[-1] - interest) * (1.0 - tax) / rev[-1]
+    implied = (ebit[-1] - interest) * (1.0 - tax) / rev[-1] - noncommon
     if implied <= 0 or latest >= NET_MARGIN_COLLAPSE_SHARE * implied:
         return None
+    prior_med = _prior_median_margin(ni, rev)
+    if attributed and not (is_num(prior_med) and prior_med > 0
+                           and latest < NET_MARGIN_COLLAPSE_SHARE * prior_med):
+        return None
     return {"latest": latest, "implied": implied, "ebit_margin": ebit[-1] / rev[-1],
-            "tax": tax, "prior_median": _prior_median_margin(ni, rev)}
+            "tax": tax, "prior_median": prior_med, "noncommon": noncommon}
 
 
 def ebit_charge_collapse(fin: Optional[AnnualFinancials]) -> Optional[dict]:
@@ -346,21 +449,27 @@ def ebit_charge_collapse(fin: Optional[AnnualFinancials]) -> Optional[dict]:
     ``net_margin_collapse`` skips a year whose EBIT margin is a one-off
     (``utils.robust_latest_margin``), since the DCF and FCFE already start from
     the median then. The comps apply a peer P/E to the reported EPS, so they
-    also need this case: the latest net margin, still positive, is below
-    ``NET_MARGIN_COLLAPSE_SHARE`` of the median net margin of the prior years
-    in the window, and the latest EBIT margin
+    also need this case: the latest net margin is still positive and the
+    latest EBIT margin
       * is a one-off drop below its prior median (``robust_latest_margin``),
         or has collapsed to under a third of it (``utils.collapsed_margin``, a
         drop too small in points for the spike screen, which the DCF also
         fades from): ``ebit_move`` "drop" or "collapse", a charge inside
-        operating profit (GM FY2025: EBIT margin 1.6% against 6.7%, net margin
-        1.46% against 6.1%; at an EBIT margin of 1.8% only the collapse rule
-        would catch it); or
+        operating profit. The EBIT screen already marks the charge year, so
+        the net margin need only be under ``MARGIN_COLLAPSE_SHARE`` (a third)
+        of the median net margin of the prior years in the window, the share
+        the EBIT collapse rule uses. GM FY2025: EBIT margin 1.6% against
+        6.7%; net margin 1.72% against 5.76% (0.30 of it) on EDGAR's income
+        available to common stockholders, which a quarter would miss. At an
+        EBIT margin of 1.8% only the collapse rule catches it; or
       * is a one-off rise above it: ``ebit_move`` "gain", so a charge below
         operating profit took the net margin down next to a one-off gain
-        within it.
+        within it. Nothing else corroborates that charge, so the net margin
+        must be under ``NET_MARGIN_COLLAPSE_SHARE`` (a quarter) of its prior
+        median.
     The dict has ``latest`` and ``prior_median`` (net margins), ``ebit_margin``,
-    ``ebit_prior_median`` and ``ebit_move``.
+    ``ebit_prior_median``, ``ebit_move`` and ``net_share``, the cut-off the
+    net margin is under (a quarter when it is under a quarter, else a third).
     """
     ni = getattr(fin, "net_income", None) or []
     rev = getattr(fin, "revenue", None) or []
@@ -381,14 +490,19 @@ def ebit_charge_collapse(fin: Optional[AnnualFinancials]) -> Optional[dict]:
     if spike is None:
         return None  # EBIT in line: net_margin_collapse's case
     prior_med = _prior_median_margin(ni, rev)
-    if not is_num(prior_med) or prior_med <= 0 or latest >= NET_MARGIN_COLLAPSE_SHARE * prior_med:
+    cut = NET_MARGIN_COLLAPSE_SHARE if move == "gain" else MARGIN_COLLAPSE_SHARE
+    if not is_num(prior_med) or prior_med <= 0 or latest >= cut * prior_med:
         return None
+    share = (NET_MARGIN_COLLAPSE_SHARE if latest < NET_MARGIN_COLLAPSE_SHARE * prior_med
+             else MARGIN_COLLAPSE_SHARE)
     return {"latest": latest, "prior_median": prior_med, "ebit_margin": spike["latest"],
-            "ebit_prior_median": spike["prior_median"], "ebit_move": move}
+            "ebit_prior_median": spike["prior_median"], "ebit_move": move,
+            "net_share": share}
 
 
 def _charge_year_net_target(
-    fin: AnnualFinancials, start: Optional[float], notes: list[str]
+    fin: AnnualFinancials, start: Optional[float], notes: list[str],
+    years_out: Optional[int] = None,
 ) -> Optional[float]:
     """Net margin to fade to after a charge year, else None.
 
@@ -400,7 +514,9 @@ def _charge_year_net_target(
     profitable year's net margin as the DCF's target is, with a WARNING note
     that names the series that showed the charge year (F FY2025: EBIT -4.9%
     after four years of operating profit; its net margin, with a loss in
-    FY2022, does not qualify on its own).
+    FY2022, does not qualify on its own). With a one-year horizon
+    (``years_out`` 1) the single forecast year already sits at the target, and
+    the note says so.
     """
     ni = getattr(fin, "net_income", None) or []
     rev = getattr(fin, "revenue", None) or []
@@ -432,9 +548,12 @@ def _charge_year_net_target(
               f"{prior_med:.1%})")
     else:
         to = f"the prior median net margin {target:.1%}"
+    path_text = (f"the projection starts from it and fades to {to}" if years_out != 1 else
+                 f"with a one-year horizon the forecast year and the terminal value use {to} "
+                 "directly (the loss year is not projected)")
     notes.append(
         f"WARNING: latest net margin {latest:.1%} {why}, likely a charge year "
-        f"(impairments, restructuring); the projection starts from it and fades to {to}.")
+        f"(impairments, restructuring); {path_text}.")
     return target
 
 
@@ -446,41 +565,79 @@ def _sustainable_growth(
 ) -> Optional[float]:
     """Sustainable growth = ROE * retention ratio.
 
-    ROE = latest net income / book equity. Retention = 1 - payout, where payout =
-    dividends paid / net income (clamped to [0, 1]); if the dividends-paid line is
-    missing/zero-filled, dividends are estimated as DPS x shares. Returns None if
-    inputs are unusable: non-positive net income, non-positive book equity (common
-    for buyback-heavy dividend payers) or an ROE above ``_MAX_MEANINGFUL_ROE``.
-    The caller then falls back to the dividend CAGR or terminal growth.
+    ROE = latest net income / book equity. Retention = 1 - payout, where payout
+    (clamped to [0, 1]) is the dividend the DDM discounts, D0 x market shares
+    outstanding, over the latest net income, so retention matches D0 after a
+    dividend reset (NVDA: 0.8% of FY2026 net income paid against 20% at the
+    raised D0; the paid figure put stage-1 growth at 52.0% instead of 41.9%);
+    a note gives both when they differ by more than 5pp. With no market share
+    count the latest dividends paid are used; if that line is
+    missing/zero-filled too, dividends are estimated as DPS x the best share
+    count.
+    A payer whose latest net income is not positive retains nothing, so
+    growth is 0% (with a note): the limit of ROE x retention as net income
+    falls to 0, so a tiny loss and a tiny profit give the same stage-1
+    growth (BP FY2025 gave 3.43 at a tiny profit and 5.57 at a tiny loss,
+    when a loss dropped this candidate and left the dividend CAGR alone).
+    Returns None if inputs are unusable: non-finite net income,
+    non-positive book equity (common for buyback-heavy dividend payers) or an
+    ROE above ``_MAX_MEANINGFUL_ROE``. The caller then falls back to the
+    dividend CAGR or terminal growth.
     """
     notes = notes if notes is not None else []
     ni = (getattr(fin, "net_income", None) or [None])[-1]
     equity = getattr(getattr(company, "balance_sheet", None), "total_equity", None)
-    if not is_num(ni) or ni <= 0:
+    if not is_num(ni):
         return None
     if not is_num(equity) or equity <= 0:
         notes.append("Book equity unavailable or non-positive; ROE x retention skipped "
                      "for high growth.")
         return None
+    if ni <= 0:
+        notes.append("Latest net income is not positive, so earnings do not cover the "
+                     "dividend: retention is 0 and ROE x retention gives 0% high growth.")
+        return 0.0
     roe = ni / equity
     if roe > _MAX_MEANINGFUL_ROE:
         notes.append(f"ROE {roe:.0%} not meaningful (thin book equity); ROE x retention "
                      "skipped for high growth.")
         return None
 
+    market = getattr(company, "market", None)
+    dps = getattr(market, "dividend_per_share", None)
+    quote_shares = getattr(market, "shares_outstanding", None)
     div_paid = (getattr(fin, "dividends_paid", None) or [None])[-1]
-    if not is_num(div_paid) or div_paid <= 0:
-        # The DDM only runs for payers (DPS > 0), so a 0 here is a data gap, not
-        # 100% retention.
-        dps = getattr(getattr(company, "market", None), "dividend_per_share", None)
-        shares = _shares(company)
-        if is_num(dps) and dps > 0 and shares:
-            div_paid = dps * shares
+    # The DDM only runs for payers (DPS > 0), so a 0 here is a data gap, not
+    # 100% retention.
+    paid = div_paid if (is_num(div_paid) and div_paid > 0) else None
+    if is_num(dps) and dps > 0 and is_num(quote_shares) and quote_shares > 0:
+        # D0 is per quote share, so it pairs with the quote-basis share count.
+        payout = max(0.0, min(1.0, dps * quote_shares / ni))
+        if paid is None:
             notes.append("Dividends paid unreported; payout estimated from DPS x shares.")
-    payout = safe_div(div_paid, ni)
-    if not is_num(payout):
-        payout = 0.0
-    payout = max(0.0, min(1.0, payout))
+        else:
+            fy_payout = max(0.0, min(1.0, paid / ni))
+            if abs(payout - fy_payout) > 0.05:
+                fy = fiscal_year_labels(getattr(fin, "fiscal_years", None),
+                                        [len(fin.net_income) - 1])
+                # Neutral on the cause: a changed dividend rate, a one-off
+                # special in that year's dividends paid (D0 leaves specials
+                # out) or a changed share count can each open the gap.
+                notes.append(
+                    f"Retention uses the payout at the current dividend D0 ({payout:.1%} of "
+                    f"{fy} net income); {fy} dividends paid were {fy_payout:.1%} of it (a "
+                    "changed dividend rate, a one-off special dividend in that year or a "
+                    "changed share count can explain the difference).")
+    else:
+        if paid is None:
+            shares = _shares(company)
+            if is_num(dps) and dps > 0 and shares:
+                paid = dps * shares
+                notes.append("Dividends paid unreported; payout estimated from DPS x shares.")
+        payout = safe_div(paid, ni)
+        if not is_num(payout):
+            payout = 0.0
+        payout = max(0.0, min(1.0, payout))
     retention = 1.0 - payout
     return roe * retention
 
@@ -489,7 +646,9 @@ def _dividend_cagr(fin: AnnualFinancials, notes: Optional[list[str]] = None) -> 
     """Per-share dividend CAGR over the continuous paying run ending in the
     latest year, else None. Annual DPS is approximated as common dividends paid
     divided by diluted weighted-average shares; when aligned share history is
-    unavailable, total dividends are a disclosed growth proxy.
+    unavailable, or it changes scale by a unit factor
+    (``utils.share_scale_break``), total dividends are a disclosed growth
+    proxy.
 
     The run goes back from the latest year and stops at a break: a zero or
     missing year between paying years (a suspension, or a year the provider
@@ -520,16 +679,30 @@ def _dividend_cagr(fin: AnnualFinancials, notes: Optional[list[str]] = None) -> 
     """
     divs = list(getattr(fin, "dividends_paid", None) or [])
     shares = list(getattr(fin, "diluted_shares", None) or [])
-    per_share = len(shares) == len(divs) and all(is_num(s) and s > 0 for s in shares)
-    if per_share:
-        divs = [d / s if is_num(d) else d for d, s in zip(divs, shares)]
-    elif notes is not None and any(is_num(d) and d > 0 for d in divs):
-        notes.append("Aligned diluted-share history unavailable; dividend growth uses "
-                     "total dividends paid as a proxy for per-share growth.")
-    label = "Dividends paid per share" if per_share else "Dividends paid"
     years = list(getattr(fin, "fiscal_years", None) or [])
     if len(years) != len(divs):
         years = []
+    per_share = len(shares) == len(divs) and all(is_num(s) and s > 0 for s in shares)
+    # A share count that jumps by a unit factor (MCD's later 10-Ks tag FY2021-25
+    # diluted shares in millions) would read as a 1,000,000x dividend break.
+    scale_break = share_scale_break(shares) if per_share else None
+    if scale_break is not None:
+        per_share = False
+    if per_share:
+        divs = [d / s if is_num(d) else d for d, s in zip(divs, shares)]
+    elif notes is not None and any(is_num(d) and d > 0 for d in divs):
+        if scale_break is not None:
+            pos, ratio = scale_break
+            factor = 10.0 ** round(math.log10(max(ratio, 1.0 / ratio)))
+            notes.append(
+                f"Diluted share counts change scale by about {factor:,.0f}x in "
+                f"{fiscal_year_labels(years, [pos])} (a unit error in the filed data, not a "
+                "split); dividend growth uses total dividends paid as a proxy for per-share "
+                "growth.")
+        else:
+            notes.append("Aligned diluted-share history unavailable; dividend growth uses "
+                         "total dividends paid as a proxy for per-share growth.")
+    label = "Dividends paid per share" if per_share else "Dividends paid"
 
     def paid(v) -> bool:
         return is_num(v) and v > 0
@@ -825,14 +998,16 @@ def run_fcfe(
         more historical capex, and never below 1.5x D&A) fades with revenue
         growth, as in the DCF (``utils.growth_capex_path``, against the same
         all-years D&A % that is added back; noted when the final year ends at
-        least 0.5pp below history). With no usable capex
+        least 0.5pp of revenue, or 10% of the historical share and 0.2pp,
+        below history, ``utils.material_capex_fade``). With no usable capex
         year at all, capex is set equal to D&A (maintenance only, with a
         WARNING note) rather than 0, as in the DCF; not for a bank, insurer,
         REIT or lender (``utils.MAINTENANCE_CAPEX_KINDS``), whose
         reference-only FCFE keeps capex at 0.
       * ΔNWC_t = (historical pooled ΔNWC / Δrevenue) * Δrevenue_t, one-off years
-        left out and set to 0 when the ratio falls outside [0, 1], as in the DCF
-        (the ΔNWC series is often zero-filled by the provider).
+        and zero-filled years left out and set to 0 when the ratio falls
+        outside [0, 1], as in the DCF (a negative ratio is floored at 0 with
+        its own note; the ΔNWC series is often zero-filled by the provider).
       * Discount each FCFE_t at the cost of equity (CAPM).
       * Terminal value: Gordon growth on FCFE_N at terminal_growth, discounted N
         years (require ke - g >= 0.005, clamp g if needed).
@@ -869,10 +1044,12 @@ def run_fcfe(
     # An explicit tax rate is the one the DCF applies to NOPAT: use it for the
     # net-margin adjustments too, so both models tax the same profit alike.
     tax_override = macro.tax_rate if (macro is not None and is_num(macro.tax_rate)) else None
-    net_margin = _latest_net_margin(fin, notes, tax_override) if fin is not None else None
+    net_margin = (_latest_net_margin(fin, notes, tax_override, tax_gap_years(company))
+                  if fin is not None else None)
     # After a charge year the margin fades from the loss to the prior median,
     # as the DCF's EBIT margin does; otherwise it is held flat.
-    net_target = _charge_year_net_target(fin, net_margin, notes) if fin is not None else None
+    net_target = (_charge_year_net_target(fin, net_margin, notes, years_out)
+                  if fin is not None else None)
 
     # Forward fiscal-year labels for the projection horizon.
     last_fy = None
@@ -935,7 +1112,21 @@ def run_fcfe(
             "out of ΔNWC/Δrevenue as a one-off.")
     if not is_num(nwc_pct_delta):
         nwc_pct_delta = 0.0
-        notes.append("Unstable/absent ΔNWC history; incremental NWC set to 0% of Δrevenue.")
+        if any(is_num(v) and v != 0 for v in (getattr(fin, "change_in_nwc", None) or [])):
+            notes.append("Unstable/absent ΔNWC history; incremental NWC set to 0% of Δrevenue.")
+        elif not _nwc_gap_noted_at_source(company):
+            # An all-zero series is the providers' gap filler. EDGAR and the
+            # yfinance fallback both note a missing line (their notes mention
+            # NWC or working capital); say it here only when no such note exists.
+            notes.append("No ΔNWC history (zero or unreported in every year); incremental "
+                         "NWC set to 0% of Δrevenue.")
+    elif -1.0 <= nwc_pct_delta < 0.0:
+        # Working capital releasing cash as revenue grows (payables growing
+        # with sales) is normal for some businesses; floored at 0 as in the DCF.
+        notes.append(f"Derived ΔNWC/Δrevenue {nwc_pct_delta:.3f} is negative (working capital "
+                     "moved opposite to revenue); floored at 0, so no working-capital release "
+                     "is credited.")
+        nwc_pct_delta = 0.0
     elif not 0.0 <= nwc_pct_delta <= 1.0:
         # Same plausibility band as the DCF: outside [0, 1] is noise, not intensity.
         notes.append(f"Derived ΔNWC/Δrevenue {nwc_pct_delta:.3f} implausible; "
@@ -1053,6 +1244,24 @@ def run_fcfe(
         cost_of_equity=ke,
         detail=detail,
     )
+
+
+_NWC_SOURCE_NOTE = re.compile(r"working capital|\bNWC\b", re.IGNORECASE)
+
+
+def _nwc_gap_noted_at_source(company: CompanyData) -> bool:
+    """True when a provider data note (``CompanyData.source_notes`` or the
+    financials' ``_source_notes``) already mentions the working-capital line,
+    as EDGAR's note for a wholly missing IncreaseDecreaseInOperatingCapital
+    tag does. A wording change there only adds a second note, never hides
+    the gap."""
+    fin = getattr(company, "financials", None)
+    for obj, attr in ((company, "source_notes"), (fin, "_source_notes")):
+        listed = getattr(obj, attr, None) if obj is not None else None
+        if isinstance(listed, (list, tuple)) and any(
+                _NWC_SOURCE_NOTE.search(str(n)) for n in listed):
+            return True
+    return False
 
 
 def _nwc_per_revenue_change(fin: AnnualFinancials) -> tuple[Optional[float], list[int]]:

@@ -17,7 +17,6 @@ import re
 import threading
 import time
 from html.parser import HTMLParser
-from typing import Optional
 
 import requests
 
@@ -43,6 +42,13 @@ _HEADERS = {"User-Agent": config.SEC_USER_AGENT}
 _SECTION_CAPS = {"risk_factors": 60_000, "mdna": 80_000, "business": 40_000}
 _WHOLE_DOC_CAP = 60_000
 _TOTAL_CAP = 150_000
+# Extracted sections shorter than this in total, in a document with at least
+# this much more text, are not the filing's body: a table of contents or a
+# Form 10-Q cross-reference index (JPMorgan, GE) passes the per-section check
+# with an "Item 2. Management's Discussion..." line and page numbers, while
+# the body's headings lack the "Item N." prefix. The document text is then
+# sent as well.
+_MIN_SECTIONS_TOTAL = 10_000
 
 _cache_lock = threading.Lock()
 _text_cache: dict[str, tuple[float, str]] = {}  # url -> (ts, text)
@@ -213,7 +219,10 @@ def _at_line_start(text: str, pos: int) -> bool:
 
 def extract_sections(text: str, form: str) -> dict[str, str]:
     """Pull the analyst-relevant sections out of a 10-K/10-Q; for short forms
-    (8-K etc.) return the whole document capped."""
+    (8-K etc.) return the whole document capped. When nothing is found, or
+    the sections found are too short to be the filing's body and most of the
+    document lies outside them (an index matched instead of body headings
+    without the 'Item N.' prefix), the capped document text is added too."""
     base = form.split("/")[0].upper()
     if base not in ("10-K", "10-Q", "20-F"):
         return {"document": text[:_WHOLE_DOC_CAP]}
@@ -252,7 +261,9 @@ def extract_sections(text: str, form: str) -> dict[str, str]:
         if len(chunk) > 500:  # ignore degenerate matches
             sections[key] = chunk[: _SECTION_CAPS.get(key, 50_000)]
 
-    if not sections:
+    found = sum(len(v) for v in sections.values())
+    if not sections or (found < _MIN_SECTIONS_TOTAL
+                        and len(text) - found >= _MIN_SECTIONS_TOTAL):
         sections["document"] = text[:_WHOLE_DOC_CAP]
     return sections
 
@@ -277,11 +288,22 @@ def build_filing_material(ticker: str, form: str, filed: str,
             "risk_factors": "ITEM 3 - KEY INFORMATION AND RISK FACTORS",
             "mdna": "ITEM 5 - OPERATING AND FINANCIAL REVIEW",
         })
+    # Sections sent beside the document text are too short to be the filing's
+    # body (see _MIN_SECTIONS_TOTAL): often an index or table-of-contents
+    # entry under the section's Item line. Their headings say so, so the
+    # model does not read a list of page numbers as the section itself. They
+    # are kept, since a genuinely short section (a 10-Q's "no material
+    # changes" risk-factor note) may lie past the document text's cap.
+    short = "document" in sections and len(sections) > 1
     parts = [f"SEC FILING: {form} for {ticker.upper()}, filed {filed} "
              f"(accession {accession_number})"]
     total = len(parts[0])
     for key, chunk in sections.items():
-        heading = f"\n\n===== {titles.get(key, key.upper())} =====\n\n"
+        title = titles.get(key, key.upper())
+        if short and key != "document":
+            title += (" (SHORT MATCH, POSSIBLY ONLY AN INDEX OR CONTENTS ENTRY; "
+                      "THE FILING TEXT FOLLOWS)")
+        heading = f"\n\n===== {title} =====\n\n"
         room = _TOTAL_CAP - total - len(heading)
         if room <= 0:
             break

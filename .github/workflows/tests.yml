@@ -7,25 +7,62 @@ on:
 permissions:
   contents: read
 
+# On a feature branch or pull request, a newer push cancels the run in
+# progress. Each commit on the default branch gets its own group (its SHA),
+# so every push there runs to completion and none is cancelled or skipped.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.sha || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   python:
-    name: Python tests
+    name: Python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
             backend/requirements-backend.txt
-      - run: python -m pip install -r requirements.txt -r backend/requirements-backend.txt
-      - run: python -m tests.test_synthetic
-      - run: python -m unittest discover -s tests -p 'test_*.py'
+            requirements-dev.txt
+      # requirements-dev.txt adds the pinned linter, coverage, httpx2 (the API
+      # tests' TestClient) and the setuptools the packaging test builds with.
+      - name: Install
+        id: install
+        run: python -m pip install -r requirements.txt -r backend/requirements-backend.txt -r requirements-dev.txt
+      - name: Lint (syntax errors and pyflakes, rules in pyproject.toml)
+        run: ruff check equity_valuation backend tests
+      # Both suites run once the install succeeded, even after a lint or unit
+      # failure, so one red step never hides the others' results. Any failed
+      # step still fails the job.
+      - name: Unit tests
+        id: unit
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: coverage run -m unittest discover -s tests -p 'test_*.py'
+      - name: Synthetic end-to-end checks
+        id: synthetic
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: coverage run -a -m tests.test_synthetic
+      # Coverage is measured only when both suites passed. The summary is
+      # written before the gate so it shows even when the gate fails.
+      - name: Coverage summary
+        if: ${{ !cancelled() && steps.unit.outcome == 'success' && steps.synthetic.outcome == 'success' }}
+        run: coverage report --format=markdown --fail-under=0 >> "$GITHUB_STEP_SUMMARY"
+      - name: Coverage gate (fail_under in pyproject.toml)
+        if: ${{ !cancelled() && steps.unit.outcome == 'success' && steps.synthetic.outcome == 'success' }}
+        run: coverage report
   frontend:
     name: Frontend build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
@@ -45,6 +82,7 @@ jobs:
   desktop:
     name: Desktop runtime tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: desktop

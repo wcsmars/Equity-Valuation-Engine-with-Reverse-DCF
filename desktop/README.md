@@ -21,8 +21,9 @@ npm --prefix desktop start
 Copy `.env.example` to `.env` and add your own optional API keys. Set
 `SEC_USER_AGENT` to your contact identity to enable SEC EDGAR requests. The
 desktop app reads this file at each launch. It builds the frontend automatically
-when a production build is missing or older than the frontend source and
-dependency files, so the first launch after an update can take longer.
+when a production build is missing, incomplete (for example after a failed build
+or quitting during one) or older than the frontend source and dependency files,
+so the first launch after an update can take longer.
 
 Source launches find the project relative to `desktop/main.js`. No absolute
 paths or generated configuration are needed. After moving the checkout,
@@ -33,8 +34,9 @@ and starts development servers. Stop those servers with Ctrl-C before launching
 the desktop app. It does not create a production frontend build.
 
 Run `npm --prefix desktop test` from the repository root to check the runtime
-helpers without opening a window. These tests use Node's standard library and
-temporary local HTTP servers; they do not require Electron or API keys.
+helpers without opening a window. These tests use Node's standard library,
+temporary local HTTP servers and short-lived local Node processes; they do not
+require Electron or API keys.
 
 ## Build a local app
 
@@ -76,14 +78,21 @@ the same fallback if it is unavailable.
 ## Runtime behavior
 
 The wrapper loads `.env` into the backend, starts `uvicorn backend.app:app`,
-ensures `frontend/.next/BUILD_ID` exists, then starts `next start`. It waits for
-both servers before showing the dashboard and passes the backend port to the
-client through `?api=`, allowing direct requests to the local backend.
+ensures `frontend/.next` holds a complete, current production build (`BUILD_ID`,
+`prerender-manifest.json` and `export-marker.json`, which `next build` writes
+last), then starts `next start`. It waits for both servers before showing the
+dashboard and passes the backend port to the client through `?api=`, allowing
+direct requests to the local backend. If a server exits during startup or is
+not ready within three minutes, the error dialog shows its recent output.
 
 Running the web development server can replace the production build. The next
 desktop launch detects the missing production build and rebuilds it. Exports
 are saved in your Downloads folder and revealed in Finder. News and filing
 links open in your default browser.
+
+Both servers stop when you quit. A small watcher process also stops them if the
+app is force-quit or crashes, so the next launch does not start a second backend
+on the same data files.
 
 ## Regenerate the icon
 

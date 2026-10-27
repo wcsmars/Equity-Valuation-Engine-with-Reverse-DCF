@@ -17,7 +17,7 @@ import re
 from typing import Optional
 
 from ..schemas import AnnualFinancials, CompanyData, MacroAssumptions, WACCResult
-from ..utils import is_num, median, safe_div
+from ..utils import fiscal_year_labels, is_num, median, safe_div
 from .. import config
 
 
@@ -38,6 +38,35 @@ MIN_TAX_HISTORY_YEARS = 3
 # tightest investment-grade spread.
 MIN_DEBT_SPREAD = 0.005
 
+# The providers' notes for tax-expense years they zero-filled: EDGAR's "tax
+# expense not reported on EDGAR for FY2019-2020, FY2023; filled with 0.0" and
+# the yfinance fallback's "yfinance fallback: tax expense missing for FY2021,
+# FY2022; filled with 0.0". A wholly missing line ("... unavailable ...") is
+# not matched: a filer with no tax line at all keeps the 0% rate and the
+# DCF's warning, as a pass-through that reports no tax would.
+_TAX_GAP_NOTE = re.compile(
+    r"\btax expense (?:not reported on EDGAR|missing) for ([^;]+); filled with 0\.0")
+_FY_SPAN = re.compile(r"FY(\d{4})(?:-(\d{4}))?")
+
+
+def tax_gap_years(source) -> frozenset:
+    """Fiscal years whose tax expense a provider zero-filled, read from its
+    gap notes: ``source`` is a ``CompanyData`` (its ``source_notes`` and its
+    financials' ``_source_notes``) or an ``AnnualFinancials``."""
+    notes: list[str] = []
+    for obj in (source, getattr(source, "financials", None)):
+        for attr in ("source_notes", "_source_notes"):
+            listed = getattr(obj, attr, None) if obj is not None else None
+            if isinstance(listed, (list, tuple)):
+                notes.extend(str(n) for n in listed)
+    years: set[int] = set()
+    for note in notes:
+        match = _TAX_GAP_NOTE.search(note)
+        if match:
+            for first, last in _FY_SPAN.findall(match.group(1)):
+                years.update(range(int(first), int(last or first) + 1))
+    return frozenset(years)
+
 
 def effective_tax_rate(fin: AnnualFinancials, fallback: float) -> float:
     """Median historical effective tax rate (tax_expense / pretax_income).
@@ -48,16 +77,21 @@ def effective_tax_rate(fin: AnnualFinancials, fallback: float) -> float:
 
 
 def effective_tax_rate_detail(
-    fin: AnnualFinancials, fallback: float
+    fin: AnnualFinancials, fallback: float, gap_years: Optional[frozenset] = None
 ) -> tuple[float, str, Optional[str]]:
     """(rate, source, note): median historical effective tax rate, or ``fallback``.
 
     A year is used only when pre-tax income is *positive* (a negative or zero
     EBT makes the ratio meaningless) and the tax charge is 0-100% of it: a tax
     benefit on a profit (valuation-allowance release) or a charge above the
-    profit is a one-off, not a rate. The median of the remaining years is
-    clamped to ``[config.MIN_EFFECTIVE_TAX_RATE, config.MAX_EFFECTIVE_TAX_RATE]``
-    and the source is ``"effective (historical)"``.
+    profit is a one-off, not a rate. A zero tax charge in a year the provider
+    says it zero-filled (``gap_years``, by fiscal year; default
+    ``tax_gap_years(fin)``) is a gap, not a 0% year, and is left out with a
+    note: counted as 0%, two gap years in four took SYNT's rate from 21% to
+    10.5%. A reported zero (a pass-through) still counts. The median of the
+    remaining years is clamped to
+    ``[config.MIN_EFFECTIVE_TAX_RATE, config.MAX_EFFECTIVE_TAX_RATE]`` and the
+    source is ``"effective (historical)"``.
 
     With fewer than ``MIN_TAX_HISTORY_YEARS`` such years (or no financials) the
     provided ``fallback`` is returned unchanged with source ``"marginal
@@ -70,31 +104,42 @@ def effective_tax_rate_detail(
 
     pretax = getattr(fin, "pretax_income", None) or []
     taxes = getattr(fin, "tax_expense", None) or []
+    years = list(getattr(fin, "fiscal_years", None) or [])
+    if gap_years is None:
+        gap_years = tax_gap_years(fin)
 
     rates: list[float] = []
     profitable = 0
+    gaps: list[int] = []  # positions of zero-filled profitable years
     # Pair up tax/pretax year-by-year; only keep positive-EBT years.
-    for tax, ebt in zip(taxes, pretax):
+    for i, (tax, ebt) in enumerate(zip(taxes, pretax)):
         if not is_num(tax) or not is_num(ebt) or ebt <= 0:
+            continue
+        if tax == 0 and i < len(years) and years[i] in gap_years:
+            gaps.append(i)
             continue
         profitable += 1
         ratio = safe_div(tax, ebt)
         if ratio is not None and 0.0 <= ratio <= 1.0:
             rates.append(ratio)
+    gap_text = (f"tax expense for {fiscal_year_labels(years, gaps)} was not reported "
+                "(zero-filled by the data provider) and is left out" if gaps else None)
 
     if len(rates) < MIN_TAX_HISTORY_YEARS:
         # Thin or distorted history -- defer to the caller's fallback (often the
         # marginal rate, config.DEFAULT_MARGINAL_TAX_RATE).
         note = None
-        if profitable:
+        if profitable or gaps:
             note = (f"effective tax rate: only {len(rates)} clean year(s) among {profitable} "
                     f"with positive pretax income (need {MIN_TAX_HISTORY_YEARS}; tax benefits "
-                    f"and charges above pretax income are left out); using {fallback:.1%}")
+                    f"and charges above pretax income are left out"
+                    + (f"; {gap_text}" if gap_text else "") + f"); using {fallback:.1%}")
         return fallback, "marginal (fallback)", note
 
     # Clamp into the sane band defined in config.
     lo, hi = config.MIN_EFFECTIVE_TAX_RATE, config.MAX_EFFECTIVE_TAX_RATE
-    return max(lo, min(hi, median(rates))), "effective (historical)", None
+    note = f"effective tax rate: {gap_text}" if gap_text else None
+    return max(lo, min(hi, median(rates))), "effective (historical)", note
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +271,8 @@ def compute_wacc(company: CompanyData, macro: MacroAssumptions) -> WACCResult:
     else:
         # (A thin-history fallback note is recorded by the DCF, which applies
         # the same rate to NOPAT; tax_source records it here.)
-        tax, tax_source, _ = effective_tax_rate_detail(fin, config.DEFAULT_MARGINAL_TAX_RATE)
+        tax, tax_source, _ = effective_tax_rate_detail(
+            fin, config.DEFAULT_MARGINAL_TAX_RATE, tax_gap_years(company))
 
     # --- pre-tax cost of debt ---------------------------------------------- #
     total_debt = getattr(bs, "total_debt", None) if bs is not None else None
@@ -236,7 +282,9 @@ def compute_wacc(company: CompanyData, macro: MacroAssumptions) -> WACCResult:
     interest_latest = None
     if fin is not None:
         ints = getattr(fin, "interest_expense", None) or []
-        if ints and is_num(ints[-1]):
+        # 0.0 is the providers' gap filler for an unreported year (AAPL FY2024-25),
+        # not a measured 0% cost of debt.
+        if ints and is_num(ints[-1]) and ints[-1] != 0:
             interest_latest = abs(ints[-1])  # stored positive, but be safe
 
     if macro is not None and is_num(macro.pretax_cost_of_debt):
@@ -265,7 +313,9 @@ def compute_wacc(company: CompanyData, macro: MacroAssumptions) -> WACCResult:
                 )
             elif total_debt > 0:
                 # (With no debt the cost of debt carries zero weight: nothing to flag.)
-                notes.append("cost of debt not derivable; using rf+spread")
+                # A genuine zero (interest all capitalised) also lands here.
+                notes.append("latest interest expense zero or not reported; cost of debt "
+                             "not derivable; using rf+spread")
 
     after_tax_cost_of_debt = kd_pretax * (1.0 - tax)
 

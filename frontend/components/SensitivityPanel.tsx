@@ -5,14 +5,17 @@
 // Green = undervalued (price above current), rose = overvalued. Follows the
 // structure, density, and color usage of ValuationSummary.
 //
-// Grids come in two kinds: WACC x terminal growth (Gordon DCF) and WACC x
-// exit EV/EBITDA (exit-multiple DCF). Axes are formatted by their label, a
-// null cell is an invalid combination ("n/a"), and the centre cell is ringed
-// as the base case only when it reproduces the headline DCF price.
+// Grids come in two kinds: WACC x terminal growth (Gordon or value-driver
+// DCF) and WACC x exit EV/EBITDA (exit-multiple DCF). Axes are formatted by
+// their label, a null cell is an invalid combination ("n/a"), and the centre
+// cell is ringed as the base case only when it reproduces the headline DCF
+// price. A grid with no valid cell at all (e.g. a bank's reference-only DCF
+// with no EBIT margin to vary) is one empty state with the reasons, not a
+// wall of "n/a".
 
 import React from "react";
 import type { Report, Sensitivity } from "@/lib/types";
-import { fmtMoney } from "@/lib/format";
+import { fmtMoney, priceDecimals } from "@/lib/format";
 import { baseCaseCell, fmtAxis } from "@/lib/sensitivity";
 import { cx, Card, EmptyState } from "@/components/ui";
 
@@ -70,6 +73,15 @@ function SensitivityGrid({
       />
     );
   }
+  const valid = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+  if (!rowValues.some((_r, i) => colValues.some((_c, j) => valid(grid[i]?.[j])))) {
+    return (
+      <EmptyState
+        title="No valid price anywhere in this grid"
+        hint={INVALID_CELL_HINT}
+      />
+    );
+  }
 
   return (
     <div className="overflow-x-auto">
@@ -112,7 +124,7 @@ function SensitivityGrid({
                         isBase && "font-semibold ring-1 ring-inset ring-ink/40"
                       )}
                     >
-                      {valid ? fmtMoney(price, cur, 0) : "n/a"}
+                      {valid ? fmtMoney(price, cur, priceDecimals(currentPrice)) : "n/a"}
                     </td>
                   );
                 })}
@@ -153,7 +165,7 @@ export default function SensitivityPanel({ report }: { report: Report }) {
             subtitle={`Implied price by ${s.row_label} and ${s.col_label} · shaded vs. current ${fmtMoney(
               currentPrice,
               cur,
-              0
+              priceDecimals(currentPrice)
             )}${base ? " · ringed cell = headline DCF" : ""}`}
           >
             <SensitivityGrid

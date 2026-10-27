@@ -10,6 +10,8 @@
 import React from "react";
 import type { CompRow, Enrichment, Report } from "@/lib/types";
 import {
+  equityMultiplesOnly,
+  financialWhom,
   fmtBig,
   fmtCount,
   fmtMoney,
@@ -50,6 +52,17 @@ export default function MultiplesPanel({
   const cur = report.summary.currency;
   const target: CompRow | undefined = report.comps?.target;
   const price = report.current_price;
+  // A bank, insurer, lender, captive-finance group or lessor is priced on P/E
+  // and P/B only: its debt funds the business, so its EV multiples mean
+  // little (a bank's EBIT is zero by design, so its EBITDA is D&A alone).
+  // They are still shown, dimmed and marked.
+  const evNotMeaningful = equityMultiplesOnly(report.summary);
+  const evNote = "not meaningful (equity multiples only)";
+  const evTitle = evNotMeaningful
+    ? `Not meaningful for ${financialWhom(report.summary) ?? "a financial institution"}: ` +
+      "most of its debt funds the business rather than financing it, so EV/EBITDA " +
+      "and EV/Sales give no price; the comps use P/E and P/B."
+    : undefined;
 
   // --- FMP TTM ratios: build only the rows that resolve to a number. ------- //
   const ratios = enrichment?.ratios_ttm;
@@ -164,8 +177,12 @@ export default function MultiplesPanel({
       >
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
           <Stat label="P/E" value={fmtMult(target?.pe)} />
-          <Stat label="EV/EBITDA" value={fmtMult(target?.ev_ebitda)} />
-          <Stat label="EV/Sales" value={fmtMult(target?.ev_sales)} />
+          <Stat label="EV/EBITDA" value={fmtMult(target?.ev_ebitda)}
+            tone={evNotMeaningful ? "text-ink-faint" : undefined}
+            sub={evNotMeaningful ? evNote : undefined} title={evTitle} />
+          <Stat label="EV/Sales" value={fmtMult(target?.ev_sales)}
+            tone={evNotMeaningful ? "text-ink-faint" : undefined}
+            sub={evNotMeaningful ? evNote : undefined} title={evTitle} />
           <Stat label="P/B" value={fmtMult(target?.pb)} />
           <Stat label="PEG (reference)" value={fmtMult(target?.peg)}
             title="Informational only; mixed peer earnings-growth horizons make PEG unsuitable for deriving the target price." />

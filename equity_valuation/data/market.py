@@ -39,6 +39,8 @@ Currencies
   the balance sheet's common equity (or drops it) where Yahoo's book value
   per share is not on the quoted basis. A same-currency EV that only minority
   interest could explain is kept when Yahoo's balance sheet cannot be read.
+  For an Up-C issuer (IBKR), whose market cap already prices the units shown
+  as minority interest, that interest joins the book value, not the EV.
 * Data-quality notes ride on the returned objects as a ``_source_notes``
   attribute (MarketData, the fallback's AnnualFinancials and rebuilt
   CompRows); HybridProvider copies the first two into
@@ -52,6 +54,18 @@ Beta
   usable for CAPM and is dropped instead, so the models use
   ``config.DEFAULT_BETA``.
 
+Trailing figures
+----------------
+* `get_market_data` also copies Yahoo's trailing-twelve-month revenue, EBITDA
+  and net income to common (``totalRevenue``, ``ebitda``,
+  ``netIncomeToCommon``, already in the ``.info`` it fetches) with the dates
+  of the latest quarter and fiscal year end. Only comps read them: the opt-in
+  trailing basis (``--comps-basis ttm``) and the default basis's fiscal-year
+  vs trailing gap note; every other model uses the fiscal-year statements.
+  They are left None when Yahoo's reporting currency is not the quote
+  currency: no FX conversion is applied to them. They are Yahoo's figures as
+  given, not screened for one-off items.
+
 Captive finance arms (statement fallback)
 -----------------------------------------
 * A durable-goods maker that consolidates a finance and leasing arm (Toyota
@@ -63,6 +77,17 @@ Captive finance arms (statement fallback)
   share of total assets (see `_captive_finance_evidence`). Where Yahoo lumps
   the finance book into unlabelled lines (BMW, Mercedes-Benz, Hyundai) an
   automaker is not marked but gets a note.
+
+Peers
+-----
+* `suggest_peers` returns ``[]``: by default comps run only on peers passed
+  explicitly. `discover_peers` (opt-in, the CLI's ``--auto-peers``) proposes
+  names from Yahoo's industry list (``yf.Industry(info['industryKey'])
+  .top_companies``) within a size band read from their market weights,
+  closest in size first, with notes asking for review; each list is cached
+  for a day. Yahoo lists one share class per company, so a row under the
+  target's company name (GOOG for a GOOGL target) is the target itself: it
+  is never proposed, and its weight sets the band. It never raises.
 
 Design notes
 ------------
@@ -85,9 +110,13 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import math
+import re
 import statistics
+import threading
+import time
 from typing import Optional
 
+from .. import config
 from ..schemas import (
     AnnualFinancials,
     BalanceSheetSnapshot,
@@ -182,12 +211,86 @@ _CAPTIVE_MIN_DEBT_SHARE = 0.30
 # Public because the provider's note quotes it.
 BACKFILL_MAX_DAYS = 100
 
+# Opt-in peer discovery (`YFinanceClient.discover_peers`). A candidate must be
+# a plain listed symbol, optionally with a one- or two-letter class or
+# exchange suffix (KO, BRK-B, SHEL.L); index and currency symbols (^GSPC,
+# EURUSD=X), numeric codes and malformed rows are skipped. Market weight is a
+# company's share of its industry's market cap, so two weights' ratio is the
+# companies' size ratio. Peers between 0.1x and 10x the target's size are
+# kept; with fewer than four of them the band widens once to 0.02x-50x.
+_PEER_SOURCE = "Yahoo Finance industry list"
+_PEER_SYMBOL = re.compile(r"^[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z]{1,2})?$")
+_PEER_SIZE_BAND = (0.1, 10.0)
+_PEER_WIDE_BAND = (0.02, 50.0)
+_PEER_MIN_IN_BAND = 4
+# industry key -> (fetched at, industry name or None, [(symbol, name,
+# weight)], rows listed). Shared by every client in the process; only
+# non-empty lists are kept, for config.PEER_DISCOVERY_TTL seconds.
+_peer_cache: dict[str, tuple[float, Optional[str], list, int]] = {}
+_peer_cache_lock = threading.Lock()
+
+
+def _clock() -> float:
+    """Monotonic seconds for the peer-list cache (patched in tests)."""
+    return time.monotonic()
+
+
+def company_name_key(name: object) -> Optional[str]:
+    """``name`` folded for matching one company's share classes: casefolded,
+    punctuation dropped, spaces collapsed ("Alphabet Inc." and "ALPHABET
+    INC" give "alphabet inc"); None for a missing or blank name. Yahoo's
+    industry lists carry one share class per company, under the same name
+    as the quote's ``longName``."""
+    if not isinstance(name, str):
+        return None
+    return " ".join(re.sub(r"[\W_]+", " ", name.casefold()).split()) or None
+
+
+def _plural(n: int, noun: str) -> str:
+    """``"1 name"``, ``"3 names"``."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _industry_rows(frame) -> list[tuple[str, Optional[str], Optional[float]]]:
+    """``(symbol, name, market weight)`` per row of a yfinance
+    ``Industry.top_companies`` frame (index: symbol; columns ``name`` and
+    ``market weight``), in Yahoo's order. A name that is not a non-empty
+    string (Yahoo leaves some NaN) and a weight that is not finite and
+    positive are None; rows without a string symbol are dropped. ``[]`` for
+    a missing or empty frame."""
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    rows: list[tuple[str, Optional[str], Optional[float]]] = []
+    for symbol, row in frame.iterrows():
+        sym = symbol.strip() if isinstance(symbol, str) else ""
+        if not sym:
+            continue
+        name = row.get("name")
+        name = name.strip() if isinstance(name, str) and name.strip() else None
+        rows.append((sym, name, _pos(row.get("market weight"))))
+    return rows
+
 # Capital expenditure rows of Yahoo's cash-flow statement, in order of
 # preference: its standard line (purchases of property, plant and equipment,
 # plus intangibles where Yahoo counts them), else the PP&E purchases alone.
 # Read by the statement fallback and by `YFinanceClient.get_capex_by_year`
 # (HybridProvider's backfill of EDGAR years without a capex tag).
 _CAPEX_ROWS = ("Capital Expenditure", "CapitalExpenditure", "Purchase Of PPE")
+# D&A rows, in order of preference: the income statement's, then the cash-flow
+# statement's. Read by the statement fallback and by
+# `YFinanceClient.get_da_by_year` (HybridProvider's backfill of EDGAR years
+# without a D&A tag).
+_DA_INCOME_ROWS = (
+    "Reconciled Depreciation",
+    "Depreciation And Amortization In Income Statement",
+    "Depreciation Amortization Depletion Income Statement",
+)
+_DA_CASHFLOW_ROWS = (
+    "Depreciation And Amortization",
+    "DepreciationAndAmortization",
+    "Depreciation Amortization Depletion",
+    "Depreciation",
+)
 
 # Monetary fields scaled by an FX conversion (share counts and years are not).
 _MONEY_SERIES = (
@@ -197,7 +300,7 @@ _MONEY_SERIES = (
 )
 _MONEY_BALANCE = (
     "total_debt", "cash_and_investments", "total_equity", "minority_interest",
-    "preferred_equity",
+    "preferred_equity", "operating_lease_liability",
 )
 
 
@@ -230,6 +333,18 @@ def _pos(x: object) -> Optional[float]:
     return v if (v is not None and v > 0) else None
 
 
+def _epoch_date(x: object) -> Optional[datetime.date]:
+    """The UTC date of a Yahoo epoch-seconds field (``lastFiscalYearEnd``
+    1780185600 -> 2026-05-31), or None when it is missing or not a date."""
+    v = _pos(x)
+    if v is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _str(x: object) -> Optional[str]:
     """Coerce to a non-empty stripped string, or None."""
     if x is None:
@@ -255,6 +370,39 @@ def major_currency(code: Optional[str]) -> tuple[Optional[str], float]:
     if s in _MINOR_UNITS:
         return _MINOR_UNITS[s]
     return s.upper(), 1.0
+
+
+def _trailing_fields(info: dict, quote_major: Optional[str]) -> dict:
+    """MarketData's trailing-twelve-month fields from Yahoo's ``.info``.
+
+    ``ttm_revenue``, ``ttm_ebitda`` and ``ttm_net_income`` are
+    ``totalRevenue``, ``ebitda`` and ``netIncomeToCommon`` (finite values
+    only, else None), filled only when Yahoo's reporting currency
+    (``financialCurrency``, major unit) is the quote currency's major unit
+    `quote_major`: no FX conversion is applied, so a different currency
+    leaves all three None (TSM: TWD figures against a USD quote).
+    ``ttm_as_of`` and ``fiscal_year_end`` are the UTC dates of
+    ``mostRecentQuarter`` and ``lastFiscalYearEnd`` as ISO strings, and
+    ``ttm_currency`` the reporting currency (None when Yahoo gives none).
+    Read only by comps (``models.comps.run_comps``): the opt-in trailing
+    basis (``basis="ttm"``) and the default basis's fiscal-year vs trailing
+    gap note; every other model uses the fiscal-year statements.
+    """
+    fin_ccy, fin_unit = major_currency(info.get("financialCurrency"))
+    as_of = _epoch_date(info.get("mostRecentQuarter"))
+    fy_end = _epoch_date(info.get("lastFiscalYearEnd"))
+    fields = {
+        "ttm_revenue": None, "ttm_ebitda": None, "ttm_net_income": None,
+        "ttm_as_of": as_of.isoformat() if as_of is not None else None,
+        "fiscal_year_end": fy_end.isoformat() if fy_end is not None else None,
+        "ttm_currency": fin_ccy,
+    }
+    if fin_ccy is not None and fin_ccy == quote_major:
+        for field_name, key in (("ttm_revenue", "totalRevenue"), ("ttm_ebitda", "ebitda"),
+                                ("ttm_net_income", "netIncomeToCommon")):
+            v = _num(info.get(key))
+            fields[field_name] = v * fin_unit if v is not None else None
+    return fields
 
 
 def blume_adjusted_beta(raw: float) -> float:
@@ -310,12 +458,21 @@ def _read_dividends(
       the median of the payments within a year either side of it (at least
       three of them), so a fast-growing dividend, or one after a cut, is
       judged against its own recent level rather than the five-year median.
+      A payment next to another of about its size (within `_OUTSIZED_PAYMENT`
+      times, under `_DRIFT_DAYS` apart) is not outsized when every later
+      payment within `_TTM_DAYS` is about its size too: a step raise (NVDA's
+      quarterly 0.01 -> 0.25) is a new regular level once a second payment
+      confirms it; the first one alone is still read as a special. Adjacent
+      large payments followed by a return to the old level stay outsized
+      (the HSBC ADR's 1.55 on 2024-03-07 and 2024-05-09, the second with a
+      special, then 0.50 a quarter).
     * An outsized payment with no regular ex-date within half the regular
       spacing of it is paid together with a regular dividend (PGR's 13.60 in
       January = 13.50 variable + the 0.10 quarterly; CME's 7.45 in March 2026 =
       6.15 + 1.30): only its excess over the next regular payment (else the
-      previous one) is special. One on its own (CME's late-December payments,
-      18 days after the quarterly) is special in full.
+      previous one) is special, and without an excess it is regular. One on
+      its own (CME's late-December payments, 18 days after the quarterly) is
+      special in full.
     * The specials recur when they fall in at least two separate years of the
       `_VARIABLE_YEARS` years ending with the latest (tolerating `_DRIFT_DAYS`
       of ex-date drift), which must be under `_VARIABLE_CURRENT_DAYS` old.
@@ -329,7 +486,21 @@ def _read_dividends(
         near = [a for d, a in pays if abs((d - day).days) <= _TTM_DAYS]
         return len(near) >= 3 and amount > _OUTSIZED_PAYMENT * statistics.median(near)
 
-    flags = [outsized(d, a) for d, a in pays]
+    def new_level(i: int) -> bool:
+        """A step raise to a new regular level (NVDA 0.01 -> 0.25 a quarter):
+        an adjacent payment under `_DRIFT_DAYS` away is about as large, and so
+        is every later payment within `_TTM_DAYS` (the level persists)."""
+        day, amount = pays[i]
+
+        def similar(other: float) -> bool:
+            return max(amount, other) <= _OUTSIZED_PAYMENT * min(amount, other)
+
+        if not any(0 <= j < len(pays) and abs((pays[j][0] - day).days) < _DRIFT_DAYS
+                   and similar(pays[j][1]) for j in (i - 1, i + 1)):
+            return False
+        return all(similar(a) for d, a in pays[i + 1:] if (d - day).days <= _TTM_DAYS)
+
+    flags = [outsized(d, a) and not new_level(i) for i, (d, a) in enumerate(pays)]
     regular = [p for p, big in zip(pays, flags) if not big]
     gaps = [(b[0] - a[0]).days for a, b in zip(regular, regular[1:])]
     half_spacing = (statistics.median(gaps) if gaps else _TTM_DAYS) / 2
@@ -345,9 +516,12 @@ def _read_dividends(
             if regular and all(abs((d - day).days) > half_spacing for d, _ in regular):
                 later = [a for d, a in regular if d > day]
                 base = later[0] if later else regular[-1][1]
-            specials.append((day, amount - base))
-            if in_ttm:
-                ttm_specials.append(specials[-1])
+            if amount > base:
+                specials.append((day, amount - base))
+                if in_ttm:
+                    ttm_specials.append(specials[-1])
+            else:  # nothing above the regular dividend: a regular payment
+                base = amount
         if in_ttm:
             ttm += amount
             regular_ttm += base
@@ -404,10 +578,13 @@ def _unit_scale(ratio_if_minor: Optional[float], factor: float) -> float:
     amount with the same quantity rebuilt from the minor-unit price: ~1 means
     it is in minor units (scale by `factor`), ~`factor` means it is already
     major (scale 1.0). The closer reading wins; without a comparison the
-    amount is taken to be in the quote's own (minor) unit.
+    amount is taken to be in the MAJOR unit, as Yahoo's ``.info`` marketCap
+    is on London, Johannesburg and Tel Aviv lines (SHEL.L, NPN.JO, TEVA.TA).
     """
-    if factor == 1.0 or ratio_if_minor is None or not ratio_if_minor > 0:
+    if factor == 1.0:
         return factor
+    if ratio_if_minor is None or not ratio_if_minor > 0:
+        return 1.0
     if abs(math.log(ratio_if_minor / factor)) < abs(math.log(ratio_if_minor)):
         return 1.0
     return factor
@@ -419,20 +596,24 @@ def scale_fundamentals(
     """Copies of the fundamentals with every monetary amount multiplied by `rate`.
 
     Used for FX conversion: all flow series and balance-sheet amounts are
-    scaled; fiscal years and share counts are not. Of the dynamic attributes
-    the financial-kind and income-attribution markers are carried over (the
-    models use them); ``_source_notes`` are handled by the caller.
+    scaled (an optional amount left None stays None); fiscal years and share
+    counts are not. Of the dynamic attributes
+    the financial-kind, income-attribution, annual-form and fiscal-year-end
+    markers are carried over (the models and HybridProvider use them);
+    ``_source_notes`` are handled by the caller.
     """
     fin = dataclasses.replace(
         financials,
         **{k: [v * rate for v in getattr(financials, k)] for k in _MONEY_SERIES},
     )
-    for marker in ("_financial_kind", "_income_attribution_adjusted"):
+    for marker in ("_financial_kind", "_income_attribution_adjusted", "_annual_form",
+                   "_latest_fy_end"):
         if hasattr(financials, marker):
             setattr(fin, marker, getattr(financials, marker))
     bs = dataclasses.replace(
         balance_sheet,
-        **{k: getattr(balance_sheet, k) * rate for k in _MONEY_BALANCE},
+        **{k: (None if getattr(balance_sheet, k) is None else getattr(balance_sheet, k) * rate)
+           for k in _MONEY_BALANCE},
     )
     return fin, bs
 
@@ -551,7 +732,10 @@ class YFinanceClient:
           shares_outstanding <- info.sharesOutstanding -> fast_info.shares, replaced by
                                 marketCap/price when they differ by >5% (multi-class
                                 issuers / ADRs report one class or ordinary shares)
-          market_cap         <- info.marketCap (fallback price * shares)
+          market_cap         <- info.marketCap (fallback price * shares); for a
+                                minor-unit quote its unit is checked against price x
+                                shares (sharesOutstanding, else fast_info.shares) and
+                                taken as major (Yahoo's usual) without a count
           beta               <- info.beta Blume-adjusted (0.67 x raw + 0.33), with a
                                 note; a beta <= 0 is dropped with a note, so the
                                 models use config.DEFAULT_BETA
@@ -561,8 +745,18 @@ class YFinanceClient:
                                 3-year average of recurring variable/special
                                 dividends from the payment history
                                 -> TTM regular history -> trailingAnnualDividendRate
-          52wk low/high      <- info.fiftyTwoWeekLow / fiftyTwoWeekHigh
+          52wk low/high      <- info.fiftyTwoWeekLow / fiftyTwoWeekHigh (positive only)
           sector/industry    <- info.sector / industry
+          industry_key       <- info.industryKey (Yahoo's industry id; read by
+                                :meth:`discover_peers`)
+          ttm_revenue / ttm_ebitda / ttm_net_income
+                             <- info.totalRevenue / ebitda / netIncomeToCommon, only
+                                when info.financialCurrency is the quote currency
+                                (no FX conversion; see :func:`_trailing_fields`)
+          ttm_as_of / fiscal_year_end
+                             <- info.mostRecentQuarter / lastFiscalYearEnd (epoch
+                                seconds -> ISO date, UTC)
+          ttm_currency       <- info.financialCurrency (major unit)
           currency           <- info.currency -> fast_info.currency (default 'USD'),
                                 minor units (GBp/ZAc/ILA) converted to the major unit
           name               <- info.longName -> shortName -> ticker
@@ -570,7 +764,12 @@ class YFinanceClient:
         When neither a share count nor a market cap is available both are left
         at 0.0 (the schema types them as float); the hybrid provider backfills
         them from the statements, with a note, or warns. Data-quality notes are
-        attached as ``_source_notes`` on the returned object.
+        attached as ``_source_notes`` on the returned object, and for the
+        hybrid provider ``_dividend_history`` (the payment history a D0
+        without Yahoo's indicated rate was read from),
+        ``_corporate_actions`` (Yahoo's split records, see
+        :meth:`_split_history`) and ``_last_fiscal_year_end`` (the date of
+        info.lastFiscalYearEnd; FDX: 2026-05-31) when available.
 
         Raises :class:`DataError` if no price can be obtained.
         """
@@ -626,7 +825,17 @@ class YFinanceClient:
             shares = self._fast_value(tk, ("shares",))
         market_cap: Optional[float] = None
         if mcap_raw is not None:
-            ratio = mcap_raw / (price_quote * shares) if shares is not None else None
+            # The unit check needs a share count; for a minor-unit quote
+            # without sharesOutstanding, fast_info's count serves for it.
+            check = shares
+            if check is None and unit != 1.0:
+                check = self._fast_value(tk, ("shares",))
+                if check is None:
+                    notes.append(
+                        f"marketCap read as {currency}, Yahoo's usual unit on {quote_ccy} "
+                        "lines (no share count to check it against the price)"
+                    )
+            ratio = mcap_raw / (price_quote * check) if check is not None else None
             market_cap = mcap_raw * _unit_scale(ratio, unit)
             implied = market_cap / price
             if shares is None:
@@ -651,7 +860,8 @@ class YFinanceClient:
             shares, market_cap = 0.0, 0.0
 
         # --- dividend per share (D0 for the DDM) ---------------------------- #
-        dps = self._dividend_per_share(tk, info, quote_ccy, price, notes)
+        d0_history: list[tuple[datetime.date, float]] = []
+        dps = self._dividend_per_share(tk, info, quote_ccy, price, notes, d0_history)
 
         # --- beta: CAPM needs a positive one, Blume-adjusted ----------------- #
         # Yahoo's beta for BP and Shell (-0.22) would put the cost of equity
@@ -677,7 +887,9 @@ class YFinanceClient:
             )
 
         def _px(key: str) -> Optional[float]:
-            v = _num(info.get(key))
+            # A 52-week low or high of 0 is a Yahoo sentinel (SHEL.L once
+            # showed fiftyTwoWeekLow 0.0), not a price: left unset.
+            v = _pos(info.get(key))
             return v * unit if v is not None else None
 
         name = (
@@ -700,15 +912,31 @@ class YFinanceClient:
             sector=_str(info.get("sector")),
             industry=_str(info.get("industry")),
             raw_beta=raw_beta,
+            industry_key=_str(info.get("industryKey")),
+            **_trailing_fields(info, currency),
         )
         md._source_notes = notes  # type: ignore[attr-defined]
+        # For HybridProvider: the payment history a no-rate D0 was read from
+        # (it checks a D0 of 0 against the statements), Yahoo's split
+        # records (it flags a spin-off after the latest fiscal year) and the
+        # latest fiscal year's end date (EDGAR's statements carry only the
+        # year's label).
+        if d0_history:
+            md._dividend_history = tuple(d0_history)  # type: ignore[attr-defined]
+        actions = self._split_history(tk)
+        if actions is not None:
+            md._corporate_actions = tuple(actions)  # type: ignore[attr-defined]
+        fy_end = _epoch_date(info.get("lastFiscalYearEnd"))
+        if fy_end is not None:
+            md._last_fiscal_year_end = fy_end  # type: ignore[attr-defined]
         return md
 
     # ----------------------------------------------------------------- #
     #  Internal: dividend per share (D0) and the payment history.
     # ----------------------------------------------------------------- #
     def _dividend_per_share(
-        self, tk, info: dict, quote_ccy: str, price: float, notes: list[str]
+        self, tk, info: dict, quote_ccy: str, price: float, notes: list[str],
+        used_history: Optional[list] = None,
     ) -> Optional[float]:
         """Annual dividend per quoted share (D0), in the quote's major unit.
 
@@ -732,12 +960,16 @@ class YFinanceClient:
           currency is the quote currency (the field is per ordinary share in
           the reporting currency; see the module notes for the ADR gap).
           Otherwise None; HybridProvider then derives DPS from the statements.
+          A history-based D0 adds the history (in the major unit) to
+          `used_history`: HybridProvider replaces a D0 of 0 from a history
+          the statements show to be incomplete.
         """
         currency, unit = major_currency(quote_ccy)
         history = self._dividend_history(tk, quote_ccy)
         rec = None
         if history:
-            rec = _read_dividends([(d, a * unit) for d, a in history], _today())
+            history = [(d, a * unit) for d, a in history]
+            rec = _read_dividends(history, _today())
 
         indicated = _num(info.get("dividendRate"))
         if indicated is not None:
@@ -791,6 +1023,8 @@ class YFinanceClient:
                     "the regular dividend; none in the two years before) is left out"
                 )
             notes.append(note)
+            if used_history is not None:
+                used_history.extend(history)
             return d0
         trailing = _num(info.get("trailingAnnualDividendRate"))
         if trailing is None or trailing == 0.0:
@@ -835,6 +1069,35 @@ class YFinanceClient:
                 day = idx.date() if hasattr(idx, "date") else None
                 if amount is not None and isinstance(day, datetime.date):
                     out.append((day, amount))
+            return out
+        except Exception:
+            return None
+
+    def _split_history(self, tk) -> Optional[list[tuple[datetime.date, float]]]:
+        """``[(date, factor)]`` of Yahoo's split records of the last five years.
+
+        Yahoo records a plain split as its share ratio (CRWD's 4-for-1 on
+        2026-07-02: 4.0) and some spin-offs as the price adjustment for the
+        value paid out (HON: 1.061 for Solstice on 2025-10-30; 0.9535 for the
+        Aerospace spin-off with a 1-for-2 consolidation on 2026-06-29). The
+        records come with the dividend history's price-history request. None
+        when they cannot be read.
+        """
+        try:
+            import pandas as pd  # lazy, like the statement fallback
+
+            try:
+                hist = tk.get_splits(period=_HISTORY_PERIOD)
+            except TypeError:  # yfinance without the `period` argument
+                hist = tk.splits
+            if not isinstance(hist, pd.Series):
+                return None
+            out: list[tuple[datetime.date, float]] = []
+            for idx, val in hist.items():
+                factor = _pos(val)
+                day = idx.date() if hasattr(idx, "date") else None
+                if factor is not None and factor != 1.0 and isinstance(day, datetime.date):
+                    out.append((day, factor))
             return out
         except Exception:
             return None
@@ -980,6 +1243,13 @@ class YFinanceClient:
           same balance sheet, or None without one: Yahoo divides the quoted
           price by a book value per share in the reporting currency, on the
           ordinary-share basis for an ADR (TSM 92.8, ASML 1,519, BP ADR 7.9).
+        * Up-C issuers (IBKR, TPG): when marketCap / price exceeds
+          ``sharesOutstanding`` by more than `_COMP_EV_TOLERANCE` and minority
+          interest is above that share of common equity, the market cap
+          prices the operating-company units the balance sheet shows as
+          minority interest. The rebuilt EV then adds no minority interest
+          and P/B is market cap / (common equity + minority interest) (IBKR
+          6.5, not 24.6).
         * Differing currencies with nothing to rebuild from (no FX rate, no
           market cap, or neither debt nor cash) leave the EV fields and P/B
           None: Yahoo's are known to be mixed.
@@ -1054,7 +1324,21 @@ class YFinanceClient:
                     f"financialCurrency ({evidence}); minority interest, preferred stock and "
                     f"common equity are read in {tables}"
                 )
-        claims = (bal["minority"] or 0.0) + (bal["preferred"] or 0.0)
+        # Up-C issuers (IBKR, TPG): Yahoo's marketCap prices every economic
+        # unit, also the operating-company units the balance sheet shows as
+        # minority interest, while sharesOutstanding counts the listed class.
+        # Their minority interest is then already in the market cap, and the
+        # book value on that basis includes it.
+        equity, minority = bal["equity"], bal["minority"]
+        listed = _pos(info.get("sharesOutstanding"))
+        px = (_pos(info.get("currentPrice")) or _pos(info.get("regularMarketPrice"))
+              or _pos(info.get("previousClose")))
+        units = mcap / (px * unit) if px is not None else None
+        all_units = (units is not None and listed is not None
+                     and units > (1 + _COMP_EV_TOLERANCE) * listed
+                     and equity is not None and equity > 0 and minority is not None
+                     and minority > _COMP_EV_TOLERANCE * equity)
+        claims = (0.0 if all_units else (minority or 0.0)) + (bal["preferred"] or 0.0)
         rebuilt += claims * table_rate
         if not mixed and ev is not None and not off(rebuilt):
             return mcap, ev, ev_ebitda, ev_sales, pb  # the gap was minority interest
@@ -1076,27 +1360,33 @@ class YFinanceClient:
                        "so it is on another share or currency basis")
         else:
             how = ("", "Yahoo reports no enterprise value")
+        added = " + preferred stock" if all_units else " + minority interest + preferred stock"
         if table_rate == rate:
             parts = "total debt - total cash"
             if claims:
-                parts += " + minority interest + preferred stock"
+                parts += added
             formula = f"({parts}){how[0]}"
         else:  # the .info amounts and the statement tables convert differently
             formula = f"(total debt - total cash){how[0]}"
             if claims:
-                formula += " + minority interest + preferred stock" + (
-                    "" if table_rate == 1.0 else f" x {table_rate:.6g}")
+                formula += added + ("" if table_rate == 1.0 else f" x {table_rate:.6g}")
         note = (
             f"{symbol}: EV rebuilt as market cap + {formula} = "
             f"{rebuilt:,.0f} {quote or ''}".rstrip() + f" ({how[1]}); EV/EBITDA "
             f"{fmt(ev_ebitda)} -> {fmt(new_ebitda)}, EV/Sales {fmt(ev_sales)} -> {fmt(new_sales)}"
         )
+        if all_units:
+            note += (f"; Yahoo's market cap prices {units:,.0f} units against {listed:,.0f} "
+                     "listed shares (an Up-C structure: the other units are the minority "
+                     "interest), so minority interest is already in the market cap and is "
+                     "counted in the book value")
         if mixed or ev is not None:
-            equity = bal["equity"]
-            new_pb = (mcap / (equity * table_rate)
-                      if equity is not None and equity > 0 else None)
+            book = equity + minority if all_units else equity
+            new_pb = (mcap / (book * table_rate)
+                      if book is not None and book > 0 else None)
             if new_pb is not None:
-                note += (f"; P/B {fmt(pb)} -> {fmt(new_pb)} (market cap / common equity at "
+                basis = "(common equity + minority interest)" if all_units else "common equity"
+                note += (f"; P/B {fmt(pb)} -> {fmt(new_pb)} (market cap / {basis} at "
                          f"{bal['as_of']})")
             elif pb is not None:
                 note += (f"; P/B {fmt(pb)} left out (Yahoo's book value per share is not on "
@@ -1208,7 +1498,9 @@ class YFinanceClient:
         """Map :meth:`get_comp_row` over ``tickers``, dropping unresolved ones.
 
         De-duplicates by upper-cased symbol so the same peer passed twice (or the
-        target appearing in its own peer list) yields a single row.
+        target appearing in its own peer list) yields a single row. A dropped
+        ticker is not lost silently: the comps model reports it as 'not found'
+        in ``CompsResult.peer_status`` and its "Peers not used" note.
         """
         rows: list[CompRow] = []
         seen: set[str] = set()
@@ -1226,20 +1518,227 @@ class YFinanceClient:
         return rows
 
     # ----------------------------------------------------------------- #
-    #  Public: best-effort peer suggestions (yfinance has no robust API).
+    #  Public: peer suggestions (none by default; discovery is opt-in).
     # ----------------------------------------------------------------- #
     def suggest_peers(self, ticker: str) -> list[str]:
-        """Best-effort peer tickers for ``ticker``: always ``[]``.
+        """Default peer tickers for ``ticker``: always ``[]``.
 
-        yfinance exposes no peer/screener data: none of the modules its `.info`
-        requests (financialData, quoteType, defaultKeyStatistics, assetProfile,
-        summaryDetail, the v7 quote) carries a related-tickers field. We never
-        fabricate peers from a sector string either, so peers must be passed
-        explicitly (README: "Peers are not auto-discovered"). Returning without
-        a network call matters because the comps model asks on every
-        (cached) recompute. Never raises.
+        None of the modules yfinance's `.info` requests (financialData,
+        quoteType, defaultKeyStatistics, assetProfile, summaryDetail, the v7
+        quote) carries a related-tickers field, and a sector string alone is
+        not a peer set, so by default peers must be passed explicitly. Opt-in
+        discovery from Yahoo's industry list, with a size band and notes to
+        review, is
+        :meth:`discover_peers` (the CLI's ``--auto-peers``). Returning without
+        a network call matters because the comps model asks on every (cached)
+        recompute. Never raises.
         """
         return []
+
+    def _industry(self, key: str):
+        """A yfinance ``Industry`` for Yahoo's industry ``key`` (lazy import;
+        the list is fetched when ``top_companies`` is first read). Raises on
+        import error."""
+        import yfinance as yf  # lazy: package imports without yfinance installed
+
+        return yf.Industry(key)
+
+    def _industry_listing(self, key: str) -> Optional[tuple[Optional[str], list, int]]:
+        """``(industry name, [(symbol, name, weight)], rows listed)`` for
+        Yahoo's industry ``key`` (see :func:`_industry_rows`), from the shared
+        cache while it is younger than ``config.PEER_DISCOVERY_TTL`` seconds;
+        None when the list is empty or unavailable (not cached). The industry
+        name is None when Yahoo gives none (the caller falls back to the
+        quote's industry, then the key). Raises on a fetch error, which
+        :meth:`discover_peers` turns into a note."""
+        now = _clock()
+        ttl = config.PEER_DISCOVERY_TTL
+        with _peer_cache_lock:
+            hit = _peer_cache.get(key)
+            if hit is not None and now - hit[0] < ttl:
+                return hit[1], hit[2], hit[3]
+        industry = self._industry(key)
+        frame = industry.top_companies
+        rows = _industry_rows(frame)
+        if not rows:
+            return None
+        try:
+            name = _str(industry.name)
+        except Exception:  # noqa: BLE001 -- the name only labels the notes
+            name = None
+        listing = (name, rows, len(frame))
+        with _peer_cache_lock:
+            for stale in [k for k, v in _peer_cache.items() if now - v[0] >= ttl]:
+                del _peer_cache[stale]
+            _peer_cache[key] = (now, *listing)
+        return listing
+
+    def discover_peers(
+        self, ticker: str, *, industry_key: Optional[str] = None,
+        limit: Optional[int] = None, name: Optional[str] = None,
+    ) -> dict:
+        """Opt-in peer suggestions for ``ticker`` from Yahoo's industry list.
+
+        Returns ``{"ticker", "industry_key", "industry", "peers", "notes",
+        "source"}``. ``peers`` holds ``{"ticker", "name", "market_weight",
+        "size_ratio"}`` dicts, at most ``limit`` (default
+        ``config.PEER_DISCOVERY_LIMIT``) of them; ``notes`` says how they were
+        chosen, and they need review before comps rely on them. ``source`` is
+        "Yahoo Finance industry list".
+
+        * The industry is ``industry_key`` (``MarketData.industry_key``), else
+          the target's ``info['industryKey']``. ``yf.Industry(key)
+          .top_companies`` lists the industry's largest companies with their
+          market weight (share of the industry's market cap).
+        * The target is its own symbol (BRK.B is matched as BRK-B) and any row
+          under its company ``name`` (compared with :func:`company_name_key`;
+          when the quote is read here, ``name`` defaults to its ``longName``,
+          then ``shortName``). Yahoo lists one share class per company, so a
+          GOOGL target finds GOOG, a BRK-A target BRK-B: that row is never
+          proposed, and when the target's own symbol is not listed its weight
+          sets the size band, with a note.
+        * A candidate has a plain listed symbol (``_PEER_SYMBOL``), a name and
+          a finite positive weight, and is not the target; a second symbol
+          under a name already taken (another class of a peer: NWS next to
+          NWSA) is skipped.
+        * Size band: with the target's weight ``wt``, ``size_ratio`` is
+          ``weight / wt``; peers within 0.1x-10x are kept, closest in size
+          (smallest ``|log size_ratio|``) first. With fewer than four the band
+          widens once to 0.02x-50x, with a note. A target with no weight in
+          the list gets no band (``size_ratio`` None) and the largest names,
+          with a note that they may differ widely in size from the target.
+        * Each industry's list is cached in the process for
+          ``config.PEER_DISCOVERY_TTL`` seconds (non-empty lists only), so
+          the size band costs no request beyond the list itself.
+
+        Known limits: the list is Yahoo's US one and covers only an
+        industry's largest names, and an industry can mix business models,
+        so the peers need review. The endpoint is undocumented: a missing
+        industry, a missing yfinance or any error gives no peers and a note.
+        Never raises.
+        """
+        sym = (_str(ticker) or "").upper()
+        result: dict = {"ticker": sym, "industry_key": None, "industry": None,
+                        "peers": [], "notes": [], "source": _PEER_SOURCE}
+        notes: list[str] = result["notes"]
+        try:
+            n = config.PEER_DISCOVERY_LIMIT if limit is None else int(limit)
+            key = _str(industry_key)
+            target_name = _str(name)
+            info_industry = None
+            if key is None:
+                info = self._info(self._ticker(sym))
+                key = _str(info.get("industryKey"))
+                info_industry = _str(info.get("industry"))
+                if target_name is None:
+                    target_name = _str(info.get("longName")) or _str(info.get("shortName"))
+            if key is None:
+                notes.append(f"No peers discovered: Yahoo gives no industry for {sym}.")
+                return result
+            result["industry_key"] = key
+            listing = self._industry_listing(key)
+            if listing is None:
+                notes.append(f"No peers discovered: Yahoo's industry list for '{key}' is "
+                             "empty or unavailable.")
+                return result
+            industry, rows, listed = listing
+            industry = industry or info_industry or key
+            result["industry"] = industry
+
+            targets = {sym, sym.replace(".", "-")}
+            own = company_name_key(target_name)
+            if own == company_name_key(sym):
+                own = None  # the ticker standing in for a missing name names no company
+            # The target's other share class: Yahoo's row under its company name.
+            classes = [(s, nm, w) for s, nm, w in rows
+                       if s not in targets and own is not None and company_name_key(nm) == own]
+            target_weight = next((w for s, _, w in rows if s in targets and w is not None), None)
+            weight_from = None
+            if target_weight is None:
+                weight_from, target_weight = next(
+                    ((s, w) for s, _, w in classes if w is not None), (None, None))
+            # Names already taken (the target's, then each candidate's): one
+            # symbol per company, so another share class is not its own peer.
+            names = {company_name_key(nm) for s, nm, _ in rows if s in targets} | {own}
+            names.discard(None)
+            candidates: list[tuple[str, str, float]] = []
+            seen: set[str] = set()
+            for s, nm, w in rows:
+                nkey = company_name_key(nm)
+                if (s in targets or s in seen or nkey is None or w is None
+                        or not _PEER_SYMBOL.fullmatch(s) or nkey in names):
+                    continue
+                seen.add(s)
+                names.add(nkey)
+                candidates.append((s, nm, w))
+            candidates.sort(key=lambda c: -c[2])  # stable: Yahoo's order breaks ties
+
+            detail: list[str] = []
+            if classes:
+                one = len(classes) == 1
+                text = (f"{', '.join(s for s, _, _ in classes)} "
+                        f"{'is' if one else 'are'} not proposed: Yahoo lists {classes[0][1]} "
+                        f"under {'it' if one else 'them'}, "
+                        f"{'another share class' if one else 'other share classes'} of {sym}")
+                text += (f"; {weight_from}'s market weight sets the size band."
+                         if weight_from is not None else ".")
+                detail.append(text)
+            if not candidates:
+                notes.append(f"No peers discovered: Yahoo's {industry} list "
+                             f"({_plural(listed, 'name')}) has no listed company with a "
+                             f"market weight other than {sym}.")
+                notes.extend(detail)
+                return result
+
+            band = None
+            chosen = candidates
+            if target_weight is None:
+                detail.append(f"Size band not applied: {sym} has no market weight in "
+                              f"Yahoo's {industry} list, so its largest names are proposed; "
+                              f"they may differ widely in size from {sym}.")
+            else:
+                def within(lo_hi: tuple[float, float]) -> list:
+                    lo, hi = lo_hi
+                    return [c for c in candidates if lo <= c[2] / target_weight <= hi]
+
+                band = _PEER_SIZE_BAND
+                chosen = within(band)
+                if len(chosen) < _PEER_MIN_IN_BAND:
+                    m = len(chosen)
+                    were = ("no name was" if m == 0
+                            else f"only {_plural(m, 'name')} {'was' if m == 1 else 'were'}")
+                    detail.append(
+                        f"Size band widened from {_PEER_SIZE_BAND[0]:g}-{_PEER_SIZE_BAND[1]:g}x "
+                        f"to {_PEER_WIDE_BAND[0]:g}-{_PEER_WIDE_BAND[1]:g}x {sym}'s market "
+                        f"weight: {were} within the narrower band.")
+                    band = _PEER_WIDE_BAND
+                    chosen = within(band)
+                # Closest in size first (stable: the larger name first on a tie).
+                chosen.sort(key=lambda c: abs(math.log(c[2] / target_weight)))
+            result["peers"] = [
+                {"ticker": s, "name": nm, "market_weight": w,
+                 "size_ratio": (w / target_weight) if target_weight is not None else None}
+                for s, nm, w in chosen[:max(n, 0)]
+            ]
+            k = len(result["peers"])
+            how = (f"closest in size first, {band[0]:g}-{band[1]:g}x {sym}'s size"
+                   if band is not None else "largest market weight first")
+            if k:
+                notes.append(f"Peers suggested from Yahoo's {industry} list ({k} of "
+                             f"{_plural(listed, 'name')}, {how}); review them before relying "
+                             "on comps.")
+            elif n <= 0:
+                notes.append(f"No peers discovered: the peer limit is {n}.")
+            else:  # a band was applied (without one every candidate is kept)
+                notes.append(f"No peers discovered: no other company in Yahoo's {industry} "
+                             f"list is within {band[0]:g}-{band[1]:g}x {sym}'s size.")
+            notes.extend(detail)
+            return result
+        except Exception as exc:  # noqa: BLE001 -- discovery is optional; never crash.
+            result["peers"] = []
+            notes.append(f"No peers discovered: Yahoo's industry data could not be read "
+                         f"({type(exc).__name__}: {exc}).")
+            return result
 
     # ----------------------------------------------------------------- #
     #  Public: fundamentals fallback from yfinance statement DataFrames.
@@ -1425,19 +1924,7 @@ class YFinanceClient:
 
         # D&A: prefer the income statement, then the cash-flow statement.
         dep_amort = series(
-            [
-                (income, (
-                    "Reconciled Depreciation",
-                    "Depreciation And Amortization In Income Statement",
-                    "Depreciation Amortization Depletion Income Statement",
-                )),
-                (cashflow, (
-                    "Depreciation And Amortization",
-                    "DepreciationAndAmortization",
-                    "Depreciation Amortization Depletion",
-                    "Depreciation",
-                )),
-            ],
+            [(income, _DA_INCOME_ROWS), (cashflow, _DA_CASHFLOW_ROWS)],
             positive=True,
             label="D&A",
         )
@@ -1463,7 +1950,8 @@ class YFinanceClient:
         # ΔNWC: yfinance's "Change In Working Capital" is signed as a cash-flow
         # contribution (a NWC *increase* is a cash *use* -> negative). Our schema
         # stores ΔNWC as positive = increase in NWC, so negate the cash-flow sign.
-        cf_wc = series([(cashflow, ("Change In Working Capital", "ChangeInWorkingCapital"))])
+        cf_wc = series([(cashflow, ("Change In Working Capital", "ChangeInWorkingCapital"))],
+                       label="change in working capital")
         change_in_nwc = [-v for v in cf_wc]
 
         # Diluted shares (weighted average), falling back to basic per period.
@@ -1599,6 +2087,9 @@ class YFinanceClient:
                               ``Current Debt``) takes the line that includes
                               leases, less its lease line when there is one
           debt_basis          which of those, in words
+          debt_includes_leases  False when `total_debt` leaves lease
+                              obligations out, True when it includes (or
+                              may include) some
           cash                cash and cash equivalents alone
           cash_and_investments  plus short-term investments
           captive             evidence of a captive finance arm, or None
@@ -1658,12 +2149,15 @@ class YFinanceClient:
             basis = ("long-term plus current debt, lease obligations excluded" if not with_leases
                      else "long-term plus current debt, "
                           f"{' and '.join(with_leases)} lease obligations included")
+            includes_leases = bool(with_leases)
         elif total is not None and leases:
             debt, basis = total - leases, "total debt less lease obligations"
+            includes_leases = False
         elif total is not None:
             debt, basis = total, "total debt, which may include lease obligations"
+            includes_leases = True
         else:
-            debt, basis = None, ""
+            debt, basis, includes_leases = None, "", False
         cash = cell("Cash And Cash Equivalents", "CashAndCashEquivalents")
         combined = cell("Cash Cash Equivalents And Short Term Investments",
                         "CashCashEquivalentsAndShortTermInvestments")
@@ -1680,6 +2174,7 @@ class YFinanceClient:
             "currency_note": currency_note,
             "total_debt": debt,
             "debt_basis": basis,
+            "debt_includes_leases": includes_leases,
             "cash": cash,
             "cash_and_investments": combined,
             "captive": evidence,
@@ -1709,28 +2204,69 @@ class YFinanceClient:
                          currency and currency_note None) when the statement
                          was read but shows no capital expenditure
         """
+        return self._annual_rows_by_year(ticker, (("cashflow", _CAPEX_ROWS),))
+
+    def get_da_by_year(self, ticker: str) -> Optional[dict]:
+        """D&A by fiscal year from Yahoo's annual income and cash-flow statements.
+
+        Used by HybridProvider to backfill EDGAR years that no D&A tag covers
+        (PG&E and Carvana tag their D&A only with company-specific elements).
+        As :meth:`get_capex_by_year`, with the statement fallback's rows: per
+        fiscal year the first of `_DA_INCOME_ROWS` with a value in the income
+        statement, else the first of `_DA_CASHFLOW_ROWS` in the cash-flow
+        statement. A fiscal year that two columns of either statement share
+        (a changed year end) is left out. Returns None when neither statement
+        could be read; ``by_year`` holds ``(ISO period end, D&A)`` pairs.
+        Never raises.
+        """
+        return self._annual_rows_by_year(
+            ticker, (("financials", _DA_INCOME_ROWS), ("cashflow", _DA_CASHFLOW_ROWS)))
+
+    def _annual_rows_by_year(
+        self, ticker: str, sources: tuple[tuple[str, tuple[str, ...]], ...]
+    ) -> Optional[dict]:
+        """One line item by fiscal year from Yahoo's annual statements, for
+        :meth:`get_capex_by_year` and :meth:`get_da_by_year`.
+
+        `sources` are ``(statement attribute, row labels)`` pairs in order of
+        preference: a fiscal year takes the first source's value, else the
+        next one's. Per column the first row with a value is read, as a
+        positive magnitude; a zero there is no reading (the year falls to the
+        next source). A fiscal year that two columns of one statement share
+        (a changed year end) is left out of every source.
+        None when no statement could be read; otherwise the dict those
+        methods describe (``currency``, ``currency_note``, ``by_year``).
+        """
         try:
             tk = self._ticker(ticker)
-            cashflow = self._frame(tk, "cashflow")
-            if cashflow is None:
-                return None
-            cols = list(cashflow.columns)
         except Exception:
             return None
         by_year: dict = {}
-        seen: set = set()
         shared: set = set()
-        for col in cols:
-            day, fy = self._col_date(col), self._year_of(col)
-            if day is None or fy is None:
+        read = False
+        for attr, rows in sources:
+            try:
+                frame = self._frame(tk, attr)
+                if frame is None:
+                    continue
+                cols = list(frame.columns)
+            except Exception:
                 continue
-            if fy in seen:
-                shared.add(fy)
-                continue
-            seen.add(fy)
-            value = self._cell(cashflow, _CAPEX_ROWS, col)
-            if value is not None and value != 0:
-                by_year[fy] = (day.isoformat(), abs(value))
+            read = True
+            seen: set = set()
+            for col in cols:
+                day, fy = self._col_date(col), self._year_of(col)
+                if day is None or fy is None:
+                    continue
+                if fy in seen:
+                    shared.add(fy)
+                    continue
+                seen.add(fy)
+                value = self._cell(frame, rows, col)
+                if value is not None and value != 0 and fy not in by_year:
+                    by_year[fy] = (day.isoformat(), abs(value))
+        if not read:
+            return None
         for fy in shared:
             by_year.pop(fy, None)
         if not by_year:
@@ -1825,7 +2361,8 @@ class YFinanceClient:
         """Build a :class:`BalanceSheetSnapshot` from the newest balance-sheet column.
 
         Always returns a snapshot (zero-filled if data is missing, with a note
-        in `notes`) so the caller gets a usable object.
+        in `notes`) so the caller gets a usable object. ``operating_lease_liability``
+        stays None: Yahoo's total debt already includes lease obligations.
         """
         notes = notes if notes is not None else []
         if balance is None or getattr(balance, "empty", True):

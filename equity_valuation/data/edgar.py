@@ -28,12 +28,16 @@ copies them into `CompanyData.source_notes`. Banks, insurers, BDCs, REITs,
 debt-funded operating lessors and industrial groups that consolidate a
 captive finance arm are recognised from their own tags and marked as
 ``_financial_kind`` ("bank", "insurer", "bdc", "reit", "lessor",
-"captive_finance"; None otherwise), with a leading WARNING note.
+"captive_finance"; None otherwise), with a leading WARNING note. The latest
+fiscal year's annual-report form ("10-K", "20-F", "40-F") and period end ride
+along as ``_annual_form`` and ``_latest_fy_end``.
 """
 
 from __future__ import annotations
 
+import math
 import time
+from fractions import Fraction
 from itertools import combinations
 from typing import Optional
 
@@ -78,24 +82,46 @@ _MIN_YEARS = 5  # informational target; we keep whatever (>=1) is available
 
 # Tag-fallback lists: try each in order, first present wins (D&A and capex
 # excepted, see `_TAGS_DA` and `_TAGS_CAPEX`).
-# `Revenues` is the income-statement total. The ASC 606 tag covers contract
-# revenue only (no lease, interest or insurance revenue), so it just backfills
-# periods where the total is not tagged.
+# `Revenues` is normally the income-statement total. Utilities that stop
+# tagging it use RegulatedAndUnregulatedOperatingRevenue (Xcel, DTE, NextEra,
+# Duke), and broker-dealers and card or universal banks
+# RevenuesNetOfInterestExpense (Goldman Sachs, Morgan Stanley, Wells Fargo,
+# American Express, SoFi); both are totals too. The ASC 606 tags cover
+# contract revenue only (no lease, interest or insurance revenue), so they
+# just backfill periods where no total is tagged, except where `Revenues` is
+# not the total at all (see `_revenue_subtotal_years`).
 _TAGS_REVENUE = (
     "Revenues",
+    "RegulatedAndUnregulatedOperatingRevenue",
+    "RevenuesNetOfInterestExpense",
     "RevenueFromContractWithCustomerExcludingAssessedTax",
     "SalesRevenueNet",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
 )
+# The ASC 606 contract-revenue tag that leaves out excise and sales taxes; the
+# tax-inclusive one can legitimately exceed a net `Revenues` total. A
+# `Revenues` series below `_REVENUE_SUBTOTAL_SHARE` of it in every fiscal year
+# both report is not the total (see `_revenue_subtotal_years`).
+_TAG_CONTRACT_REVENUE = "RevenueFromContractWithCustomerExcludingAssessedTax"
+_REVENUE_SUBTOTAL_SHARE = 0.9
 _TAGS_EBIT = ("OperatingIncomeLoss",)
-# Total costs of sales and operating expenses; EBIT fallback = revenue - this.
+# Total costs of sales and operating expenses; EBIT fallback = revenue - this,
+# and the EBIT of a filer whose OperatingIncomeLoss is a total of segment
+# profit (see `_segment_profit_years`), tested with this share of revenue.
 _TAGS_COSTS_AND_EXPENSES = ("CostsAndExpenses",)
+_SEGMENT_TOTAL_MIN_GAP = 0.01
 _TAG_COMMON_INCOME = "NetIncomeLossAvailableToCommonStockholdersBasic"
 _TAG_NCI_INCOME = "NetIncomeLossAttributableToNoncontrollingInterest"
 _TAGS_PREFERRED_INCOME_ADJUSTMENTS = (
     "PreferredStockDividendsAndOtherAdjustments",
     "PreferredStockDividendsIncomeStatementImpact",
 )
+# The form and end date of the latest fiscal year's annual report ride on the
+# financials as ``_annual_form`` and ``_latest_fy_end`` (see
+# `EdgarClient._latest_annual_report`), read from that year's full-year facts
+# under these tags (the revenue and net income tags the fiscal-year axis is
+# built from).
+_TAGS_FORM_EVIDENCE = _TAGS_REVENUE + (_TAG_COMMON_INCOME, "NetIncomeLoss", "ProfitLoss")
 # D&A: each of these tags is either the filer's total D&A or one part of it,
 # and which one differs by filer (McDonald's DepreciationDepletionAndAmortization
 # is 0.46B against a 2.20B DepreciationAndAmortization total; United Rentals
@@ -130,10 +156,19 @@ _TAGS_DA = (
 # whose second tag is larger in every year both report, as a total is: Copart
 # tags its segment note's capex "including acquisitions" there (the same as
 # its PP&E purchases in years without an acquisition), and Schwab a figure
-# that is smaller in some years, so neither is read as the total.
+# that is smaller in some years, so neither is read as the total. Utilities
+# may tag their construction expenditures, their whole capex, only as
+# PaymentsForConstructionInProcess: AEP's PP&E tag stops in 2020 and its
+# productive-assets tag holds a separate line, acquisitions of generation
+# facilities (0.16-3.45B against 7.4-8.5B of construction). Listed last, it
+# replaces the others only where it is larger than each of them in every
+# year they share, and otherwise only fills the years they leave empty
+# (Consolidated Edison's PP&E tag is larger in a shared year, so construction
+# fills only the years after that tag stops).
 _TAGS_CAPEX = (
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
+    "PaymentsForConstructionInProcess",
 )
 # Payments for "other" PP&E: Eli Lilly's whole capex line, but for D.R. Horton
 # a separate line (rental properties) that adds to its PP&E purchases and is
@@ -182,10 +217,45 @@ _TAGS_DIVIDENDS = (
     "PaymentsOfDividends",
     "DividendsCommonStockCash",
 )
+# PaymentsOfDividends covers preferred dividends too (it is the only dividends
+# line in the cash flows JPMorgan, Goldman Sachs and Schwab tag), while net
+# income and the share counts are common-only. In a year with preferred dividends tagged, it gives way to the
+# common dividends declared when tagged, else to itself less the preferred
+# dividends (see `_common_dividends`). Not where the cash flow shows the
+# preferred dividends paid on a line of their own: the generic line is then
+# the common dividends.
+_TAGS_COMMON_DIVIDENDS_DECLARED = ("DividendsCommonStockCash", "DividendsCommonStock")
+_TAGS_PREFERRED_DIVIDENDS = ("DividendsPreferredStockCash", "DividendsPreferredStock")
+_TAG_PREFERRED_DIVIDENDS_PAID = "PaymentsOfDividendsPreferredStockAndPreferenceStock"
 _TAGS_DILUTED_SHARES = (
     "WeightedAverageNumberOfDilutedSharesOutstanding",
     "WeightedAverageNumberOfSharesOutstandingBasic",
 )
+# Share-count checks (see `_adjusted_share_counts`). Units: a year below
+# `_SHARE_UNIT_MAX_SHARE` of a reference count (the largest class on the
+# cover page's latest shares outstanding, else the median of the series' own
+# counts of at least `_SHARE_UNIT_MIN_COUNT`) was tagged in millions
+# (McDonald's tags 716.4 for 716.4M since 2024) and is multiplied by
+# `_SHARE_UNIT_MILLION` when that lands within a factor of 10 of the
+# reference. (Berkshire's Class A equivalent count is 0.1% of its Class B
+# cover count, so the share is set well below that.)
+# Splits: a filing after the latest annual report that restates a period's
+# count by a factor of at least `_SPLIT_MIN_FACTOR` (and at most
+# `_SPLIT_MAX_FACTOR`, beyond which it is a unit change) records a split
+# after that report (Honeywell 1-for-2, Booking 25-for-1), provided that
+# year's annual count is still on the old basis. Every year is multiplied by
+# that factor, since the annual counts predate it. The factor measured from
+# rounded counts (Booking's 24.99) is snapped to the plain ratio with a
+# denominator up to `_SPLIT_RATIO_MAX_DENOMINATOR` within
+# `_SPLIT_RATIO_TOLERANCE` of it (25-for-1, 3-for-2, 1-for-10).
+_TAG_COVER_SHARES = "EntityCommonStockSharesOutstanding"
+_SHARE_UNIT_MAX_SHARE = 1e-4
+_SHARE_UNIT_MIN_COUNT = 1e5
+_SHARE_UNIT_MILLION = 1e6
+_SPLIT_MIN_FACTOR = 1.5
+_SPLIT_MAX_FACTOR = 100.0
+_SPLIT_RATIO_MAX_DENOMINATOR = 10
+_SPLIT_RATIO_TOLERANCE = 0.005
 # Only the aggregate operating-capital tag is read. Most filers tag just the
 # individual cash-flow lines instead, and a partial sum of them (receivables +
 # inventories - payables) leaves out contract liabilities, accruals and other
@@ -202,7 +272,14 @@ _TAGS_LTD_NONCURRENT = (
     "LongTermDebtAndCapitalLeaseObligations",
     "LongTermNotesPayable",
 )
-_TAGS_LTD_CURRENT = ("LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent")
+# The current convertible-note tags come last: some filers (Akamai,
+# Cloudflare) tag the current tranche of their convertible notes only there.
+_TAGS_LTD_CURRENT = (
+    "LongTermDebtCurrent",
+    "LongTermDebtAndCapitalLeaseObligationsCurrent",
+    "ConvertibleNotesPayableCurrent",
+    "ConvertibleDebtCurrent",
+)
 # Short-term borrowings (which by definition include commercial paper; Apple-
 # style filers tag only CommercialPaper).
 _TAGS_ST_BORROWINGS = ("ShortTermBorrowings", "CommercialPaper")
@@ -223,10 +300,13 @@ _TAGS_DEBT_COMBINED = (
 # balance-sheet debt lines. One tag per group is used, so a notes total and a
 # subset of it (senior or convertible notes) are never both counted. Each line
 # includes its current portion, except the noncurrent-only tags listed last in
-# their groups (used only when the group has no including-current line).
+# their groups (used only when the group has no including-current line), such
+# as the noncurrent convertible notes that are all the debt of DoorDash and
+# Robinhood.
 _DEBT_LINE_GROUPS = (
     ("NotesPayable", "SeniorNotes", "UnsecuredDebt", "ConvertibleNotesPayable",
-     "UnsecuredLongTermDebt", "SeniorLongTermNotes"),
+     "UnsecuredLongTermDebt", "SeniorLongTermNotes", "ConvertibleLongTermNotesPayable",
+     "ConvertibleDebtNoncurrent"),
     ("LoansPayable",),
     ("SecuredDebt", "SecuredLongTermDebt"),
     ("LineOfCredit",),
@@ -235,11 +315,23 @@ _DEBT_LINE_GROUPS = (
 )
 # Debt lines that exclude their current portion. When every line summed is
 # one of these, all current debt is added (not just short-term borrowings).
-_DEBT_LINES_NONCURRENT = frozenset(
-    ("UnsecuredLongTermDebt", "SeniorLongTermNotes", "SecuredLongTermDebt")
-)
+_DEBT_LINES_NONCURRENT = frozenset((
+    "UnsecuredLongTermDebt", "SeniorLongTermNotes", "SecuredLongTermDebt",
+    "ConvertibleLongTermNotesPayable", "ConvertibleDebtNoncurrent",
+))
 # Two amounts within this relative distance are read as the same figure.
 _AMOUNT_MATCH_TOLERANCE = 0.005
+# The debt note's total carrying amount: only a cross-check of the total
+# built above, matched within `_DEBT_CARRYING_MATCH` (see `_total_debt`), and
+# a WARNING when every debt tag is from an earlier balance sheet while it is
+# more than `_STALE_DEBT_MAX_GAP` away from that total.
+_TAG_DEBT_CARRYING = "DebtInstrumentCarryingAmount"
+_DEBT_CARRYING_MATCH = 0.01
+_STALE_DEBT_MAX_GAP = 0.10
+_TAGS_ALL_DEBT = (
+    _TAGS_LTD_NONCURRENT + _TAGS_LTD_CURRENT + _TAGS_ST_BORROWINGS + _TAGS_DEBT_CURRENT
+    + _TAGS_LTD_TOTAL + _TAGS_DEBT_COMBINED + tuple(t for g in _DEBT_LINE_GROUPS for t in g)
+)
 # Balance-sheet cash & equivalents first. Filers that tag only the cash-flow
 # total including restricted cash (GE, P&G, Chevron, GE Vernova, most banks)
 # get that total less restricted cash tagged at the same date; some insurers
@@ -269,7 +361,18 @@ _TAGS_RESTRICTED_CASH_NONCURRENT = (
     "RestrictedCashAndCashEquivalentsNoncurrent",
     "RestrictedCashNoncurrent",
 )
-_TAGS_ST_INVEST = ("ShortTermInvestments", "MarketableSecuritiesCurrent")
+# Short-term investments: the balance-sheet lines first, then the current
+# debt-securities elements many filers put on that line instead (Intel,
+# Elevance and GM tag theirs as available-for-sale debt securities, Nike
+# without accrued interest, NVIDIA as current debt securities). The first tag
+# at the snapshot wins, so they are never added together.
+_TAGS_ST_INVEST = (
+    "ShortTermInvestments",
+    "MarketableSecuritiesCurrent",
+    "DebtSecuritiesCurrent",
+    "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+    "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent",
+)
 _TAGS_EQUITY = (
     "StockholdersEquity",
     "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
@@ -283,6 +386,12 @@ _TAGS_PREFERRED_BOOK = (
     "PreferredStockValue",
 )
 _TAGS_PREFERRED = _TAGS_PREFERRED_BOOK + ("PreferredStockLiquidationPreferenceValue",)
+# Operating-lease liabilities (ASC 842), which the debt tags above leave out:
+# the total, else its noncurrent and current parts. Only the comps EV bridge
+# reads them (``BalanceSheetSnapshot.operating_lease_liability``).
+_TAG_OPERATING_LEASE_TOTAL = "OperatingLeaseLiability"
+_TAG_OPERATING_LEASE_NONCURRENT = "OperatingLeaseLiabilityNoncurrent"
+_TAG_OPERATING_LEASE_CURRENT = "OperatingLeaseLiabilityCurrent"
 
 # Financial filers. For banks, insurers, BDCs and REITs, borrowing, lending,
 # investing or buying property is the business itself, so the operating-
@@ -293,9 +402,18 @@ _TAGS_PREFERRED = _TAGS_PREFERRED_BOOK + ("PreferredStockLiquidationPreferenceVa
 #   bank     Deposits >= 15% of total assets;
 #   insurer  premiums earned or policyholder benefits >= 40% of revenue AND
 #            net investment income >= 2% of revenue (the second test leaves
-#            out managed-care companies, whose float income is ~1%);
+#            out managed-care companies, whose float income is ~1%); or
+#            policyholder liabilities >= 40% of total assets: annuity and
+#            retirement writers (Apollo with Athene, Equitable, Voya) book
+#            deposits rather than premiums, so they fail the revenue test,
+#            while a run-off book (GE 26%) stays below this share. Contract
+#            deposits and policyholder funds are often the same total tagged
+#            twice, so each group is a share of its own and the largest counts;
+#            future policy benefits and separate accounts are also read alone,
+#            since one may be tagged only annually and the other quarterly;
 #   BDC      investments at fair value >= 50% of total assets;
-#   REIT     real-estate investment property >= 50% of total assets, or real
+#   REIT     real-estate investment property (or, without that tag, real-
+#            estate investments) >= 50% of total assets, or real
 #            estate at gross carrying value on its Schedule III (the SEC's
 #            real-estate schedule) >= 40% of them: tower and data-centre REITs
 #            (American Tower 47%, Equinix 84%) tag no investment-property
@@ -310,12 +428,25 @@ _TAGS_INVESTMENT_INCOME = (
     "InvestmentIncomeInterestAndDividend",
     "InterestAndDividendIncomeOperating",
 )
+_TAGS_POLICYHOLDER_LIABILITIES = (
+    ("PolicyholderContractDeposits",),
+    ("PolicyholderFunds",),
+    ("LiabilityForFuturePolicyBenefits", "SeparateAccountsLiability"),
+    ("LiabilityForFuturePolicyBenefits",),
+    ("SeparateAccountsLiability",),
+)
 _TAGS_BDC_INVESTMENTS = ("InvestmentOwnedAtFairValue",)
 _TAGS_REIT_PROPERTY = ("RealEstateInvestmentPropertyNet",)
+# The broader real-estate investments line, tested next: VICI's casino
+# properties are leases accounted for as investments (97% of total assets),
+# with no investment-property tag. Insurers' real-estate holdings under that
+# tag are 1-2% of their assets.
+_TAGS_REIT_INVESTMENTS = ("RealEstateInvestments",)
 _TAGS_REIT_SCHEDULE_III = ("RealEstateGrossAtCarryingValue",)
 _BANK_MIN_DEPOSIT_SHARE = 0.15
 _INSURER_MIN_PREMIUM_SHARE = 0.40
 _INSURER_MIN_INVESTMENT_INCOME_SHARE = 0.02
+_INSURER_MIN_POLICY_LIABILITY_SHARE = 0.40
 _BDC_MIN_INVESTMENT_SHARE = 0.50
 _REIT_MIN_PROPERTY_SHARE = 0.50
 _REIT_MIN_SCHEDULE_III_SHARE = 0.40
@@ -351,10 +482,13 @@ _CAPTIVE_LOANS_ONLY_REASON = (
 # Captive finance arms (GM Financial, Ford Credit, John Deere Financial, Cat
 # Financial, PACCAR Financial, Harley-Davidson Financial Services): a group
 # that is none of the kinds above, sells products and lends to its customers
-# and dealers to finance them. A product business is required: inventory on
-# the latest balance sheet or a change in inventories in the latest fiscal
-# year's cash flow (every captive group holds inventory; a lending platform
-# such as Upstart does not). Evidence must include lending, since operating-
+# and dealers to finance them. A product business is required: inventory of
+# at least `_CAPTIVE_MIN_INVENTORY_SHARE` of total assets on the latest
+# balance sheet, or a change in inventories in the latest fiscal year's cash
+# flow (every captive group holds inventory, Pitney Bowes 2%, GM 5%,
+# Caterpillar 20%; a lending platform such as Upstart does not, and Shopify's
+# 0.1% of point-of-sale hardware does not make its merchant cash advances a
+# captive finance arm). Evidence must include lending, since operating-
 # lease vehicles alone are what any lessor or rental company holds; they only
 # add to the arm's size. At the latest data, either
 #   * finance receivables are at least `_CAPTIVE_MIN_RECEIVABLE_SHARE` of total
@@ -393,6 +527,7 @@ _TAG_OPERATING_LEASE_INCOME = "OperatingLeaseLeaseIncome"
 # uses a company-specific element (PACCAR, Marriott Vacations).
 _TAGS_INVENTORY = ("InventoryNet", "InventoryGross", "InventoryRealEstate")
 _TAG_INVENTORY_CHANGE = "IncreaseDecreaseInInventories"
+_CAPTIVE_MIN_INVENTORY_SHARE = 0.01
 _CAPTIVE_MIN_RECEIVABLE_SHARE = 0.10
 _CAPTIVE_MIN_ASSET_SHARE = 0.25
 _CAPTIVE_MIN_ORIGINATION_SHARE = 0.15
@@ -428,10 +563,21 @@ _TAGS_LESSOR_INTEREST = _TAGS_INTEREST + ("InterestExpenseOperating",)
 # Avis Budget's vehicle interest) is not added back and stays inside it.
 # Equity REITs and lessors are also exempt from the share test
 # (`_SHARE_TEST_EXEMPT_KINDS`), since their interest often passes 10% of
-# revenue.
+# revenue. So are regulated utilities and other asset-heavy operators, whose
+# interest is on the debt that funds their plant, a financing cost (Sempra
+# 11% and AES 12% of revenue, with net PP&E at 43% and 75% of total assets):
+# an unclassified filer whose net PP&E is at least `_ASSET_HEAVY_MIN_PPE_SHARE`
+# of total assets is derived (lenders, brokers and mortgage REITs hold almost
+# none: Affirm 4%, SoFi 1%).
 _EBIT_NOT_DERIVED_KINDS = ("bank", "bdc")
 _SHARE_TEST_EXEMPT_KINDS = ("reit", "lessor")
 _LENDER_MIN_INTEREST_SHARE = 0.10
+_TAGS_NET_PPE = (
+    ("PropertyPlantAndEquipmentNet",),
+    ("PublicUtilitiesPropertyPlantAndEquipmentNet",),
+    ("PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",),
+)
+_ASSET_HEAVY_MIN_PPE_SHARE = 0.25
 
 # A latest-year interest expense above this share of total debt means debt
 # the tags above do not cover (company-specific tags, unread line items). It
@@ -530,6 +676,18 @@ def _fy_list(years: list[int]) -> str:
     return ", ".join(
         f"FY{r[0]}" if len(r) == 1 else f"FY{r[0]}-{r[-1]}" for r in runs
     )
+
+
+def _plain_split_factor(factor: float) -> float:
+    """A split factor measured from rounded share counts, snapped to the
+    nearest plain ratio (``n/m`` with ``m <= _SPLIT_RATIO_MAX_DENOMINATOR``,
+    taken on the side above 1 so a 1-for-20 reverse split is ``1/20``) when
+    that lies within `_SPLIT_RATIO_TOLERANCE` of it; otherwise `factor`."""
+    above = max(factor, 1.0 / factor)
+    ratio = float(Fraction(above).limit_denominator(_SPLIT_RATIO_MAX_DENOMINATOR))
+    if ratio <= 0 or abs(ratio / above - 1.0) > _SPLIT_RATIO_TOLERANCE:
+        return factor
+    return ratio if factor >= 1.0 else 1.0 / ratio
 
 
 # --------------------------------------------------------------------------- #
@@ -713,6 +871,35 @@ class EdgarClient:
             return None
         return start, end, filed, float(val)
 
+    def _latest_annual_report(
+        self, facts: dict, year: int
+    ) -> tuple[Optional[str], Optional[str]]:
+        """``(form, period end)`` of the annual report behind fiscal year
+        `year`: "10-K", "20-F" or "40-F" (with "/A" for an amendment) and the
+        ISO end date of that year, or None for either when not found.
+
+        Both come from the full-year facts labelled `year` under
+        `_TAGS_FORM_EVIDENCE`: the form of the latest-filed one (an amendment
+        of that year wins, as its figures do) and the latest period end (as
+        `_annual_flow_by_fy` keeps). They ride on the financials as
+        ``_annual_form`` and ``_latest_fy_end``: HybridProvider warns when it
+        fills Yahoo's missing share count from a 20-F filer's EDGAR count
+        (ordinary shares, not the ADSs quoted), and takes the fiscal year's
+        exact end date from it (see `provider._fiscal_year_end`).
+        """
+        latest: Optional[tuple[str, str]] = None  # (filed, form)
+        end: Optional[str] = None
+        for tag in _TAGS_FORM_EVIDENCE:
+            for e in self._unit_entries(facts, tag, _UNIT_USD):
+                fact = self._annual_fact(e)
+                if fact is None or _fiscal_year_label(fact[1]) != year:
+                    continue
+                if latest is None or fact[2] > latest[0]:
+                    latest = (fact[2], str(e.get("form")))
+                if end is None or fact[1] > end:
+                    end = fact[1]
+        return (latest[1] if latest else None), end
+
     def _fiscal_year_period(
         self, facts: dict, tags: tuple[str, ...], year: int
     ) -> Optional[tuple[str, str]]:
@@ -879,6 +1066,19 @@ class EdgarClient:
                 best[end] = (filed, float(val))
         return {end: fv[1] for end, fv in best.items()}
 
+    def _annual_balance_sheet_dates(self, facts: dict) -> list[str]:
+        """Sorted dates of the filer's annual-report balance sheets: total
+        assets tagged in a 10-K, 20-F or 40-F (or an amendment) for its fiscal
+        year, the prior year's comparative included."""
+        dates = {
+            e["end"]
+            for e in self._unit_entries(facts, _TAGS_ASSETS[0], _UNIT_USD)
+            if isinstance(e, dict) and not e.get("start") and e.get("fp") == "FY"
+            and e.get("form") in _ANNUAL_FORMS and is_num(e.get("val"))
+            and _reported_period(e.get("end"), e.get("filed") or "")
+        }
+        return sorted(dates)
+
     def _instant_at(
         self,
         facts: dict,
@@ -907,12 +1107,16 @@ class EdgarClient:
 
         The first tag (in preference order) with a fact dated exactly `as_of`
         wins. Failing that, the most recent fact dated within
-        `_INSTANT_GRACE_DAYS` before `as_of` is used (noted). An item whose
-        latest fact is older than that is treated as no longer reported: None,
-        with a note when the ignored value was non-zero. Facts dated after
-        `as_of` are never used. With `bs_dates` (the filer's balance-sheet
-        dates), an earlier fact must fall on one of them: a debt amount dated
-        mid-quarter describes one note issue, not the balance.
+        `_INSTANT_GRACE_DAYS` before `as_of` is used (noted), unless an annual
+        report's balance sheet dated between the two left the item out: the
+        grace window is for an item reported only in the last 10-K, not for a
+        10-Q item the next 10-K no longer reports (Alliant Energy's short-term
+        investments). An item whose latest fact is older than that is treated
+        as no longer reported: None, with a note when the ignored value was
+        non-zero. Facts dated after `as_of` are never used. With `bs_dates`
+        (the filer's balance-sheet dates), an earlier fact must fall on one of
+        them: a debt amount dated mid-quarter describes one note issue, not
+        the balance.
         """
         series = [self._instant_by_end(facts, tag) for tag in tags]
         for tag, by_end in zip(tags, series):
@@ -928,8 +1132,19 @@ class EdgarClient:
         end, neg_pref, val = max(older)
         age = _days_between(end, as_of)
         if age is not None and age <= _INSTANT_GRACE_DAYS:
-            notes.append(f"{label} taken from {end}; not reported at the {as_of} balance sheet")
-            return val, tags[-neg_pref], end
+            omitted = next(
+                (d for d in self._annual_balance_sheet_dates(facts) if end < d < as_of), None
+            )
+            if omitted is None:
+                notes.append(f"{label} taken from {end}; not reported at the {as_of} balance sheet")
+                return val, tags[-neg_pref], end
+            if val != 0.0:
+                notes.append(
+                    f"{label} last reported {end} ({val:,.0f}) and left out of the "
+                    f"{omitted} annual balance sheet; treated as 0 at the {as_of} "
+                    "balance sheet"
+                )
+            return None, None, None
         if val != 0.0:
             notes.append(
                 f"{label} last reported {end} ({val:,.0f}); treated as 0 at the "
@@ -994,12 +1209,18 @@ class EdgarClient:
                     f"premiums or policy benefits are {premiums:.0%} and net "
                     f"investment income {invest:.0%} of revenue"
                 )
+        policy = self._latest_asset_share(facts, _TAGS_POLICYHOLDER_LIABILITIES)
+        if policy >= _INSURER_MIN_POLICY_LIABILITY_SHARE:
+            return "insurer", f"policyholder liabilities are {policy:.0%} of total assets"
         share = asset_share(_TAGS_BDC_INVESTMENTS)
         if share is not None and share >= _BDC_MIN_INVESTMENT_SHARE:
             return "bdc", f"investments at fair value are {share:.0%} of total assets"
         share = asset_share(_TAGS_REIT_PROPERTY)
         if share is not None and share >= _REIT_MIN_PROPERTY_SHARE:
             return "reit", f"investment property is {share:.0%} of total assets"
+        share = asset_share(_TAGS_REIT_INVESTMENTS)
+        if share is not None and share >= _REIT_MIN_PROPERTY_SHARE:
+            return "reit", f"real-estate investments are {share:.0%} of total assets"
         share = asset_share(_TAGS_REIT_SCHEDULE_III)
         if share is not None and share >= _REIT_MIN_SCHEDULE_III_SHARE:
             return "reit", (f"real estate at gross carrying value (its Schedule III) is "
@@ -1084,7 +1305,7 @@ class EdgarClient:
                 _LESSOR_MIN_LEASE_INCOME_SHARE * revenue):
             return None  # a lessor or rental company
         inventory = self._latest_asset_share(facts, tuple((t,) for t in _TAGS_INVENTORY))
-        if inventory <= 0 and latest_flow(_TAG_INVENTORY_CHANGE) <= 0:
+        if inventory < _CAPTIVE_MIN_INVENTORY_SHARE and latest_flow(_TAG_INVENTORY_CHANGE) <= 0:
             return None  # no products to finance: a lender or lending platform
         originated = sum(latest_flow(t) for t in _TAGS_FINANCE_ORIGINATIONS) / revenue
         evidence: list[str] = []
@@ -1200,13 +1421,16 @@ class EdgarClient:
         year: int,
         revenue_by_fy: dict[int, float],
         interest_by_fy: dict[int, float],
+        asset_heavy: bool = False,
     ) -> Optional[str]:
         """Why pretax income + interest expense is not EBIT here, else None.
 
         A reason is given for a bank or BDC, and for any other filer but an
-        equity REIT or a lessor when its fiscal-`year` interest expense is at
-        least `_LENDER_MIN_INTEREST_SHARE` of revenue or comes with no revenue
-        (see `_EBIT_NOT_DERIVED_KINDS`). It completes a source note.
+        equity REIT, a lessor or an `asset_heavy` operator (net PP&E of at
+        least `_ASSET_HEAVY_MIN_PPE_SHARE` of total assets) when its
+        fiscal-`year` interest expense is at least `_LENDER_MIN_INTEREST_SHARE`
+        of revenue or comes with no revenue (see `_EBIT_NOT_DERIVED_KINDS`).
+        It completes a source note.
         """
         if fin_kind in _EBIT_NOT_DERIVED_KINDS:
             return (
@@ -1214,7 +1438,7 @@ class EdgarClient:
                 "so adding it back would count it twice"
             )
         interest = abs(interest_by_fy.get(year, 0.0))
-        if fin_kind in _SHARE_TEST_EXEMPT_KINDS or interest <= 0:
+        if fin_kind in _SHARE_TEST_EXEMPT_KINDS or asset_heavy or interest <= 0:
             return None
         revenue = revenue_by_fy.get(year) or 0.0
         if revenue <= 0:
@@ -1228,6 +1452,193 @@ class EdgarClient:
             "mortgage REIT, so it is likely a funding cost that adding it back "
             "would count twice"
         )
+
+    def _revenue_subtotal_years(self, facts: dict) -> dict[int, float]:
+        """``fy -> contract revenue`` for the years whose `Revenues` is not the
+        income-statement total, else {}.
+
+        A filer's undimensioned `Revenues` can be a figure from a note: General
+        Mills tagged its joint ventures' net sales (about 2.0B against its own
+        17-20B) until FY2024. A total is never far below its contract-revenue
+        part, so when `Revenues` is below `_REVENUE_SUBTOTAL_SHARE` of
+        `_TAG_CONTRACT_REVENUE` in EVERY fiscal year both report, the series
+        is decided per filer, as for capex (`_largest_flow_by_fy`), and
+        contract revenue replaces it in those years where it was filed no
+        earlier. A true total that dips below contract revenue only in some
+        years (derivative losses booked in revenue, as gas producers do) keeps
+        its figures.
+        """
+        total = self._annual_flow_filed_by_fy(facts, (_TAGS_REVENUE[0],))
+        contract = self._annual_flow_filed_by_fy(facts, (_TAG_CONTRACT_REVENUE,))
+        shared = [y for y in total.keys() & contract.keys() if total[y][0] or contract[y][0]]
+        if not shared or not all(
+            abs(total[y][0]) < _REVENUE_SUBTOTAL_SHARE * abs(contract[y][0]) for y in shared
+        ):
+            return {}
+        return {y: contract[y][0] for y in shared if contract[y][1] >= total[y][1]}
+
+    def _segment_profit_years(
+        self,
+        facts: dict,
+        oi_years: list[int],
+        revenue_by_fy: dict[int, float],
+        ebit_by_fy: dict[int, float],
+        pretax_by_fy: dict[int, float],
+        interest_by_fy: dict[int, float],
+    ) -> dict[int, float]:
+        """``fy -> revenue - CostsAndExpenses`` for the `oi_years` (those with
+        a tagged OperatingIncomeLoss) when that tag is a total of segment
+        profit, else {}.
+
+        Disney's income statement has no operating-income line; its
+        undimensioned OperatingIncomeLoss is total segment operating income,
+        before corporate costs and the amortization of acquired intangibles
+        (17.6B against 13.8B of revenue - CostsAndExpenses in FY2025). Decided
+        once per filer, on the latest of `oi_years` with revenue, costs and
+        pretax income: the tagged figure must exceed both revenue -
+        CostsAndExpenses and pretax income + interest expense by more than
+        `_SEGMENT_TOTAL_MIN_GAP` of revenue (a real operating income that
+        holds an equity-method or asset gain has it in pretax income too),
+        while revenue - CostsAndExpenses itself exceeds pretax income by that
+        much (so CostsAndExpenses is an operating-cost total, not one that
+        includes interest and other non-operating items). Every year of
+        `oi_years` with revenue and costs then takes revenue - costs.
+        """
+        costs_by_fy = self._annual_flow_by_fy(facts, _TAGS_COSTS_AND_EXPENSES)
+        checkable = [y for y in oi_years
+                     if y in revenue_by_fy and y in costs_by_fy and y in pretax_by_fy]
+        if not checkable:
+            return {}
+        y = checkable[-1]
+        tol = _SEGMENT_TOTAL_MIN_GAP * abs(revenue_by_fy[y])
+        by_costs = revenue_by_fy[y] - abs(costs_by_fy[y])
+        by_pretax = pretax_by_fy[y] + abs(interest_by_fy.get(y, 0.0))
+        if not (ebit_by_fy[y] - by_costs > tol and ebit_by_fy[y] - by_pretax > tol
+                and by_costs - pretax_by_fy[y] > tol):
+            return {}
+        return {y: revenue_by_fy[y] - abs(costs_by_fy[y])
+                for y in oi_years if y in revenue_by_fy and y in costs_by_fy}
+
+    def _common_dividends(
+        self, facts: dict
+    ) -> tuple[dict[int, float], list[int], list[int]]:
+        """``(fy -> common dividends paid, years from declared, years netted)``
+        (see `_TAGS_DIVIDENDS`).
+
+        A year read from the generic PaymentsOfDividends (no common-stock tag)
+        that also has preferred dividends tagged (`_TAGS_PREFERRED_DIVIDENDS`)
+        takes the common dividends declared (`_TAGS_COMMON_DIVIDENDS_DECLARED`)
+        if tagged, else PaymentsOfDividends less the preferred dividends, never
+        below 0 (Boeing's 2025 payments are its preferred dividends alone).
+        Skipped in a year whose cash flow tags the preferred dividends paid
+        separately (`_TAG_PREFERRED_DIVIDENDS_PAID`).
+        """
+        div = self._annual_flow_by_fy(facts, _TAGS_DIVIDENDS)
+        common_paid = self._annual_flow_by_fy(facts, _TAGS_DIVIDENDS[:1])
+        generic = self._annual_flow_by_fy(facts, _TAGS_DIVIDENDS[1:2])
+        preferred = self._annual_flow_by_fy(facts, _TAGS_PREFERRED_DIVIDENDS)
+        paid_apart = self._annual_flow_by_fy(facts, (_TAG_PREFERRED_DIVIDENDS_PAID,))
+        declared = self._annual_flow_by_fy(facts, _TAGS_COMMON_DIVIDENDS_DECLARED)
+        from_declared: list[int] = []
+        netted: list[int] = []
+        for year, val in generic.items():
+            if year in common_paid or not preferred.get(year) or year in paid_apart:
+                continue
+            if year in declared:
+                div[year] = declared[year]
+                from_declared.append(year)
+            else:
+                div[year] = max(abs(val) - abs(preferred[year]), 0.0)
+                netted.append(year)
+        return div, from_declared, netted
+
+    def _adjusted_share_counts(
+        self, facts: dict, shares_by_fy: dict[int, float]
+    ) -> tuple[dict[int, float], list[int], Optional[tuple[float, str, str]]]:
+        """``(fy -> count, years rescaled from millions, split)`` for the
+        annual share counts (see `_TAG_COVER_SHARES`).
+
+        `split` is ``(factor, period start, period end)`` of the restated
+        period that shows a split after the latest annual report, else None.
+        """
+        shares = dict(shares_by_fy)
+        try:
+            cover = facts.get("facts", {}).get("dei", {}).get(_TAG_COVER_SHARES, {})
+            cover = cover.get("units", {}).get(_UNIT_SHARES, [])
+        except AttributeError:
+            cover = []
+        by_end: dict[str, float] = {}
+        for e in cover if isinstance(cover, list) else []:
+            if (isinstance(e, dict) and is_num(e.get("val"))
+                    and _reported_period(e.get("end"), e.get("filed") or "")):
+                by_end[e["end"]] = max(by_end.get(e["end"], 0.0), float(e["val"]))
+        reference = by_end[max(by_end)] if by_end else 0.0
+        if reference <= 0:
+            large = sorted(v for v in shares.values() if v >= _SHARE_UNIT_MIN_COUNT)
+            reference = large[len(large) // 2] if large else 0.0
+        rescaled: list[int] = []
+        if reference > 0:
+            for year, val in shares.items():
+                if (0 < val < _SHARE_UNIT_MAX_SHARE * reference
+                        and 0.1 <= val * _SHARE_UNIT_MILLION / reference <= 10.0):
+                    shares[year] = val * _SHARE_UNIT_MILLION
+                    rescaled.append(year)
+
+        # A split after the latest annual report: a later filing restates a
+        # period it had reported by then (a 10-Q's prior-year comparative) by
+        # the split factor, and that period's fiscal year still has its
+        # annual count on the old basis (the restated count is about the
+        # factor times it). A split before that report is already in its
+        # restated annual counts (Netflix, ServiceNow), and an interim count
+        # that only differs from the year's (an IPO year) is not restated.
+        split: Optional[tuple[float, str, str]] = None
+        for tag in _TAGS_DILUTED_SHARES:
+            entries = [e for e in self._unit_entries(facts, tag, _UNIT_SHARES)
+                       if isinstance(e, dict)]
+            annual: dict[tuple[str, str], tuple[str, float]] = {}  # latest filed per year
+            for fact in map(self._annual_fact, entries):
+                if fact is not None and (
+                        (fact[0], fact[1]) not in annual or fact[2] >= annual[(fact[0], fact[1])][0]):
+                    annual[(fact[0], fact[1])] = (fact[2], fact[3])
+            if not annual:
+                continue
+            last_annual = max(filed for filed, _val in annual.values())
+            original: dict[tuple[str, str], tuple[str, float]] = {}  # first filed by then
+            restated: dict[tuple[str, str], tuple[str, float]] = {}  # last filed after
+            for e in entries:
+                start, end, val = e.get("start"), e.get("end"), e.get("val")
+                filed = e.get("filed") or ""
+                if (not start or not filed or not is_num(val) or float(val) <= 0
+                        or not _reported_period(end, filed)):
+                    continue
+                key = (start, end)
+                if filed <= last_annual:
+                    if key not in original or filed < original[key][0]:
+                        original[key] = (filed, float(val))
+                elif key not in restated or filed > restated[key][0]:
+                    restated[key] = (filed, float(val))
+            latest_filed = ""
+            for (start, end), (filed, val) in restated.items():
+                year_val = next((v for (s, en), (_f, v) in annual.items()
+                                 if s <= start and end <= en and v > 0), None)
+                if (start, end) not in original or year_val is None:
+                    continue
+                old_val = original[(start, end)][1]
+                factor = val / old_val
+                # The year's annual count must be on the old basis: closer, as
+                # a ratio, to the period's original count than to its restated
+                # one. A split during that year but after the period (Fastenal's
+                # 2-for-1 in May 2025, after its Q1 10-Q) is already in the
+                # annual counts, which then sit near the restated count.
+                if (_SPLIT_MIN_FACTOR <= max(factor, 1.0 / factor) <= _SPLIT_MAX_FACTOR
+                        and abs(old_val / year_val - 1.0) <= _SPLIT_MIN_FACTOR - 1.0
+                        and abs(math.log(old_val / year_val)) < abs(math.log(val / year_val))
+                        and filed > latest_filed):
+                    latest_filed, split = filed, (_plain_split_factor(factor), start, end)
+            break  # only the tag that carries the annual counts
+        if split is not None:
+            shares = {year: val * split[0] for year, val in shares.items()}
+        return shares, rescaled, split
 
     # ------------------------ public entry point -------------------------- #
     def _common_net_income(self, facts: dict, notes: list[str]) -> dict[int, float]:
@@ -1339,6 +1750,10 @@ class EdgarClient:
 
         # ---- pull each FLOW item as fy -> value -------------------------- #
         revenue_by_fy = self._annual_flow_by_fy(facts, _TAGS_REVENUE)
+        # `Revenues` that is a note's sub-total, not the total (see
+        # _revenue_subtotal_years): contract revenue in its place.
+        revenue_subtotal = self._revenue_subtotal_years(facts)
+        revenue_by_fy.update(revenue_subtotal)
         ebit_by_fy = self._annual_flow_by_fy(facts, _TAGS_EBIT)
         ni_by_fy = self._common_net_income(facts, info_notes)
         da_by_fy, da_replaced = self._largest_flow_by_fy(facts, _TAGS_DA)
@@ -1348,8 +1763,10 @@ class EdgarClient:
         interest_by_fy = self._annual_flow_by_fy(facts, _TAGS_INTEREST)
         tax_by_fy = self._annual_flow_by_fy(facts, _TAGS_TAX)
         pretax_by_fy = self._annual_flow_by_fy(facts, _TAGS_PRETAX)
-        div_by_fy = self._annual_flow_by_fy(facts, _TAGS_DIVIDENDS)
-        shares_by_fy = self._annual_flow_by_fy(facts, _TAGS_DILUTED_SHARES, _UNIT_SHARES)
+        div_by_fy, div_declared, div_netted = self._common_dividends(facts)
+        shares_by_fy, shares_rescaled, share_split = self._adjusted_share_counts(
+            facts, self._annual_flow_by_fy(facts, _TAGS_DILUTED_SHARES, _UNIT_SHARES)
+        )
         nwc_by_fy = self._annual_flow_by_fy(facts, _TAGS_NWC)
 
         # ---- fatal guard: need revenue OR net income --------------------- #
@@ -1411,6 +1828,45 @@ class EdgarClient:
             notes.append(
                 f"only {len(years)} annual period(s) available on EDGAR "
                 f"(target is {_MIN_YEARS}-{_MAX_YEARS})"
+            )
+        # Share counts in millions, and a split after the latest annual
+        # report (see _adjusted_share_counts).
+        rescaled_years = [y for y in years if y in shares_rescaled]
+        if rescaled_years:
+            info_notes.append(
+                f"diluted shares for {_fy_list(rescaled_years)} are tagged in millions on "
+                "EDGAR (far below the shares outstanding on the cover page); multiplied by "
+                "1,000,000"
+            )
+        if share_split is not None:
+            factor, start, end = share_split
+            info_notes.append(
+                f"diluted shares multiplied by {factor:.4g} for a stock split after the latest "
+                f"annual report: a later filing restates the {start} to {end} share count by "
+                "that factor"
+            )
+        # Dividends cleared of preferred dividends (see _common_dividends).
+        declared_years = [y for y in years if y in div_declared]
+        if declared_years:
+            info_notes.append(
+                f"dividends paid for {_fy_list(declared_years)} are the common dividends "
+                "declared: the filer's PaymentsOfDividends also includes its preferred "
+                "dividends"
+            )
+        netted_years = [y for y in years if y in div_netted]
+        if netted_years:
+            info_notes.append(
+                f"dividends paid for {_fy_list(netted_years)} are PaymentsOfDividends less "
+                "the preferred dividends tagged for those years (that line covers common "
+                "and preferred dividends)"
+            )
+        subtotal_years = [y for y in years if y in revenue_subtotal]
+        if subtotal_years:
+            notes.append(
+                f"revenue for {_fy_list(subtotal_years)} is contract revenue "
+                f"({_TAG_CONTRACT_REVENUE}): the filer's Revenues figure is below "
+                f"{_REVENUE_SUBTOTAL_SHARE:.0%} of it in every year both are tagged, so it "
+                "is not the income-statement total (likely a sub-total from a note)"
             )
 
         # ---- helper to align one flow series onto `years` ---------------- #
@@ -1523,10 +1979,16 @@ class EdgarClient:
         # missing years stay 0.0 with a note. A pretax-based figure above
         # revenue (a gain in pretax income, or interest income left out of
         # revenue) is not used either.
+        # Only here, not in the captive-finance test: utilities carry
+        # inventory, so their interest must still rule them out there.
+        asset_heavy = fin_kind is None and (
+            self._latest_asset_share(facts, _TAGS_NET_PPE) >= _ASSET_HEAVY_MIN_PPE_SHARE
+        )
         lender_reason = self._lender_reason(
-            fin_kind, years[-1], revenue_by_fy, interest_by_fy
+            fin_kind, years[-1], revenue_by_fy, interest_by_fy, asset_heavy
         )
         ebit_by_fy = dict(ebit_by_fy)
+        oi_years = [y for y in years if ebit_by_fy.get(y) is not None]
         costs_by_fy: Optional[dict[int, float]] = None
         from_pretax: list[int] = []
         from_costs: list[int] = []
@@ -1575,6 +2037,18 @@ class EdgarClient:
                 f"{_fy_list(not_derived)}; left at 0.0 rather than derived as "
                 f"pretax income + interest expense: {lender_reason}"
             )
+        segment_total = (self._segment_profit_years(
+            facts, oi_years, revenue_by_fy, ebit_by_fy, pretax_by_fy, interest_by_fy
+        ) if lender_reason is None else {})
+        if segment_total:
+            ebit_by_fy.update(segment_total)
+            notes.append(
+                f"EBIT for {_fy_list(list(segment_total))} derived as revenue - "
+                "CostsAndExpenses: the tagged OperatingIncomeLoss exceeds both that and "
+                "pretax income + interest expense, so it is likely a total of segment "
+                "profit (before corporate costs and the amortization of acquired "
+                "intangibles), not the income statement's operating income"
+            )
 
         # Capex where the second tag, larger in every year both report,
         # replaced the first tag's figure (see _TAGS_CAPEX). The years neither
@@ -1587,7 +2061,17 @@ class EdgarClient:
             "it is larger in every year both tags report, so it is read as the total and "
             "the smaller as a part of it; the two are not added",
         )
-        main_capex = {**self._annual_flow_by_fy(facts, (_TAG_OTHER_PPE,)), **capex_by_fy}
+        other_ppe = self._annual_flow_by_fy(facts, (_TAG_OTHER_PPE,))
+        main_capex = {**other_ppe, **capex_by_fy}
+        # A year that only the construction tag fills (no PP&E or productive-
+        # assets figure, and not a total that replaced them) takes the larger
+        # of it and the other-PP&E line: Gaming and Leisure Properties' other-
+        # PP&E line is its whole capex, construction only a part of it.
+        first_two = self._annual_flow_by_fy(facts, _TAGS_CAPEX[:2])
+        for y, val in other_ppe.items():
+            if (y in capex_by_fy and y not in first_two and y not in capex_replaced
+                    and abs(val) > abs(capex_by_fy[y])):
+                main_capex[y] = val
         other_productive = self._annual_flow_by_fy(facts, (_TAG_OTHER_PRODUCTIVE_ASSETS,))
         other_only = [y for y in years if y in other_productive and y not in main_capex]
         capex_by_fy = {**other_productive, **main_capex}
@@ -1655,9 +2139,11 @@ class EdgarClient:
 
         # ΔNWC (positive = increase = cash use) from the aggregate operating-
         # capital tag only; see _TAGS_NWC for why the component lines are not
-        # summed instead.
+        # summed instead. Years the tag skips are zero-filled with an info note
+        # (the models treat a zero-filled year as a gap).
         if nwc_by_fy:
-            change_in_nwc = _align(nwc_by_fy, label="change in NWC")
+            change_in_nwc = _align(nwc_by_fy, label="change in NWC", note_if_empty=True,
+                                   gap_notes=info_notes)
         else:
             change_in_nwc = [0.0 for _ in years]
             info_notes.append(
@@ -1738,12 +2224,17 @@ class EdgarClient:
         # HybridProvider copies into CompanyData.source_notes (data gaps first,
         # informational derivations last). `_financial_kind` ("bank",
         # "insurer", "bdc", "reit", "lessor", "captive_finance" or None) rides
-        # the same way, for models that rebuild EBIT or choose methods.
+        # the same way, for models that rebuild EBIT or choose methods, and so
+        # do `_annual_form` and `_latest_fy_end`, the latest fiscal year's
+        # annual-report form and ISO end date (see `_latest_annual_report`).
+        form, fy_end = self._latest_annual_report(facts, years[-1])
         try:
             setattr(financials, "_source_notes", notes + info_notes)
             setattr(financials, "_financial_kind", fin_kind)
             setattr(financials, "_income_attribution_adjusted",
                     self._income_attribution_adjusted(facts, ni_by_fy, years))
+            setattr(financials, "_annual_form", form)
+            setattr(financials, "_latest_fy_end", fy_end)
         except Exception:  # pragma: no cover - dataclasses allow attr set
             pass
 
@@ -1831,7 +2322,31 @@ class EdgarClient:
             total_equity=float(equity or 0.0),
             minority_interest=float(minority or 0.0),
             preferred_equity=float(preferred or 0.0),
+            operating_lease_liability=self._operating_lease_liability(facts, as_of),
         )
+
+    def _operating_lease_liability(self, facts: dict, as_of: str) -> Optional[float]:
+        """Operating-lease liabilities at the snapshot date `as_of`, or None.
+
+        ``OperatingLeaseLiability`` dated `as_of`, else
+        ``OperatingLeaseLiabilityNoncurrent`` dated `as_of` plus
+        ``OperatingLeaseLiabilityCurrent`` when that is tagged at `as_of` too.
+        Only facts at that exact date count, never an earlier total: MCD
+        last tagged the total for 2023 and has tagged only the two parts
+        since (14.0B + 0.7B at 2026-06-30). EDGAR's total debt
+        (the borrowings tags) leaves these leases out, while the peers' EVs
+        from the market data include them, so comps add this amount to the
+        target's EV and strip it in the EV-to-equity bridge. None when
+        nothing is tagged at `as_of` (the DCF and WACC do not read it).
+        """
+        total = self._instant_by_end(facts, _TAG_OPERATING_LEASE_TOTAL).get(as_of)
+        if is_num(total):
+            return float(total)
+        noncurrent = self._instant_by_end(facts, _TAG_OPERATING_LEASE_NONCURRENT).get(as_of)
+        if not is_num(noncurrent):
+            return None
+        current = self._instant_by_end(facts, _TAG_OPERATING_LEASE_CURRENT).get(as_of)
+        return float(noncurrent) + (float(current) if is_num(current) else 0.0)
 
     def _total_debt(
         self,
@@ -1849,16 +2364,77 @@ class EdgarClient:
         def at(tags: tuple[str, ...], label: str) -> Optional[float]:
             return self._instant_at(facts, tags, as_of, date_notes, label, bs_dates)
 
+        def read(tags: tuple[str, ...], label: str) -> tuple[Optional[float], Optional[str], list[str]]:
+            """``(value, end, notes)`` at `as_of`; the date notes are held back
+            until it is known whether the value is used."""
+            held: list[str] = []
+            val, _tag, end = self._instant_fact(facts, tags, as_of, held, label, bs_dates)
+            return val, end, held
+
+        def exact(tags: tuple[str, ...], end: Optional[str]) -> Optional[float]:
+            """The first of `tags` reported exactly at `end` (no grace), or None."""
+            for tag in tags:
+                val = self._instant_by_end(facts, tag).get(end) if end else None
+                if val is not None:
+                    return val
+            return None
+
         # Total debt = noncurrent LTD + current debt, where current debt is
         # DebtCurrent if tagged (it already includes the current maturities of
         # LTD and short-term borrowings, so never add those to it) or else the
         # sum of those components. Without a noncurrent tag: a long-term total
         # that includes its current maturities plus short-term borrowings, then
         # a short- plus long-term total, then the separate debt lines.
-        ltd_nc = at(_TAGS_LTD_NONCURRENT, "long-term debt (noncurrent)")
-        ltd_cur = at(_TAGS_LTD_CURRENT, "current portion of long-term debt")
-        st_borrow = at(_TAGS_ST_BORROWINGS, "short-term borrowings")
-        debt_cur = at(_TAGS_DEBT_CURRENT, "current debt")
+        ltd_nc, nc_end, nc_notes = read(_TAGS_LTD_NONCURRENT, "long-term debt (noncurrent)")
+        ltd_cur, cur_end, cur_notes = read(_TAGS_LTD_CURRENT, "current portion of long-term debt")
+        st_borrow, st_end, st_notes = read(_TAGS_ST_BORROWINGS, "short-term borrowings")
+        debt_cur, dc_end, dc_notes = read(_TAGS_DEBT_CURRENT, "current debt")
+        # A noncurrent line from an earlier balance sheet (the grace window)
+        # does not beat a long-term or combined total reported at `as_of`
+        # itself when no current portion is reported there either: the filer
+        # moved its debt to the total's tags (Chevron's 10-Qs tag only the
+        # total including current maturities and short-term borrowings). The
+        # stale components are dropped, and only short-term borrowings
+        # reported at `as_of` are added to the total.
+        ltd_total_now = exact(_TAGS_LTD_TOTAL, as_of) is not None
+        if (ltd_nc is not None and nc_end != as_of and cur_end != as_of and dc_end != as_of
+                and (ltd_total_now or exact(_TAGS_DEBT_COMBINED, as_of) is not None)):
+            # Name only the items dropped, grouped by their own dates.
+            dropped: dict[str, list[str]] = {str(nc_end): ["long-term debt (noncurrent)"]}
+            for val, end, label in ((ltd_cur, cur_end, "current portion of long-term debt"),
+                                    (debt_cur, dc_end, "current debt"),
+                                    (st_borrow, st_end, "short-term borrowings")):
+                if val is not None and end != as_of:
+                    dropped.setdefault(str(end), []).append(label)
+
+            def listed(items: list[str]) -> str:
+                return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+            used = ("a long-term debt total" if ltd_total_now
+                    else "a short- and long-term debt total")
+            if ltd_total_now and st_end == as_of:
+                used += ", used with the short-term borrowings reported there"
+            single = len(dropped) == 1 and len(dropped[str(nc_end)]) == 1
+            date_notes.append(
+                listed([f"{listed(labels)} last reported {end}"
+                        for end, labels in dropped.items()])
+                + f" {'is' if single else 'are'} not used: the {as_of} balance sheet "
+                f"reports {used}"
+            )
+            kept = [(ltd_cur, cur_notes), (debt_cur, dc_notes)]
+            if st_end != as_of:
+                kept.append((st_borrow, st_notes))
+                st_borrow = None
+            else:
+                date_notes.extend(st_notes)
+            # Keep only the notes on items treated as 0 (not reused).
+            for val, held in kept:
+                if val is None:
+                    date_notes.extend(held)
+            ltd_nc = ltd_cur = debt_cur = None
+        else:
+            for held in (nc_notes, cur_notes, st_notes, dc_notes):
+                date_notes.extend(held)
         if debt_cur is not None:
             current_debt: Optional[float] = debt_cur
         elif ltd_cur is not None or st_borrow is not None:
@@ -1877,14 +2453,34 @@ class EdgarClient:
                 short_only = max(debt_cur - ltd_cur, 0.0)
             else:
                 short_only = 0.0
-            ltd_total = at(_TAGS_LTD_TOTAL, "long-term debt")
-            combined = None if ltd_total is not None else at(
-                _TAGS_DEBT_COMBINED, "total debt")
+            # A total reported at `as_of` beats one from an earlier date.
+            ltd_total = exact(_TAGS_LTD_TOTAL, as_of)
+            combined = None if ltd_total is not None else exact(_TAGS_DEBT_COMBINED, as_of)
+            if ltd_total is None and combined is None:
+                ltd_total = at(_TAGS_LTD_TOTAL, "long-term debt")
+                combined = None if ltd_total is not None else at(
+                    _TAGS_DEBT_COMBINED, "total debt")
             lines = (
                 None if ltd_total is not None or combined is not None
                 else self._debt_lines(at, st_borrow)
             )
             if ltd_total is not None:
+                # Some filers (Tesla) tag their noncurrent line as LongTermDebt
+                # beside DebtCurrent, with no current-maturity breakdown. When
+                # the debt note's carrying amount at `as_of` matches the two
+                # added (and not LongTermDebt alone), all current debt is added.
+                carrying = exact((_TAG_DEBT_CARRYING,), as_of)
+                if debt_cur is not None and short_only < debt_cur and carrying:
+                    alt = ltd_total + debt_cur
+                    gap = abs(carrying - alt)
+                    if (gap <= _DEBT_CARRYING_MATCH * abs(carrying)
+                            and gap < abs(carrying - (ltd_total + short_only))):
+                        short_only = debt_cur
+                        date_notes.append(
+                            "LongTermDebt is the noncurrent line here: with DebtCurrent "
+                            f"({debt_cur:,.0f}) it matches the debt carrying amount "
+                            f"({carrying:,.0f}) at {as_of}, so all current debt is added"
+                        )
                 total_debt = ltd_total + short_only
             elif combined is not None:
                 total_debt = combined
@@ -1906,15 +2502,42 @@ class EdgarClient:
                     + (" (current debt alone is larger and is used)"
                        if total_debt > lines_total + extra else "")
                 )
-            elif current_debt is not None:
+            elif current_debt:
                 total_debt = current_debt
                 notes.append(
                     "no long-term debt found under the debt tags read from EDGAR; "
                     "total debt counts current debt only"
                 )
             else:
+                # No debt figure, or only zero current debt: no debt is
+                # found. The date notes on zeros taken from an earlier
+                # balance sheet (Shopify's repaid convertible notes, last
+                # tagged 0 in its 10-K) are withdrawn, as nothing was used.
+                for val, end, held in ((ltd_cur, cur_end, cur_notes),
+                                       (st_borrow, st_end, st_notes),
+                                       (debt_cur, dc_end, dc_notes)):
+                    if val == 0.0 and end != as_of:
+                        for note in held:
+                            if note in date_notes:
+                                date_notes.remove(note)
                 total_debt = 0.0
                 notes.append("total debt unavailable on EDGAR; set to 0.0")
+
+        # Every debt figure above came from an earlier balance sheet (the
+        # grace window), yet the debt note's carrying amount at `as_of` is far
+        # from it: the debt changed and the filer tagged the new figures
+        # elsewhere (CoreWeave's 10-Q). Flagged, not replaced, since the
+        # carrying amount may leave out commercial paper or leases.
+        carrying = exact((_TAG_DEBT_CARRYING,), as_of)
+        if (carrying and total_debt > 0
+                and abs(carrying - total_debt) > _STALE_DEBT_MAX_GAP * total_debt
+                and not any(exact((tag,), as_of) is not None for tag in _TAGS_ALL_DEBT)):
+            notes.append(
+                f"WARNING: total debt ({total_debt:,.0f}) comes from debt tags last reported "
+                f"before the {as_of} balance sheet, where the debt note's carrying amount "
+                f"({_TAG_DEBT_CARRYING}) is {carrying:,.0f}; the debt has changed since, so "
+                "net debt and the WACC debt weight may be out of date"
+            )
         return total_debt
 
     def _mean_debt_in_year(

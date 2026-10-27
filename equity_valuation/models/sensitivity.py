@@ -10,6 +10,10 @@ Two public entry points:
                        Grid 2 — EBIT margin x terminal growth
         Exit multiple: Grid 1 — WACC x exit EV/EBITDA
                        Grid 2 — EBIT margin x exit EV/EBITDA
+    A value-driver headline keeps the Gordon axes (terminal growth columns)
+    and every cell runs the value-driver method with the headline's RONIC
+    (each row's WACC when none is given, or when the headline replaced the
+    one given with WACC).
     Each cell is an independent DCF run on a *cloned* macro/assumptions pair
     (via ``dataclasses.replace``) so the base inputs are never mutated.
 
@@ -25,9 +29,11 @@ Design notes:
   * Row/column *values* are the ACTUAL resulting levels (e.g. the realized WACC
     read back off the returned ``DCFResult``), not the raw deltas, so the labels
     on the grid are economically meaningful. A cell the DCF could only price by
-    changing its inputs (terminal g clamped below WACC, or a non-positive WACC
-    replaced by the fallback rate), or an invalid one (an exit multiple <= 0),
-    is stored as NaN rather than shown under a label it does not represent.
+    changing its inputs (terminal g clamped below WACC, a non-positive WACC
+    replaced by the fallback rate, or an explicit value-driver RONIC not above
+    the column's growth replaced by WACC), or an invalid one (an exit multiple
+    <= 0), is stored as NaN rather than shown under a label it does not
+    represent.
   * Axis labels tell renderers how to format values: a label containing
     "EV/EBITDA" or "multiple" holds multiples (12.0 -> "12.0x"); "WACC",
     "Terminal growth" and "EBIT margin" hold decimal rates.
@@ -36,6 +42,7 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from .. import config
@@ -57,6 +64,7 @@ from ..utils import (
     median,
     net_debt_parts,
 )
+from .comps import operating_lease_claim
 from .dcf import margin_fade_target, resolve_terminal_method, run_dcf, start_ebit_margin
 
 
@@ -73,8 +81,10 @@ def _safe_implied_price(
 
     Never raises: on any failure both elements degrade to ``float('nan')`` so the
     caller can keep building a rectangular grid. The price is also NaN when the
-    DCF had to clamp the cell's terminal growth or replace a non-positive WACC,
-    since the cell would then not be priced at its row/column labels.
+    DCF had to clamp the cell's terminal growth, replace a non-positive WACC or,
+    for a value-driver cell, replace an explicit RONIC that is not above the
+    cell's growth with WACC, since the cell would then not be priced at its
+    row/column labels and the headline's RONIC.
     """
     try:
         result = run_dcf(company, macro, assumptions, current_price)
@@ -105,7 +115,32 @@ def _safe_implied_price(
     g_req, g_used = a.get("terminal_growth"), a.get("terminal_growth_used")
     if is_num(g_req) and is_num(g_used) and g_used != g_req:
         price = float("nan")  # g clamped to WACC - gap: not the column's growth
+    # An explicit value-driver RONIC the DCF replaced with WACC (it is not above
+    # the column's growth): the cell is not priced at the headline's RONIC. A
+    # non-numeric RONIC falls back to WACC in every cell, as in the headline.
+    ronic_req = getattr(assumptions, "terminal_ronic", None)
+    if (a.get("terminal_method") == "value_driver" and is_num(ronic_req)
+            and a.get("terminal_ronic_used") != float(ronic_req)):
+        price = float("nan")
     return price, realized_wacc
+
+
+def _headline_uses_ronic(
+    company: CompanyData,
+    macro: MacroAssumptions,
+    assumptions: DCFAssumptions,
+    current_price: float,
+) -> bool:
+    """True when the headline value-driver DCF prices its terminal value at
+    the explicit ``terminal_ronic`` (it replaces one that is not positive or
+    not above the terminal growth used with WACC). A headline that fails to
+    run counts as using it, so its cells keep the explicit RONIC."""
+    try:
+        result = run_dcf(company, macro, assumptions, current_price)
+    except Exception:  # defensive: e.g. no positive revenue base
+        return True
+    used = (getattr(result, "assumptions", None) or {}).get("terminal_ronic_used")
+    return used == float(assumptions.terminal_ronic)
 
 
 def _base_latest_ebit_margin(company: CompanyData) -> float:
@@ -147,6 +182,11 @@ def dcf_sensitivity(
     centre cell equals the headline implied price:
       * Gordon (or a fallback to it): columns are terminal growth levels, label
         ``"Terminal growth"``, and every cell runs the Gordon method.
+      * Value driver: the same terminal growth columns, and every cell runs
+        the value-driver method with the headline's ``terminal_ronic``, or
+        each row's WACC when it is None or the headline replaced it with WACC
+        (not positive, or not above the headline's growth); a column whose
+        growth is not below an explicit RONIC the headline used is NaN.
       * Exit multiple: columns are exit EV/EBITDA multiples (the headline
         multiple +/- ``config.SENSITIVITY_EXIT_MULTIPLE_DELTAS``, e.g. 10.0 to
         14.0 around 12.0; the steps shrink for a multiple no larger than the
@@ -174,7 +214,7 @@ def dcf_sensitivity(
     base_rf = float(base_rf)
 
     # Column axis, shared by both grids: exit multiples when the headline DCF
-    # uses one, else terminal-growth levels (Gordon).
+    # uses one, else terminal-growth levels (Gordon or value-driver cells).
     headline_method, _ = resolve_terminal_method(assumptions)
     if headline_method == "exit_multiple":
         base_multiple = float(assumptions.exit_ev_ebitda)
@@ -196,9 +236,22 @@ def dcf_sensitivity(
         col_levels = [base_growth + d for d in growth_deltas]
         col_label = "Terminal growth"
         col_title = "terminal growth"
+        # Keep a value-driver headline's method so the centre cell is the
+        # headline; anything else (Gordon or a fallback to it) runs Gordon.
+        cell_method = "value_driver" if headline_method == "value_driver" else "gordon"
+        # An explicit RONIC the headline replaced with WACC (not above its
+        # growth, or not positive): every cell runs at its row's WACC, as the
+        # headline does, instead of at a RONIC the headline did not use.
+        cell_ronic = getattr(assumptions, "terminal_ronic", None)
+        if (cell_method == "value_driver" and is_num(cell_ronic)
+                and not _headline_uses_ronic(company, macro, assumptions, current_price)):
+            cell_ronic = None
 
         def cell_assumptions(base: DCFAssumptions, col: float):
-            return replace(base, terminal_growth=col, terminal_method="gordon")
+            if cell_method == "value_driver":
+                return replace(base, terminal_growth=col, terminal_method=cell_method,
+                               terminal_ronic=cell_ronic)
+            return replace(base, terminal_growth=col, terminal_method=cell_method)
 
     # ----------------------------------------------------------------------- #
     # Grid 1 — WACC (rows) x terminal growth or exit multiple (cols)
@@ -370,9 +423,17 @@ def build_football_field(report) -> list[FootballFieldRow]:
                             dcf.implied_price, which is the base; the bar is
                             still widened to contain it if that cell is blank),
                             else +/-15% around dcf.implied_price.
-      * 'EV/EBITDA comps' / 'P/E comps': spread from comps stats applied to the
-                            target metric where available, else the comps implied
-                            price summary, else skipped.
+      * 'EV/EBITDA comps' / 'EV/Sales comps' / 'P/E comps' / 'P/B comps':
+                            one bar per multiple in the comps median, spread
+                            from comps stats applied to the target metric
+                            where available (a +/-10% band when the peers give
+                            no spread); a multiple whose implied price is not
+                            positive (an EV bridge where net debt exceeds the
+                            implied EV) is skipped, as the comps summary
+                            leaves it out. With no such row, or when the
+                            comps median lies outside every such bar, a 'Comps'
+                            bar from the comps implied price summary (a +/-10%
+                            band when it has a single price).
       * 'DDM' / 'FCFE'   : +/-10% bands around their implied prices.
     For a bank, insurer, REIT or lender, a captive-finance group or a
     debt-funded lessor (``utils.financial_institution``) the DCF and FCFE bars
@@ -453,7 +514,7 @@ def build_football_field(report) -> list[FootballFieldRow]:
             )
 
     # ----------------------------------------------------------------------- #
-    # Comps — EV/EBITDA and P/E rows
+    # Comps — EV/EBITDA, EV/Sales, P/E and P/B rows
     # ----------------------------------------------------------------------- #
     if comps is not None:
         rows.extend(_comps_rows(comps, company))
@@ -484,13 +545,17 @@ def build_football_field(report) -> list[FootballFieldRow]:
 
 
 def _ev_bridge_inputs(company):
-    """Pull the EV->equity bridge inputs (ebitda_latest, net_debt, minority,
-    preferred, shares) from ``company`` for re-pricing EV multiples.
+    """Pull the EV->equity bridge inputs (ebitda_latest, revenue_latest,
+    net_debt, minority, preferred, lease, shares) from ``company`` for
+    re-pricing EV multiples.
 
-    Returns a dict with those keys, or ``None`` if the essential inputs
-    (positive latest EBITDA and a usable share count) can't be resolved. Net
-    debt / minority / preferred default to 0.0 when the balance sheet is absent,
-    mirroring ``models.comps``.
+    Returns a dict with those keys, or ``None`` if there is no company or no
+    usable share count. ``ebitda_latest`` / ``revenue_latest`` are the latest
+    figures when positive, else None (that multiple cannot be re-priced). Net
+    debt / minority / preferred / operating-lease liabilities default to 0.0
+    when the balance sheet is absent, mirroring ``models.comps`` (the lease
+    term, ``comps.operating_lease_claim``, is 0.0 while the optional
+    ``operating_lease_liability`` field is None).
     """
     if company is None:
         return None
@@ -498,10 +563,10 @@ def _ev_bridge_inputs(company):
     bs = getattr(company, "balance_sheet", None)
     market = getattr(company, "market", None)
 
-    ebitda = getattr(fin, "ebitda", None) if fin is not None else None
-    ebitda_latest = ebitda[-1] if ebitda else None
-    if not is_num(ebitda_latest) or float(ebitda_latest) <= 0:
-        return None
+    def latest_positive(name):
+        series = getattr(fin, name, None) if fin is not None else None
+        v = series[-1] if series else None
+        return float(v) if is_num(v) and float(v) > 0 else None
 
     # Prefer market shares outstanding, else latest diluted weighted-average.
     shares = getattr(market, "shares_outstanding", None) if market is not None else None
@@ -520,42 +585,78 @@ def _ev_bridge_inputs(company):
         preferred = float(pe_eq) if is_num(pe_eq) else 0.0
 
     return {
-        "ebitda_latest": float(ebitda_latest),
+        "ebitda_latest": latest_positive("ebitda"),
+        "revenue_latest": latest_positive("revenue"),
         "net_debt": net_debt,
         "minority": minority,
         "preferred": preferred,
+        "lease": operating_lease_claim(bs),
         "shares": float(shares),
     }
 
 
-def _ev_price_at_multiple(mult: float, bridge: dict):
-    """Equity price implied by an EV/EBITDA ``mult`` via the EV->equity bridge.
+# The target metric each EV multiple is applied to (a key of the bridge dict).
+_EV_METRIC = {"ev_ebitda": "ebitda_latest", "ev_sales": "revenue_latest"}
 
-    price = (mult*ebitda - net_debt - minority - preferred) / shares.
-    Returns ``None`` if shares are unusable (guards divide-by-zero).
+
+def _ev_price_at_multiple(mult: float, bridge: dict, metric: str = "ebitda_latest"):
+    """Equity price implied by an EV multiple ``mult`` via the EV->equity bridge.
+
+    price = (mult*metric - net_debt - minority - preferred - lease) / shares,
+    with ``metric`` the bridge's ``ebitda_latest`` (EV/EBITDA) or
+    ``revenue_latest`` (EV/Sales), as ``models.comps`` prices the peer median.
+    Returns ``None`` if that metric or the share count is unusable (guards
+    divide-by-zero).
     """
     shares = bridge.get("shares")
-    if not is_num(shares) or float(shares) == 0:
+    base = bridge.get(metric)
+    if not is_num(shares) or float(shares) == 0 or not is_num(base) or float(base) <= 0:
         return None
-    ev_star = mult * bridge["ebitda_latest"]
-    equity_star = ev_star - bridge["net_debt"] - bridge["minority"] - bridge["preferred"]
+    ev_star = mult * float(base)
+    equity_star = (ev_star - bridge["net_debt"] - bridge["minority"] - bridge["preferred"]
+                   - bridge.get("lease", 0.0))
     return equity_star / float(shares)
 
 
 def _comps_rows(comps, company=None) -> list[FootballFieldRow]:
-    """Build the EV/EBITDA and P/E football-field rows from a CompsResult.
+    """Build the EV/EBITDA, EV/Sales, P/E and P/B football-field rows from a
+    CompsResult.
+
+    Every multiple that enters the comps median gets a bar. P/B matters most
+    for a bank, insurer, lender or captive-finance group (P/E and P/B only),
+    where the P/B price is half the comps value in the blend (JPM: P/E 253,
+    P/B 172, median 213, and only the P/E bar was drawn). EV/Sales can carry
+    the median too (GIS: EV/Sales 30.88 and P/B 16.80 gave a median of 23.84,
+    and only the P/B bar, 14.08-19.53, was drawn). When the comps median, the
+    value in the blend, still lies outside every per-multiple bar (an even
+    number of prices whose bars do not meet), the summary "Comps" bar is
+    drawn as well (step 3), so that value is always on the chart.
 
     Strategy per multiple:
+      0. Skip a multiple whose implied price is missing or not positive: the
+         comps summary (so the blend) leaves out an EV multiple whose bridge
+         gives non-positive equity, and a bar below zero would read as a
+         valuation range.
       1. Use the implied price from the peer median as the base.
       2. Spread the band by the dispersion of the peer multiple:
            * Equity multiples (P/E, P/B) scale the base price proportionally by
              p25/median and p75/median.
-           * EV multiples (EV/EBITDA) re-apply the EV->equity bridge at the p25
-             and p75 peer multiples, since proportional scaling of an equity
-             price is only valid for equity multiples. If the bridge inputs
-             aren't available, this falls back to the symmetric band below.
-      3. If the per-multiple stats aren't usable, fall back to the overall
-         ``implied_price_summary`` low/median/high.
+           * EV multiples (EV/EBITDA, EV/Sales) re-apply the EV->equity bridge
+             at the p25 and p75 peer multiples to the EBITDA or revenue comps
+             priced on (``CompsResult.target_metrics``: the latest fiscal
+             year's, or the trailing figures under the trailing basis; the
+             company's latest fiscal year when that field is empty), since
+             proportional scaling of an equity price is only valid for equity
+             multiples. If the bridge inputs aren't
+             available, this falls back to the symmetric band below.
+         With no stats, or peers that give no spread (p25 == p75, e.g.
+         peers on the same multiple), the bar is a symmetric +/-10% band
+         around the base, so it is not drawn as a zero-width sliver.
+      3. If no per-multiple row was built, or the summary median lies outside
+         every per-multiple bar, add a "Comps" bar from the overall
+         ``implied_price_summary`` low/median/high, widened to a +/-10% band
+         when it holds a single price (low == high), as for a multiple
+         without stats.
     """
     out: list[FootballFieldRow] = []
 
@@ -565,19 +666,28 @@ def _comps_rows(comps, company=None) -> list[FootballFieldRow]:
 
     # EV multiples need the EV->equity bridge to re-price at p25/p75; equity
     # multiples (P/E, P/B) use proportional scaling.
-    ev_keys = {"ev_ebitda", "ev_sales"}
     bridge = _ev_bridge_inputs(company)
+    # Re-price on the EBITDA and revenue comps applied (Yahoo's trailing ones
+    # under the opt-in trailing basis), so each EV bar holds its implied price.
+    applied = getattr(comps, "target_metrics", None)
+    if bridge is not None and isinstance(applied, dict):
+        for metric, key in (("ebitda_latest", "ebitda"), ("revenue_latest", "revenue")):
+            if key in applied:
+                value = applied[key]
+                bridge[metric] = float(value) if is_num(value) and float(value) > 0 else None
 
     mapping = [
         ("ev_ebitda", "EV/EBITDA comps"),
+        ("ev_sales", "EV/Sales comps"),
         ("pe", "P/E comps"),
+        ("pb", "P/B comps"),
     ]
 
     used_per_multiple = False
     for key, label in mapping:
         base_price = implied.get(key) if isinstance(implied, dict) else None
-        if not is_num(base_price):
-            continue
+        if not is_num(base_price) or float(base_price) <= 0:
+            continue  # left out of the comps summary and the blend (models.comps)
         base_price = float(base_price)
 
         mult_stats = stats.get(key) if isinstance(stats, dict) else None
@@ -586,13 +696,16 @@ def _comps_rows(comps, company=None) -> list[FootballFieldRow]:
             med = mult_stats.get("median")
             p25 = mult_stats.get("p25")
             p75 = mult_stats.get("p75")
-            if key in ev_keys and bridge is not None:
-                # Re-apply the EV->equity bridge at the p25/p75 peer multiples:
-                # price(mult) = (mult*ebitda - net_debt - minority - preferred)/shares.
-                if is_num(p25):
-                    low_price = _ev_price_at_multiple(float(p25), bridge)
-                if is_num(p75):
-                    high_price = _ev_price_at_multiple(float(p75), bridge)
+            if key in _EV_METRIC:
+                if bridge is not None:
+                    # Re-apply the EV->equity bridge at the p25/p75 peer
+                    # multiples: price(mult) = (mult*metric - net_debt -
+                    # minority - preferred - lease)/shares.
+                    metric = _EV_METRIC[key]
+                    if is_num(p25):
+                        low_price = _ev_price_at_multiple(float(p25), bridge, metric)
+                    if is_num(p75):
+                        high_price = _ev_price_at_multiple(float(p75), bridge, metric)
             elif is_num(med) and med != 0:
                 # Scale the implied price by the dispersion of the peer multiple.
                 if is_num(p25):
@@ -609,6 +722,9 @@ def _comps_rows(comps, company=None) -> list[FootballFieldRow]:
         low_price, high_price = float(low_price), float(high_price)
         if low_price > high_price:
             low_price, high_price = high_price, low_price
+        if math.isclose(low_price, high_price, rel_tol=1e-12, abs_tol=1e-12):
+            # The peers give no spread (one usable peer): the +/-10% band.
+            low_price, _, high_price = _band(base_price, 0.10)
         base = min(max(base_price, low_price), high_price)
         out.append(
             FootballFieldRow(
@@ -617,9 +733,15 @@ def _comps_rows(comps, company=None) -> list[FootballFieldRow]:
         )
         used_per_multiple = True
 
-    # Fallback: if neither per-multiple implied price was usable but the engine
-    # produced an overall summary, emit a single generic "Comps" bar.
-    if not used_per_multiple and isinstance(summary, dict):
+    # The summary "Comps" bar (low / median / high of the implied prices):
+    # the fallback when no per-multiple price was usable, and also drawn when
+    # the comps median, the value in the blend, lies outside every
+    # per-multiple bar (two prices whose bars do not meet: GIS, P/B 14.08-19.53
+    # and EV/Sales 27.00-34.77 around a median of 23.84).
+    summary_med = summary.get("median") if isinstance(summary, dict) else None
+    median_undrawn = is_num(summary_med) and not any(
+        r.low - 1e-9 <= float(summary_med) <= r.high + 1e-9 for r in out)
+    if (not used_per_multiple or median_undrawn) and isinstance(summary, dict):
         lo = summary.get("low")
         med = summary.get("median")
         hi = summary.get("high")
@@ -629,6 +751,9 @@ def _comps_rows(comps, company=None) -> list[FootballFieldRow]:
                 low_price, high_price = high_price, low_price
             base = float(med) if is_num(med) else (low_price + high_price) / 2.0
             base = min(max(base, low_price), high_price)
+            if low_price == high_price:
+                # One implied price: no spread to show, so the +/-10% band.
+                low_price, base, high_price = _band(base, 0.10)
             out.append(
                 FootballFieldRow(
                     method="Comps", low=low_price, base=base, high=high_price

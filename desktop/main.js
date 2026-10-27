@@ -3,7 +3,8 @@
 // On launch it starts the FastAPI backend (project venv Python) and the Next.js
 // production server on free local ports, injects keys from the project's .env
 // into the backend, waits until the frontend is serving, then loads it in a
-// native window. Both child processes are killed on quit.
+// native window. Both child processes are killed on quit, and a reaper process
+// stops them if the app dies without quitting (see startReaper in runtime.js).
 
 const { app, BrowserWindow, dialog, shell } = require("electron");
 const { spawn } = require("child_process");
@@ -13,10 +14,12 @@ const fs = require("fs");
 const {
   loadDotenv,
   waitForHttp,
+  withLogTail,
   uniquePath,
   watchChildExit,
   startupFailure,
   productionBuildIsCurrent,
+  startReaper,
 } = require("./runtime");
 
 // Source launches always resolve the adjacent checkout. Packaged local apps
@@ -57,6 +60,7 @@ const NODE_BIN = USE_ELECTRON_NODE ? process.execPath : CONFIGURED_NODE;
 let backendProc = null;
 let frontendProc = null;
 let buildProc = null;
+let reaper = null;
 let mainWindow = null;
 let appUrl = null;
 let quitting = false;
@@ -99,9 +103,18 @@ function pipeLogs(name, proc, onLog) {
   });
 }
 
-// `next start` requires a PRODUCTION build (.next/BUILD_ID). Running `next dev`
-// (e.g. via run_dev.sh) overwrites .next with a dev build that next start can't
-// serve, so we detect that and rebuild.
+// Registers a detached child's process group with the reaper so it is stopped
+// even if this process is killed outright, and forgets it once it has exited.
+function guardChild(proc) {
+  if (!reaper || !proc.pid) return;
+  reaper.guard(proc.pid);
+  proc.once("exit", () => reaper && reaper.release(proc.pid));
+}
+
+// `next start` requires a COMPLETE production build. Running `next dev` (e.g.
+// via run_dev.sh) overwrites .next with a dev build that next start can't
+// serve, and a failed or interrupted `next build` leaves BUILD_ID without the
+// files written at the end, so we detect both and rebuild.
 function hasProductionBuild() {
   return productionBuildIsCurrent(FRONTEND_DIR);
 }
@@ -111,6 +124,7 @@ function buildFrontend(onLog, logTail) {
     const env = { ...process.env, NODE_ENV: "production" };
     if (USE_ELECTRON_NODE) env.ELECTRON_RUN_AS_NODE = "1";
     buildProc = spawn(NODE_BIN, [NEXT_CLI, "build"], { cwd: FRONTEND_DIR, env, detached: process.platform !== "win32" });
+    guardChild(buildProc);
     pipeLogs("build", buildProc, onLog);
     buildProc.once("error", (error) => {
       buildProc = null;
@@ -147,6 +161,10 @@ async function startServers(onLog) {
   };
   const tail = () => logBuf.join("\n");
 
+  const reaperEnv = { ...process.env };
+  if (USE_ELECTRON_NODE) reaperEnv.ELECTRON_RUN_AS_NODE = "1";
+  reaper = startReaper(NODE_BIN, reaperEnv);
+
   // Backend first — its heavy imports overlap with any frontend build below.
   backendProc = spawn(
     VENV_PY,
@@ -163,6 +181,7 @@ async function startServers(onLog) {
     ],
     { cwd: PROJECT_ROOT, env: { ...process.env, ...dotenv, PYTHONUNBUFFERED: "1" }, detached: process.platform !== "win32" }
   );
+  guardChild(backendProc);
   pipeLogs("backend", backendProc, log);
   // Watch the backend from the moment it is spawned: a crash during a long
   // first-run build must not wait for the health-check timeout.
@@ -194,24 +213,21 @@ async function startServers(onLog) {
     env: fenv,
     detached: process.platform !== "win32",
   });
+  guardChild(frontendProc);
   pipeLogs("frontend", frontendProc, log);
 
   // Wait until BOTH servers are truly ready before revealing the dashboard, so
   // an early request can't hit a not-yet-listening backend and 500. Race the
   // health probes against child-process death so a crashed server surfaces
-  // its log tail immediately instead of a silent multi-minute spinner.
+  // its log tail immediately instead of a silent multi-minute spinner. A
+  // server that stays up but never turns healthy times out with the same tail.
   const failures = [
     backendDied,
     watchChildExit("The frontend server", frontendProc, tail),
   ];
-  await Promise.race([
-    waitForHttp(`http://127.0.0.1:${backendPort}/api/health`, 180000),
-    ...failures,
-  ]);
-  await Promise.race([
-    waitForHttp(`http://127.0.0.1:${frontendPort}/`, 180000),
-    ...failures,
-  ]);
+  const ready = (url) => withLogTail(waitForHttp(url, 180000), tail);
+  await Promise.race([ready(`http://127.0.0.1:${backendPort}/api/health`), ...failures]);
+  await Promise.race([ready(`http://127.0.0.1:${frontendPort}/`), ...failures]);
   return { frontendPort, backendPort };
 }
 
@@ -229,6 +245,10 @@ function killServers() {
   backendProc = null;
   frontendProc = null;
   buildProc = null;
+  // The servers were just signalled; stop the reaper so it never signals
+  // their process-group IDs again after they may have been reused.
+  if (reaper) reaper.stop();
+  reaper = null;
 }
 
 function createWindow() {

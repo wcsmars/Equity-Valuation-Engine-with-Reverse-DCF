@@ -11,10 +11,17 @@ Design notes:
     a section (and record nothing fatal) when its model is ``None`` or its inputs
     are unusable. The exporter must never crash on a partially-filled report.
   * Money is in absolute reporting-currency units (see schemas.py); we format with
-    thousands separators and a currency symbol pulled from
-    ``config.CURRENCY_SYMBOLS``. Large magnitudes are abbreviated (K/M/B/T) so the
-    tables stay readable.
+    thousands separators and the currency prefix every output shares
+    (``excel.currency_prefix``), the minus sign first (-$6.52). Large magnitudes
+    are abbreviated (K/M/B/T) so the tables stay readable.
   * Rates are decimals; we render them as percentages.
+  * The DCF section adds the terminal year's reinvestment check to the bridge
+    (for a value-driver terminal value, the g / RONIC it reinvests, with the
+    drivers' check marked as a comparison) and a reverse-DCF table (what the
+    market price implies for year-1 growth, the target EBIT margin and the
+    discount rate, other inputs held); the comps table's caption names the
+    target's metric basis and the number of peers behind each multiple. The
+    rules are the Excel exporter's.
 
 """
 
@@ -28,8 +35,13 @@ from .. import config
 from ..schemas import ValuationReport
 from ..utils import available_model_price, is_num, median
 # The rules every output shares (no-target text, method-upside colour, the
-# Blume note) live with the Excel exporter.
-from .excel import BLUME_NOTE, method_upside_toned, no_target_text
+# Blume note, how a model-detail value is formatted) live with the Excel
+# exporter.
+from .excel import (BLUME_NOTE, REVERSE_DCF_TITLE, TERMINAL_DIAGNOSTICS, _is_rate_key,
+                    _is_years_key, comps_basis_text, currency_prefix, ddm_method_label,
+                    method_upside_toned, no_target_text, peer_counts, reverse_dcf_message,
+                    reverse_dcf_rows, terminal_check_rows, terminal_method_label,
+                    value_driver_check_note)
 
 # plotly is the only hard third-party dependency of this module. Import it at the
 # top so an environment without plotly fails loudly rather than silently writing
@@ -41,17 +53,40 @@ import plotly.graph_objects as go
 #  Number / string formatting helpers
 # --------------------------------------------------------------------------- #
 def _currency_symbol(currency: Optional[str]) -> str:
-    """Currency glyph for a reporting currency, '' when unknown/None."""
-    if not currency:
-        return ""
-    return config.CURRENCY_SYMBOLS.get(currency, "")
+    """Currency prefix for a reporting currency (its symbol, else its ISO code
+    and a space), '' when unknown/None or not a three-letter code
+    (``excel.currency_prefix``). HTML-escaped: it goes into the page's markup."""
+    return _esc(currency_prefix(currency))
+
+
+def _report_currency(report: ValuationReport) -> Optional[str]:
+    """The reporting currency's ISO code, or None (also when the provider's
+    value is not a three-letter code, so it never reaches a chart title)."""
+    market = getattr(getattr(report, "company", None), "market", None)
+    code = getattr(market, "currency", None) if market is not None else None
+    return code if currency_prefix(code) else None
+
+
+def _axis_title(label: str, report: ValuationReport) -> str:
+    """A chart axis title with its currency code, e.g. 'FCFF (USD)'."""
+    code = _report_currency(report)
+    return f"{label} ({code})" if code else label
+
+
+def _fmt_money(value: Optional[float], symbol: str = "", decimals: int = 2) -> str:
+    """An amount with thousands separators, the minus sign before the currency
+    symbol (-$6.52, as the memo, deck and dashboard print it). A value that
+    rounds to zero shows without a sign."""
+    if not is_num(value):
+        return "n/a"
+    v = round(float(value), decimals)
+    sign = "-" if v < 0 else ""
+    return f"{sign}{symbol}{abs(v):,.{decimals}f}"
 
 
 def _fmt_price(value: Optional[float], symbol: str = "") -> str:
     """Per-share price: 2 decimals with thousands separators, e.g. '$1,234.50'."""
-    if not is_num(value):
-        return "n/a"
-    return f"{symbol}{value:,.2f}"
+    return _fmt_money(value, symbol, 2)
 
 
 def _fmt_big(value: Optional[float], symbol: str = "") -> str:
@@ -162,10 +197,12 @@ def _football_field_fig(report: ValuationReport, symbol: str,
             orientation="h",
             marker=dict(color="#5b8def", line=dict(color="#3a66c4", width=1)),
             name="Range",
-            customdata=list(zip(lows, highs)),
+            # Preformatted, so a tooltip puts the minus before the symbol too.
+            customdata=[[_fmt_price(lo, symbol), _fmt_price(hi, symbol)]
+                        for lo, hi in zip(lows, highs)],
             hovertemplate=(
-                "%{y}<br>Low: " + symbol + "%{customdata[0]:,.2f}"
-                "<br>High: " + symbol + "%{customdata[1]:,.2f}<extra></extra>"
+                "%{y}<br>Low: %{customdata[0]}"
+                "<br>High: %{customdata[1]}<extra></extra>"
             ),
             showlegend=False,
         )
@@ -182,7 +219,8 @@ def _football_field_fig(report: ValuationReport, symbol: str,
                 marker=dict(symbol="diamond", size=11, color="#16324f",
                             line=dict(color="white", width=1)),
                 name="Base case",
-                hovertemplate="%{y}<br>Base: " + symbol + "%{x:,.2f}<extra></extra>",
+                customdata=[_fmt_price(b, symbol) for b in base_vals],
+                hovertemplate="%{y}<br>Base: %{customdata}<extra></extra>",
             )
         )
 
@@ -199,7 +237,7 @@ def _football_field_fig(report: ValuationReport, symbol: str,
     fig.update_layout(
         barmode="stack",
         title="Valuation summary (football field)",
-        xaxis_title="Implied price per share (" + (symbol or "") + ")",
+        xaxis_title=_axis_title("Implied price per share", report),
         height=max(260, 70 * len(rows) + 120),
         margin=dict(l=10, r=20, t=60, b=40),
         plot_bgcolor="white",
@@ -228,13 +266,14 @@ def _fcff_fig(report: ValuationReport, symbol: str, embed: _PlotEmbedder) -> str
             x=xs,
             y=ys,
             marker=dict(color="#2e8b8b"),
-            hovertemplate="Year %{x}<br>FCFF: " + symbol + "%{y:,.0f}<extra></extra>",
+            customdata=[_fmt_money(v, symbol, 0) for v in ys],
+            hovertemplate="Year %{x}<br>FCFF: %{customdata}<extra></extra>",
         )
     )
     fig.update_layout(
         title="DCF — projected unlevered free cash flow (FCFF)",
         xaxis_title="Forecast year",
-        yaxis_title="FCFF (" + (symbol or "") + ")",
+        yaxis_title=_axis_title("FCFF", report),
         height=340,
         margin=dict(l=10, r=20, t=60, b=40),
         plot_bgcolor="white",
@@ -245,20 +284,40 @@ def _fcff_fig(report: ValuationReport, symbol: str, embed: _PlotEmbedder) -> str
     return embed.to_html(fig)
 
 
+# The multiples the comps chart can show, in the comps table's order (PEG gives
+# no implied price, so it is never charted).
+_CHART_MULTIPLES = (("ev_ebitda", "EV/EBITDA"), ("ev_sales", "EV/Sales"),
+                    ("pe", "P/E"), ("pb", "P/B"))
+
+
 def _comps_fig(report: ValuationReport, embed: _PlotEmbedder) -> str:
-    """Bar chart of each peer's EV/EBITDA against the target's EV/EBITDA."""
+    """Bar chart of the peers' multiple against the target's.
+
+    The multiple is the first (EV/EBITDA, EV/Sales, P/E, P/B) that gave the
+    target an implied price, so a bank or a captive-finance group, whose EV
+    multiples the comps model does not price, is charted on P/E or P/B. No
+    chart when no multiple gave a price or no peer has that multiple, so the
+    target is never charted alone.
+    """
     comps = report.comps
     if comps is None:
         return ""
-    peers = [p for p in (getattr(comps, "peers", []) or [])
-             if p is not None and is_num(getattr(p, "ev_ebitda", None))]
-    target = getattr(comps, "target", None)
-    target_mult = getattr(target, "ev_ebitda", None) if target is not None else None
-    if not peers and not is_num(target_mult):
+    implied = getattr(comps, "implied", None) or {}
+    pick = next(((k, lab) for k, lab in _CHART_MULTIPLES
+                 if is_num(implied.get(k)) and implied[k] > 0), None)
+    if pick is None:
         return ""
+    key, label = pick
+    peers = [p for p in (getattr(comps, "peers", []) or [])
+             if p is not None and is_num(getattr(p, key, None))]
+    if not peers:
+        return ""
+    target = getattr(comps, "target", None)
+    target_mult = getattr(target, key, None) if target is not None else None
+    decimals = 2 if key == "pb" else 1  # P/B sits near 1x
 
     labels = [_esc(getattr(p, "ticker", None) or getattr(p, "name", "?")) for p in peers]
-    values = [float(p.ev_ebitda) for p in peers]
+    values = [float(getattr(p, key)) for p in peers]
     colors = ["#5b8def"] * len(peers)
 
     # Append the target as a highlighted bar.
@@ -269,29 +328,29 @@ def _comps_fig(report: ValuationReport, embed: _PlotEmbedder) -> str:
 
     # Peer median reference line: the comps model's (outlier-trimmed) median,
     # which is what the stats table and the implied prices use.
-    med = ((getattr(comps, "stats", None) or {}).get("ev_ebitda") or {}).get("median")
+    med = ((getattr(comps, "stats", None) or {}).get(key) or {}).get("median")
     if not is_num(med):
-        med = median(values[:len(peers)]) if peers else None
+        med = median(values[:len(peers)])
 
     fig = go.Figure(
         go.Bar(
             x=labels,
             y=values,
             marker=dict(color=colors),
-            hovertemplate="%{x}<br>EV/EBITDA: %{y:.1f}x<extra></extra>",
+            hovertemplate="%{x}<br>" + label + ": %{y:." + str(decimals) + "f}x<extra></extra>",
         )
     )
     if is_num(med):
         fig.add_hline(
             y=float(med),
             line=dict(color="#16324f", width=1.5, dash="dot"),
-            annotation_text="Peer median " + _fmt_mult(med),
+            annotation_text=f"Peer median {float(med):,.{decimals}f}x",
             annotation_position="top left",
         )
     fig.update_layout(
-        title="Comps — EV/EBITDA: peers vs target",
+        title=f"Comps — {label}: peers vs target",
         xaxis_title="",
-        yaxis_title="EV / EBITDA (x)",
+        yaxis_title=f"{label.replace('/', ' / ')} (x)",
         height=360,
         margin=dict(l=10, r=20, t=60, b=60),
         plot_bgcolor="white",
@@ -354,10 +413,10 @@ def _sensitivity_figs(report: ValuationReport, symbol: str,
                 text=cell_text,
                 texttemplate="%{text}",
                 colorscale="RdYlGn",
-                colorbar=dict(title="Implied " + (symbol or "price")),
+                colorbar=dict(title=_axis_title("Implied price", report)),
                 hovertemplate=(
                     col_label + ": %{x}<br>" + row_label
-                    + ": %{y}<br>Implied: " + symbol + "%{z:,.2f}<extra></extra>"
+                    + ": %{y}<br>Implied: %{text}<extra></extra>"
                 ),
             )
         )
@@ -529,10 +588,22 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         v = getattr(bs, attr, None) if bs is not None else None
         return float(v) if is_num(v) else 0.0
 
+    # The terminal year's reinvestment check sits under the PV of the terminal
+    # value, indented: annotations of the terminal value, not bridge items. A
+    # value-driver TV leads with the reinvestment it uses (g / RONIC), and an
+    # aside marks the drivers' rows as a comparison.
+    adict = getattr(dcf, "assumptions", None) or {}
+    vd_note = value_driver_check_note(adict)
+    terminal_check = [
+        (label, _fmt_pct(value)
+         + (f"<br><span class='aside'>{_esc(vd_note)}</span>"
+            if vd_note and label == TERMINAL_DIAGNOSTICS[0][0] else ""))
+        for label, value in terminal_check_rows(adict)]
     bridge_items = [
         ("Sum PV of FCFF", _fmt_big(sum(v for v in pv if is_num(v)), symbol)),
         ("Terminal value (undiscounted)", _fmt_big(getattr(dcf, "terminal_value", None), symbol)),
         ("PV of terminal value", _fmt_big(getattr(dcf, "pv_terminal", None), symbol)),
+        *terminal_check,
         ("Enterprise value", _fmt_big(getattr(dcf, "enterprise_value", None), symbol)),
         ("Less: net debt", _fmt_big(getattr(dcf, "net_debt", None), symbol)),
         ("Less: minority interest", _fmt_big(_claim("minority_interest"), symbol)),
@@ -542,8 +613,10 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         ("Implied price", _fmt_price(available_model_price(dcf), symbol)),
         ("Current price", _fmt_price(getattr(dcf, "current_price", None), symbol)),
     ]
+    sub_rows = {label for label, _ in terminal_check}
     bridge_rows = "".join(
-        f"<tr><th class='rowhead'>{_esc(k)}</th><td>{v}</td></tr>"
+        f"<tr><th class='rowhead{' sub' if k in sub_rows else ''}'>{_esc(k)}</th>"
+        f"<td>{v}</td></tr>"
         for k, v in bridge_items
     )
     price = available_model_price(dcf)
@@ -563,6 +636,156 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         "<div class='table-wrap'>" + table + "</div>"
         "<div class='bridge'>" + bridge + "</div>"
     )
+
+
+def _reverse_dcf_html(report: ValuationReport) -> str:
+    """The reverse-DCF table of the DCF section: per driver (year-1 revenue
+    growth, target EBIT margin, discount rate) the model's value and the one
+    the market price implies with the other inputs held, n/a when that solve
+    did not converge, with the solver's notes beneath; or the single line of
+    ``excel.reverse_dcf_message`` (e.g. 'Not meaningful for a financial
+    institution: ...'). '' without a DCF."""
+    if report.dcf is None:
+        return ""
+    reverse = getattr(report, "reverse_dcf", None)
+    head = f"<h3 class='subhead'>{_esc(REVERSE_DCF_TITLE)}</h3>"
+    message = reverse_dcf_message(reverse)
+    if message is not None:
+        return head + f"<p class='rdcf-note'>{_esc(message)}</p>"
+    rows = reverse_dcf_rows(reverse)
+    body = "".join(
+        f"<tr><th class='rowhead'>{_esc(r['label'])}</th><td>{_fmt_pct(r['model'])}</td>"
+        f"<td>{_fmt_pct(r['implied'])}</td></tr>"
+        for r in rows)
+    notes = [f"{r['label']}: {r['note']}" for r in rows if r["note"]]
+    notes_block = ("<ul class='notes'>" + "".join(f"<li>{_esc(n)}</li>" for n in notes)
+                   + "</ul>") if notes else ""
+    return (head + "<p class='rdcf-note'>Each driver solved by the model on its own, the "
+            "other DCF inputs held.</p>"
+            "<table class='kv rdcf'><thead><tr><th></th><th>Model</th>"
+            "<th>Market-implied</th></tr></thead><tbody>" + body + "</tbody></table>"
+            + notes_block)
+
+
+def _not_in_blend(report: ValuationReport, name: str) -> str:
+    """A line saying a method is left out of the blended target, and why ('' when
+    it is in the blend); ``name`` is the summary's method name."""
+    excluded = (report.summary or {}).get("excluded_from_blend") or {}
+    if name not in excluded:
+        return ""
+    return (f"<p class='aside'>Not in the blended target: "
+            f"{_esc(excluded[name])}.</p>")
+
+
+def _upside_row(report: ValuationReport, name: str, price: Optional[float],
+                current: Optional[float]) -> str:
+    """The 'Upside' row of a value bridge, coloured as the methods table colours
+    that method (``method_upside_toned``)."""
+    up = price / current - 1.0 if is_num(price) and is_num(current) and current > 0 else None
+    cls = _upside_class(up) if method_upside_toned(report.summary, name) else "neutral"
+    return f"<tr><th class='rowhead'>Upside</th><td class='{cls}'>{_fmt_pct(up)}</td></tr>"
+
+
+def _kv_table(items: list, extra_rows: str = "") -> str:
+    """A label/value table from (label, value HTML) pairs, plus ready-made rows."""
+    rows = "".join(f"<tr><th class='rowhead'>{_esc(k)}</th><td>{v}</td></tr>" for k, v in items)
+    return "<table class='kv'><tbody>" + rows + extra_rows + "</tbody></table>"
+
+
+# The DDM's detail entries shown in the report, in order: (key, label).
+_DDM_DETAIL_ROWS = (
+    ("D0", "Latest dividend per share (D0)"),
+    ("growth", "Perpetual growth"),
+    ("high_growth", "High-growth rate"),
+    ("high_growth_years", "High-growth years"),
+    ("H_half", "Half of the high-growth years (H)"),
+    ("terminal_growth_used", "Terminal growth (used)"),
+    ("pv_stage1", "PV of stage-1 dividends"),
+    ("terminal_value", "Terminal value (per share)"),
+    ("pv_terminal", "PV of terminal value"),
+)
+
+
+def _detail_value(key: str, value: float, symbol: str) -> str:
+    """A DDM detail value, formatted by its key name as the workbook formats it
+    (years, a rate, or a per-share amount), never by its magnitude."""
+    if _is_years_key(key):
+        return _fmt_num(value, 0 if float(value).is_integer() else 1)
+    if _is_rate_key(key):
+        return _fmt_pct(value, 2)
+    return _fmt_price(value, symbol)
+
+
+def _ddm_fcfe_html(report: ValuationReport, symbol: str) -> str:
+    """The dividend discount model's inputs and the FCFE projection and bridge
+    (the workbook's DDM_FCFE sheet), '' when neither model ran."""
+    parts = []
+    current = report.current_price
+    ddm = report.ddm
+    if ddm is not None:
+        detail = getattr(ddm, "detail", None) or {}
+        price = available_model_price(ddm)
+        items = [("Method", _esc(ddm_method_label(getattr(ddm, "method", None)))),
+                 ("Cost of equity", _fmt_pct(getattr(ddm, "cost_of_equity", None), 2))]
+        items += [(label, _detail_value(key, detail[key], symbol))
+                  for key, label in _DDM_DETAIL_ROWS if is_num(detail.get(key))]
+        items.append(("Implied price", _fmt_price(price, symbol)))
+        table = _kv_table(items, _upside_row(report, "DDM", price, current))
+        dividends = [d for d in (detail.get("dividends") or []) if is_num(d)]
+        pvs = list(detail.get("stage1_pvs") or [])
+        years = ""
+        if dividends:
+            head = "".join(f"<th>Year {i}</th>" for i in range(1, len(dividends) + 1))
+            pv_cells = "".join(
+                f"<td>{_fmt_price(pvs[i] if i < len(pvs) else None, symbol)}</td>"
+                for i in range(len(dividends)))
+            years = (
+                "<div class='table-wrap'><table class='grid'><thead><tr>"
+                f"<th class='rowhead'>Stage 1</th>{head}</tr></thead><tbody>"
+                "<tr><th class='rowhead'>Dividend per share</th>"
+                + "".join(f"<td>{_fmt_price(d, symbol)}</td>" for d in dividends)
+                + "</tr><tr><th class='rowhead'>PV of dividend</th>" + pv_cells
+                + "</tr></tbody></table></div>")
+        notes = [n for n in (detail.get("notes") or []) if n]
+        notes_block = ("<ul class='notes'>" + "".join(f"<li>{_esc(n)}</li>" for n in notes)
+                       + "</ul>") if notes else ""
+        parts.append("<h3 class='subhead'>Dividend discount model (DDM)</h3>"
+                     + _not_in_blend(report, "DDM") + table + years + notes_block)
+
+    fcfe = report.fcfe
+    if fcfe is not None:
+        years = list(getattr(fcfe, "years", []) or [])
+        flows = list(getattr(fcfe, "fcfe", []) or [])
+        pvs = list(getattr(fcfe, "pv_fcfe", []) or [])
+        grid = ""
+        if years:
+            def cells(seq):
+                return "".join(
+                    f"<td>{_fmt_big(seq[i] if i < len(seq) else None, symbol)}</td>"
+                    for i in range(len(years)))
+            grid = (
+                "<div class='table-wrap'><table class='grid'><thead><tr>"
+                "<th class='rowhead'>Year</th>"
+                + "".join(f"<th>{_esc(y)}</th>" for y in years) + "</tr></thead><tbody>"
+                f"<tr><th class='rowhead'>FCFE</th>{cells(flows)}</tr>"
+                f"<tr><th class='rowhead'>PV of FCFE</th>{cells(pvs)}</tr>"
+                "</tbody></table></div>")
+        price = available_model_price(fcfe)
+        bridge = _kv_table([
+            ("Cost of equity", _fmt_pct(getattr(fcfe, "cost_of_equity", None), 2)),
+            ("Sum PV of FCFE", _fmt_big(sum(v for v in pvs if is_num(v)), symbol)),
+            ("Terminal value (undiscounted)",
+             _fmt_big(getattr(fcfe, "terminal_value", None), symbol)),
+            ("PV of terminal value", _fmt_big(getattr(fcfe, "pv_terminal", None), symbol)),
+            ("Equity value", _fmt_big(getattr(fcfe, "equity_value", None), symbol)),
+            ("Shares", _fmt_big(getattr(fcfe, "shares", None))),
+            ("Implied price", _fmt_price(price, symbol)),
+            ("Current price", _fmt_price(getattr(fcfe, "current_price", None), symbol)),
+        ], _upside_row(report, "FCFE", price, getattr(fcfe, "current_price", None)))
+        parts.append("<h3 class='subhead'>Free cash flow to equity (FCFE)</h3>"
+                     + _not_in_blend(report, "FCFE") + grid
+                     + "<div class='bridge'>" + bridge + "</div>")
+    return "".join(parts)
 
 
 def _comps_table(report: ValuationReport, symbol: str) -> str:
@@ -623,8 +846,14 @@ def _comps_table(report: ValuationReport, symbol: str) -> str:
             cells.append(f"<td>{fmt(sub.get(sk))}</td>")
         stat_rows.append(f"<tr class='stat-row'>{''.join(cells)}</tr>")
 
+    # The caption names the target's metric basis and the peer values behind
+    # each multiple's statistics, so a thin sample does not look authoritative.
+    counts = peer_counts(comps)
+    sizes = " · ".join(f"{mult_labels.get(k, k)} n={counts.get(k, 0)}" for k in mult_keys)
+    caption = (f"<caption>Target metrics: {_esc(comps_basis_text(report))}. "
+               f"Peers per multiple: {_esc(sizes)}</caption>")
     table = (
-        "<table class='grid'><thead><tr>" + head_html + "</tr></thead><tbody>"
+        "<table class='grid'>" + caption + "<thead><tr>" + head_html + "</tr></thead><tbody>"
         + "".join(body) + "".join(stat_rows) + "</tbody></table>"
     )
 
@@ -833,7 +1062,8 @@ def _footnotes_html(report: ValuationReport) -> str:
                 growth += f"<br><span class='aside'>{_esc(EXIT_MULTIPLE_GROWTH_NOTE)}</span>"
             items.append(("Terminal growth", growth))
         if adict.get("terminal_method"):
-            items.append(("Terminal method", _esc(adict.get("terminal_method"))))
+            # 'Value driver (RONIC x%)' names the return on new capital it used.
+            items.append(("Terminal method", _esc(terminal_method_label(adict))))
         # The multiple that sets an exit-multiple terminal value (and centres
         # the exit EV/EBITDA sensitivity axis).
         exit_mult = adict.get("exit_ev_ebitda")
@@ -919,8 +1149,10 @@ table.grid tr.stat-row td { background:#f3f7fb; font-style:italic; color:var(--m
 table.kv { width:auto; min-width:280px; }
 table.kv th.rowhead { text-align:left; padding:5px 14px 5px 0; color:var(--muted); font-weight:600; }
 table.kv td { text-align:right; padding:5px 0; font-weight:600; }
-table.kv.methods td { padding-left:18px; }
-table.kv.methods thead th { text-align:right; color:var(--muted); font-size:12px; font-weight:600; padding-left:18px; }
+table.kv.methods td, table.kv.rdcf td { padding-left:18px; }
+table.kv.methods thead th, table.kv.rdcf thead th { text-align:right; color:var(--muted); font-size:12px; font-weight:600; padding-left:18px; }
+table.kv th.rowhead.sub { padding-left:14px; font-weight:400; }
+table.grid caption { caption-side:top; text-align:left; color:var(--muted); font-size:12px; padding:0 0 6px; }
 .bridge { margin-top:14px; }
 .pos { color:var(--pos); }
 .neg { color:var(--neg); }
@@ -931,7 +1163,8 @@ ul.notes li.warn { color:var(--neg); }
 .empty { color:var(--muted); font-style:italic; }
 .aside { color:var(--muted); font-weight:400; font-size:12px; }
 table.kv td .aside { display:inline-block; max-width:360px; }
-.fig-note { margin:2px 0 16px; color:var(--muted); font-size:12px; font-style:italic; }
+.fig-note, .rdcf-note { margin:2px 0 16px; color:var(--muted); font-size:12px; font-style:italic; }
+.rdcf-note { margin-bottom:8px; }
 footer.gen { margin-top:30px; color:var(--muted); font-size:11px; text-align:center; }
 """
 
@@ -949,6 +1182,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 {football}
 {dcf_section}
 {comps_section}
+{ddm_section}
 {sens_section}
 {footnotes}
 <footer class="gen">Generated {generated} · equity-valuation</footer>
@@ -970,16 +1204,16 @@ def write_html(report: ValuationReport, path: str) -> str:
     """Write a single self-contained interactive .html report and return the path.
 
     The document embeds plotly.js once so it renders offline. Every model section
-    is optional: when ``report.dcf`` / ``report.comps`` / sensitivities are absent
-    or empty, the corresponding section is simply omitted. The function never
-    raises on missing fields — it degrades to ``n/a`` cells and skipped sections.
+    is optional: when ``report.dcf`` / ``report.comps`` / ``report.ddm`` and
+    ``report.fcfe`` / sensitivities are absent or empty, the corresponding
+    section is simply omitted. A method the engine leaves out of the blended
+    target says so at the top of its section. The function never raises on
+    missing fields — it degrades to ``n/a`` cells and skipped sections.
     """
     embed = _PlotEmbedder()  # per-render embed state (plotly.js once per document)
 
-    # Resolve the currency symbol from the company's market data.
-    market = getattr(getattr(report, "company", None), "market", None)
-    currency = getattr(market, "currency", None) if market is not None else None
-    symbol = _currency_symbol(currency)
+    # Resolve the currency prefix from the company's market data.
+    symbol = _currency_symbol(_report_currency(report))
 
     # --- Header ----------------------------------------------------------- #
     header = _header_html(report, symbol)
@@ -991,12 +1225,17 @@ def write_html(report: ValuationReport, path: str) -> str:
     # --- DCF -------------------------------------------------------------- #
     dcf_table = _dcf_table(report, symbol)
     dcf_chart = _fcff_fig(report, symbol, embed)
-    dcf_section = _section("Discounted cash flow (DCF)", dcf_table, dcf_chart)
+    dcf_section = (_section("Discounted cash flow (DCF)", _not_in_blend(report, "DCF"),
+                            dcf_table, _reverse_dcf_html(report), dcf_chart)
+                   if dcf_table or dcf_chart else "")
 
     # --- Comps ------------------------------------------------------------ #
     comps_table = _comps_table(report, symbol)
     comps_chart = _comps_fig(report, embed)
     comps_section = _section("Trading comparables", comps_table, comps_chart)
+
+    # --- DDM and FCFE (the workbook's DDM_FCFE sheet) ---------------------- #
+    ddm_section = _section("Dividend discount & FCFE", _ddm_fcfe_html(report, symbol))
 
     # --- Sensitivities ---------------------------------------------------- #
     sens_figs = _sensitivity_figs(report, symbol, embed)
@@ -1016,6 +1255,7 @@ def write_html(report: ValuationReport, path: str) -> str:
         football=football,
         dcf_section=dcf_section,
         comps_section=comps_section,
+        ddm_section=ddm_section,
         sens_section=sens_section,
         footnotes=footnotes,
         generated=_esc(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")),

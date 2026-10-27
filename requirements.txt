@@ -1,6 +1,9 @@
 # Core
-pandas>=1.5
-numpy>=1.23
+# 2.2.2 is the first pandas built against NumPy 2; older pandas fails to
+# import next to numpy>=2, which these floors would otherwise allow.
+pandas>=2.2.2
+# 1.23.2 is the first NumPy with Python 3.11 wheels.
+numpy>=1.23.2
 requests>=2.33
 # Keep the trust store beyond the revoked-certificate security fixes.
 certifi>=2026.10.19

@@ -76,7 +76,13 @@ def _spct(x: Optional[float]) -> str:
 
 
 def _money(x: Optional[float], sym: str = "") -> str:
-    return "n/a" if x is None else f"{sym}{x:,.2f}"
+    """'-$6.52': the minus sign before the currency symbol, as the memo and
+    deck (``exports._money``) and the dashboard write it; no sign on a value
+    that rounds to zero."""
+    if x is None:
+        return "n/a"
+    x = round(x, 2)
+    return f"{'-' if x < 0 else ''}{sym}{abs(x):,.2f}"
 
 
 def _isnum(x: Any) -> bool:
@@ -91,14 +97,30 @@ def _dec(x: Optional[float]) -> str:
     return f"{x:.4g}" if _isnum(x) else "n/a"
 
 
+def _finite(x: Any) -> bool:
+    return _isnum(x) and math.isfinite(x)
+
+
+def _axis(label: Any, x: Any) -> str:
+    """A sensitivity-grid axis value: a multiple on an exit EV/EBITDA axis,
+    else a rate (WACC, terminal growth, EBIT margin)."""
+    if not _finite(x):
+        return "n/a"
+    return _mult(x) if "EV/EBITDA" in str(label) else _pct(x)
+
+
 def _big(x: Optional[float], sym: str = "") -> str:
-    """Compact large-number formatter (e.g. 391.0B)."""
+    """Compact large-number formatter ('391.0B', '-$13.0B'): the minus sign
+    before the currency symbol, as ``_money`` writes it; no sign on a value
+    that rounds to zero."""
     if x is None:
         return "n/a"
+    sign = "-" if x < 0 else ""
     for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
         if abs(x) >= div:
-            return f"{sym}{x / div:,.1f}{unit}"
-    return f"{sym}{x:,.0f}"
+            return f"{sign}{sym}{abs(x) / div:,.1f}{unit}"
+    digits = f"{abs(x):,.0f}"
+    return f"{sign if digits != '0' else ''}{sym}{digits}"
 
 
 def _beta(beta: Any, raw: Any, source: Any = None) -> str:
@@ -116,8 +138,9 @@ def _beta(beta: Any, raw: Any, source: Any = None) -> str:
 def _blend(s: dict, sym: str, comps: Any = None) -> str:
     """The blended target and upside, or why there is none, in the words the
     reports use: no target (and whether peers would give one), a verdict the
-    engine withholds (a target, no upside, "N/A" at a positive price), or no
-    upside because there is no current price."""
+    engine withholds (a target, no upside, "N/A" at a positive price; the
+    summary's ``verdict_withheld`` reason when it gives one), or no upside
+    because there is no current price."""
     target = s.get("blended_target")
     if not _isnum(target):
         if needs_peers(s, comps):
@@ -127,14 +150,18 @@ def _blend(s: dict, sym: str, comps: Any = None) -> str:
     if not _isnum(upside):
         price = s.get("current_price")
         if s.get("recommendation") == "N/A" and _isnum(price) and price > 0:
-            return f"blended target {_money(target, sym)} (upside withheld: n/a)"
+            why = s.get("verdict_withheld")
+            why = why.strip() if isinstance(why, str) and why.strip() else "n/a"
+            return f"blended target {_money(target, sym)} (upside withheld: {why})"
         return f"blended target {_money(target, sym)} (upside n/a: no current price)"
     return f"blended target {_money(target, sym)} ({_spct(upside)} vs price)"
 
 
 def build_ai_context(report: dict) -> str:
-    """A compact (~1k token) snapshot of the loaded valuation, fed to Claude so
-    its analysis and assumption suggestions reference the actual current model."""
+    """A compact (about 1k tokens) snapshot of the loaded valuation, fed to
+    Claude so its analysis and assumption suggestions reference the actual
+    current model, including the DCF sensitivity grids and the football field,
+    so sensitivity claims quote the model's own numbers."""
     s = report.get("summary", {}) or {}
     company = report.get("company", {}) or {}
     market = company.get("market", {}) or {}
@@ -161,6 +188,12 @@ def build_ai_context(report: dict) -> str:
     lines.append(f"VERDICT: {s.get('recommendation','?')} | {_blend(s, sym, comps)}")
     methods = s.get("methods") or {}
     excluded = s.get("excluded_from_blend") or {}
+    # A DCF left out of the blend (a bank's, a captive-finance group's or a
+    # lessor's) is marked on every line built from it (the DCF, its reverse
+    # DCF and its sensitivity grids), as on the METHOD VALUES line, so its
+    # view is not quoted as the model's.
+    ref_only = (f" (reference only, not in blend: {excluded['DCF']})"
+                if "DCF" in excluded else "")
     if methods:
         # Methods left out of the blend (e.g. a bank's or a lessor's DCF) are
         # marked, so they are not quoted as the model's valuation.
@@ -226,11 +259,6 @@ def build_ai_context(report: dict) -> str:
         if g_used is not None and g_req is not None and abs(g_used - g_req) > 1e-12:
             growth += f" (input {_pct(g_req)}, clamped below WACC)"
         wdetail = wacc.get("detail") or {}
-        # A DCF left out of the blend (a bank's, a captive-finance group's or a
-        # lessor's) is marked as on the METHOD VALUES line, so its upside is
-        # not quoted as the model's view.
-        ref_only = (f" (reference only, not in blend: {excluded['DCF']})"
-                    if "DCF" in excluded else "")
         lines.append(
             f"DCF: WACC {_pct(wacc.get('wacc'))} (ke {_pct(wacc.get('cost_of_equity'))}, "
             f"beta {_beta(wacc.get('beta'), wdetail.get('beta_raw'), wdetail.get('beta_source'))}), "
@@ -244,11 +272,16 @@ def build_ai_context(report: dict) -> str:
             lines.append(
                 "DCF revenue-growth path: " + ", ".join(_pct(g) for g in rg)
             )
+        # The exit multiple is quoted only when it set the terminal value (the
+        # method the DCF applied, as the memo does); a multiple left over in
+        # the request under another method played no part.
+        exit_multiple = (_mult(da.get("exit_ev_ebitda"))
+                         if da.get("terminal_method") == "exit_multiple" else "n/a (not used)")
         lines.append(
             f"DCF operating drivers: EBIT margin {_pct(da.get('start_ebit_margin'))} "
             f"fading to target {_pct(da.get('target_ebit_margin'))}, "
             f"tax rate used {_pct(da.get('tax_rate'))} ({da.get('tax_source') or 'n/a'}), "
-            f"exit EV/EBITDA {_mult(da.get('exit_ev_ebitda'))}"
+            f"exit EV/EBITDA {exit_multiple}"
         )
     # macro.tax_rate is None when the engine derives the rate; report the
     # rate the DCF actually applied instead of "n/a".
@@ -277,11 +310,60 @@ def build_ai_context(report: dict) -> str:
         + ", ".join(f"{k}={_dec(v)}" for k, v in current.items())
     )
     rdcf = report.get("reverse_dcf") or {}
+    if not isinstance(rdcf, dict):
+        rdcf = {}
     if rdcf.get("converged") and rdcf.get("implied_growth_y1") is not None:
         lines.append(
             "REVERSE DCF: the market price implies year-1 revenue growth of "
-            f"{_pct(rdcf.get('implied_growth_y1'))} (other assumptions held)"
+            f"{_pct(rdcf.get('implied_growth_y1'))} (other assumptions held){ref_only}"
         )
+    def rate(x: Any) -> str:
+        return _pct(x) if _finite(x) else "n/a"
+
+    # The target-margin and discount-rate legs, each solved on its own; only
+    # a converged leg is quoted (a leg's note explains the others in the UI).
+    legs = []
+    margin, wacc_leg = rdcf.get("margin"), rdcf.get("wacc")
+    if (isinstance(margin, dict) and margin.get("converged")
+            and _finite(margin.get("implied_target_ebit_margin"))):
+        legs.append(f"a target EBIT margin of {rate(margin['implied_target_ebit_margin'])} "
+                    f"(model {rate(margin.get('current_target_ebit_margin'))})")
+    if (isinstance(wacc_leg, dict) and wacc_leg.get("converged")
+            and _finite(wacc_leg.get("implied_wacc"))):
+        legs.append(f"a discount rate of {rate(wacc_leg['implied_wacc'])} "
+                    f"(model WACC {rate(wacc_leg.get('current_wacc'))})")
+    if legs:
+        lines.append(
+            "REVERSE DCF: the market price implies " + " and ".join(legs)
+            + f" (each alone, other assumptions held){ref_only}"
+        )
+
+    def price(x: Any) -> str:
+        return _money(x, sym) if _finite(x) else "n/a"
+
+    # DCF sensitivity grids, cell by cell, so the note can quote how the
+    # implied price moves with one driver at a time instead of estimating it.
+    for grid in report.get("sensitivities") or []:
+        if not isinstance(grid, dict):
+            continue
+        cells = [row if isinstance(row, list) else [] for row in grid.get("grid") or []]
+        if not any(_finite(v) for row in cells for v in row):
+            continue
+        rl = grid.get("row_label") or "row"
+        cl = grid.get("col_label") or "column"
+        cols = " / ".join(_axis(cl, c) for c in grid.get("col_values") or [])
+        lines.append(f"SENSITIVITY {grid.get('title') or 'DCF implied price'} "
+                     f"(per share; columns {cl} {cols}){ref_only}:")
+        for rv, row in zip(grid.get("row_values") or [], cells):
+            lines.append(f"  {rl} {_axis(rl, rv)}: " + " / ".join(price(v) for v in row))
+
+    # Football field: each method's low / base / high per share, under the
+    # engine's labels (a bar left out of the blend reads "DCF (not in blend)").
+    bars = [r for r in report.get("football_field") or [] if isinstance(r, dict)]
+    if bars:
+        lines.append("FOOTBALL FIELD (low / base / high per share): " + "; ".join(
+            f"{r.get('method')} {price(r.get('low'))} / {price(r.get('base'))} / "
+            f"{price(r.get('high'))}" for r in bars))
 
     # Comps snapshot
     if comps:
@@ -293,13 +375,13 @@ def build_ai_context(report: dict) -> str:
 
         lines.append(
             "TARGET MULTIPLES: "
-            f"P/E {target.get('pe')}, EV/EBITDA {target.get('ev_ebitda')}, "
-            f"EV/Sales {target.get('ev_sales')}, P/B {target.get('pb')}"
+            f"P/E {_mult(target.get('pe'))}, EV/EBITDA {_mult(target.get('ev_ebitda'))}, "
+            f"EV/Sales {_mult(target.get('ev_sales'))}, P/B {_mult(target.get('pb'))}"
         )
         lines.append(
             "PEER MEDIANS: "
-            f"P/E {med('pe')}, EV/EBITDA {med('ev_ebitda')}, "
-            f"EV/Sales {med('ev_sales')}, P/B {med('pb')} "
+            f"P/E {_mult(med('pe'))}, EV/EBITDA {_mult(med('ev_ebitda'))}, "
+            f"EV/Sales {_mult(med('ev_sales'))}, P/B {_mult(med('pb'))} "
             f"({len(comps.get('peers') or [])} peers)"
         )
 

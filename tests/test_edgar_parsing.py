@@ -5,21 +5,31 @@ real filings: restated comparatives win, quarterly and non-annual forms are
 ignored, 52/53-week years are accepted, and a company that switched revenue
 tags still gets one complete series with the preferred tag winning on overlap.
 Further fixtures cover the full `get_annual_financials` path: EBIT fallbacks
-and the filers they must skip (banks, BDCs, lender-scale interest), the
-financial-filer flags (banks, insurers, BDCs, REITs, including those known
-only by their Schedule III real estate, debt-funded lessors, captive finance
-arms and the rental companies, lenders and small finance lines that are
-neither), D&A and capex as the largest of their tags unless that figure
-predates a restatement (for capex, only a tag larger in every year, not a
-line that adds acquisitions or a separate line), lease-fleet capex (not added
-again to a total that holds it), other-PP&E capex and the
-other-productive-assets line (gap-fills only, the latter named in a note),
-pretax income from its domestic and foreign parts,
-statements reported in another currency, signed tax,
-working capital, stale balance-sheet facts, the cash and debt tag families,
-the interest-versus-debt warning, preferred stock, stale revenue axes,
-amendments, the hand-off of parsing notes to HybridProvider, and the SEC
-filings list shown in the app.
+and the filers they must skip (banks, BDCs, lender-scale interest, but not
+asset-heavy utilities), an operating-income tag that is a segment-profit
+total, the financial-filer flags (banks, insurers, including annuity writers
+known by their policyholder liabilities, BDCs, REITs, including those known
+only by their Schedule III real estate or real-estate investments,
+debt-funded lessors, captive finance arms and the rental companies, lenders,
+small finance lines and hardware slivers that are neither), the utility and
+bank revenue totals and a `Revenues` tag that is a note's sub-total, D&A and
+capex as the largest of their tags unless that figure predates a restatement
+(for capex, only a tag larger in every year, not a line that adds
+acquisitions or a separate line; utility construction expenditures),
+lease-fleet capex (not added again to a total that holds it), other-PP&E
+capex and the other-productive-assets line (gap-fills only, the latter named
+in a note), pretax income from its domestic and foreign parts, statements
+reported in another currency, signed tax, working capital, common dividends
+net of preferred, share counts tagged in millions or predating a split,
+stale balance-sheet facts (also a 10-Q item a later 10-K left out), the cash,
+short-term investment and debt tag families (convertible notes, a fresh total
+beating stale components, LongTermDebt as the noncurrent line, the stale-debt
+warning), the interest-versus-debt warning, preferred stock, stale revenue
+axes, amendments, the latest annual report's form and fiscal-year end
+carried on the financials, years the working-capital tag skips, the
+hand-off of parsing notes to HybridProvider, the EDGAR
+HTTP client (User-Agent, retries, backoff), and the SEC filings list and
+document fetch shown in the app.
 No network access is needed. Run with:  python -m unittest tests.test_edgar_parsing
 """
 
@@ -28,10 +38,12 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import requests
+
 from backend import filings
 
 from equity_valuation.data.base import DataError
-from equity_valuation.data.edgar import _TAGS_REVENUE, EdgarClient
+from equity_valuation.data.edgar import _TAGS_REVENUE, EdgarClient, _plain_split_factor
 from equity_valuation.data.provider import HybridProvider, _missing_debt_warning
 from equity_valuation.schemas import MarketData
 from equity_valuation.utils import financial_institution_detail
@@ -198,6 +210,44 @@ class AmendmentAndPrecedenceTests(unittest.TestCase):
         self.assertEqual(_client(facts)._annual_flow_by_fy(facts, ("Revenues",)),
                          {2022: 7.0, 2023: 9.0})
 
+    def test_latest_annual_form_rides_on_the_financials(self) -> None:
+        # HybridProvider reads `_annual_form` to warn when a 20-F filer's
+        # EDGAR share count (ordinary shares, not ADSs) stands in for Yahoo's.
+        def with_form(usd: dict, form: str, years=None) -> dict:
+            return {tag: [dict(e, form=form) if years is None or int(e["end"][:4]) in years
+                          else e for e in entries] for tag, entries in usd.items()}
+
+        cases = (
+            ("10-K", _base_usd()),
+            ("20-F", with_form(_base_usd(), "20-F")),
+            ("40-F", with_form(_base_usd(), "40-F")),
+            # A former 20-F filer whose latest years are on 10-Ks.
+            ("10-K", with_form(_base_usd(), "20-F", years=range(2019, 2023))),
+        )
+        for expected, usd in cases:
+            with self.subTest(expected=expected):
+                fin, _bs, _notes = _parse(usd)
+                self.assertEqual(fin._annual_form, expected)
+        # An amendment of the latest year wins, as its figures do; one of an
+        # earlier year, filed later, does not change the latest year's form.
+        usd = with_form(_base_usd(), "20-F")
+        usd["Revenues"] = usd["Revenues"] + [_fy(2024, 1450.0, "2025-09-01", form="20-F/A")]
+        self.assertEqual(_parse(usd)[0]._annual_form, "20-F/A")
+        usd = _base_usd()
+        usd["Revenues"] = usd["Revenues"] + [_fy(2022, 1250.0, "2025-09-01", form="20-F/A")]
+        self.assertEqual(_parse(usd)[0]._annual_form, "10-K")
+
+    def test_latest_fiscal_year_end_rides_on_the_financials(self) -> None:
+        # HybridProvider takes the latest fiscal year's exact end from it.
+        self.assertEqual(_parse(_base_usd())[0]._latest_fy_end, "2024-12-31")
+        # A 52/53-week FY2024 ending on 2025-01-03 keeps its own end date.
+        usd = _base_usd()
+        for tag in ("Revenues", "NetIncomeLoss"):
+            usd[tag] = [e for e in usd[tag] if not e["end"].startswith("2024")] + [
+                _entry("2023-12-30", "2025-01-03", 2000.0, "2025-02-20")]
+        fin = _parse(usd)[0]
+        self.assertEqual((fin.fiscal_years[-1], fin._latest_fy_end), (2024, "2025-01-03"))
+
     def test_total_revenues_beats_the_asc606_subset(self) -> None:
         # A lessor/finance-arm filer: total Revenues includes lease income, the
         # ASC 606 contract-revenue tag does not.
@@ -347,13 +397,25 @@ class AnnualFinancialsTests(unittest.TestCase):
         usd = _base_usd()
         usd["IncreaseDecreaseInOperatingCapital"] = [_fy(y, 7.0) for y in _YEARS]
         usd["IncreaseDecreaseInAccountsReceivable"] = [_fy(y, 10.0) for y in _YEARS]
-        fin, _bs, _notes = _parse(usd)
+        fin, _bs, notes = _parse(usd)
         self.assertEqual(fin.change_in_nwc, [7.0] * 6)
+        self.assertFalse(any("NWC" in n or "working capital" in n for n in notes), notes)
+
+    def test_years_the_aggregate_nwc_tag_skips_are_noted(self) -> None:
+        # The models treat a zero-filled dNWC year as a gap; the note says
+        # which years are zero-filled (after the data gaps, as information).
+        usd = _base_usd()
+        usd["IncreaseDecreaseInOperatingCapital"] = [_fy(y, 7.0) for y in _YEARS
+                                                     if y not in (2020, 2021)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.change_in_nwc, [7.0, 0.0, 0.0, 7.0, 7.0, 7.0])
+        self.assertEqual(notes[-1],
+                         "change in NWC not reported on EDGAR for FY2020-2021; filled with 0.0")
 
     def test_revenue_moved_to_an_unread_tag_is_rejected_as_stale(self) -> None:
         usd = {
             "SalesRevenueNet": [_fy(y, 1000.0) for y in range(2010, 2018)],
-            "RevenuesNetOfInterestExpense": [_fy(y, 2000.0) for y in range(2018, 2025)],
+            "SalesRevenueGoodsNet": [_fy(y, 2000.0) for y in range(2018, 2025)],
             "NetIncomeLoss": [_fy(y, 100.0) for y in range(2010, 2025)],
         }
         with self.assertRaisesRegex(DataError, "FY2017 but net income to FY2024"):
@@ -365,6 +427,93 @@ class AnnualFinancialsTests(unittest.TestCase):
         fin, _bs, notes = _parse(usd)
         self.assertEqual(fin.fiscal_years[-1], 2023)
         self.assertTrue(any("revenue on EDGAR ends FY2023" in n for n in notes), notes)
+
+    def test_utility_and_bank_revenue_totals_are_read(self) -> None:
+        # Xcel / DTE stopped tagging Revenues for the utility total, Wells
+        # Fargo / Morgan Stanley for net revenue; both rank above the ASC 606
+        # contract-revenue subset, and Revenues still wins where tagged.
+        for tag in ("RegulatedAndUnregulatedOperatingRevenue", "RevenuesNetOfInterestExpense"):
+            with self.subTest(tag=tag):
+                usd = _base_usd()
+                usd["Revenues"] = usd["Revenues"][:2]
+                usd[tag] = [_fy(y, 5000.0) for y in _YEARS]
+                usd[PREFERRED] = [_fy(y, 1.0) for y in _YEARS]
+                fin, _bs, _notes = _parse(usd)
+                self.assertEqual(fin.fiscal_years[-1], 2024)
+                self.assertEqual(fin.revenue, [1000.0, 1100.0] + [5000.0] * 4)
+
+    def test_broker_with_only_net_revenue_has_revenue(self) -> None:
+        # Goldman Sachs tags revenue only as net revenue.
+        usd = _without(_base_usd(), "Revenues")
+        usd["RevenuesNetOfInterestExpense"] = [_fy(y, 4000.0 + 100 * i)
+                                               for i, y in enumerate(_YEARS)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.revenue[-1], 4500.0)
+        self.assertFalse([n for n in notes if n.startswith("revenue unavailable")], notes)
+
+    def test_revenues_below_contract_revenue_every_year_is_not_the_total(self) -> None:
+        # General Mills: Revenues held its joint ventures' net sales (about
+        # 10% of its own) until FY2022; contract revenue is its net sales.
+        usd = _base_usd()
+        usd["Revenues"] = [_fy(y, 200.0) for y in _YEARS if y <= 2022]
+        usd[PREFERRED] = [_fy(y, 1900.0 + 10 * i) for i, y in enumerate(_YEARS)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.revenue, [1900.0, 1910.0, 1920.0, 1930.0, 1940.0, 1950.0])
+        self.assertIn(f"revenue for FY2019-2022 is contract revenue ({PREFERRED}): the "
+                      "filer's Revenues figure is below 90% of it in every year both are "
+                      "tagged, so it is not the income-statement total (likely a sub-total "
+                      "from a note)", notes)
+        # Flowserve: a Revenues figure of 0 every year is not the total either.
+        usd["Revenues"] = [_fy(y, 0.0) for y in _YEARS]
+        fin, _bs, _notes = _parse(usd)
+        self.assertEqual(fin.revenue[0], 1900.0)
+
+    def test_a_total_below_contract_revenue_in_some_years_is_kept(self) -> None:
+        # Williams / EQT: derivative losses booked in revenue push the total
+        # below contract revenue in one year only; it is still the total.
+        usd = _base_usd()
+        usd["Revenues"] = [_fy(y, 700.0 if y == 2021 else 1000.0 + 100 * i)
+                           for i, y in enumerate(_YEARS)]
+        usd[PREFERRED] = [_fy(y, 950.0 + 100 * i) for i, y in enumerate(_YEARS)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.revenue, [1000.0, 1100.0, 700.0, 1300.0, 1400.0, 1500.0])
+        self.assertFalse([n for n in notes if "is contract revenue" in n], notes)
+
+    def _segment_usd(self, operating_income: list[float]) -> dict:
+        """Interest of 40; revenue - CostsAndExpenses = pretax + interest."""
+        usd = _base_usd()
+        usd["InterestExpense"] = [_fy(y, 40.0) for y in _YEARS]
+        usd["CostsAndExpenses"] = [_fy(y, (1000.0 + 100 * i) - (170.0 + 10 * i))
+                                   for i, y in enumerate(_YEARS)]
+        usd["OperatingIncomeLoss"] = [_fy(y, v) for y, v in zip(_YEARS, operating_income)]
+        return usd
+
+    def test_operating_income_that_is_a_segment_total_is_replaced(self) -> None:
+        # Disney: its OperatingIncomeLoss is total segment operating income,
+        # above both revenue - CostsAndExpenses and pretax income + interest.
+        fin, _bs, notes = _parse(self._segment_usd([260.0 + 10 * i for i in range(6)]))
+        self.assertEqual(fin.ebit, [170.0, 180.0, 190.0, 200.0, 210.0, 220.0])
+        self.assertEqual(fin.ebitda[-1], 270.0)
+        self.assertTrue(any(n.startswith(
+            "EBIT for FY2019-2024 derived as revenue - CostsAndExpenses: the tagged "
+            "OperatingIncomeLoss exceeds both that and pretax income + interest expense, so "
+            "it is likely a total of segment profit") for n in notes), notes)
+
+    def test_operating_income_matching_the_cost_total_is_kept(self) -> None:
+        # A real operating income above pretax + interest (a non-operating
+        # loss below it) equals revenue - CostsAndExpenses: kept as tagged.
+        usd = self._segment_usd([260.0 + 10 * i for i in range(6)])
+        usd["CostsAndExpenses"] = [_fy(y, (1000.0 + 100 * i) - (260.0 + 10 * i))
+                                   for i, y in enumerate(_YEARS)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.ebit, [260.0, 270.0, 280.0, 290.0, 300.0, 310.0])
+        self.assertFalse([n for n in notes if "segment profit" in n], notes)
+        # CostsAndExpenses that include interest and other non-operating items
+        # (revenue - them is pretax income) do not test operating income.
+        usd["CostsAndExpenses"] = [_fy(y, (1000.0 + 100 * i) - (130.0 + 10 * i))
+                                   for i, y in enumerate(_YEARS)]
+        fin, _bs, _notes = _parse(usd)
+        self.assertEqual(fin.ebit[-1], 310.0)
 
 
 class DepreciationTagTests(unittest.TestCase):
@@ -607,6 +756,44 @@ class CapexTagTests(unittest.TestCase):
              for n in notes if n.startswith("capex")],
             ["capex for FY2019-2022", "capex for FY2022-2024"])
 
+    _CIP = "PaymentsForConstructionInProcess"
+
+    def test_utility_construction_expenditures_are_the_total_capex(self) -> None:
+        # AEP: its construction expenditures are its whole capex; the PP&E tag
+        # stops in FY2020 (9, then 0) and the productive-assets tag holds a
+        # separate acquisitions line (2-35), which must not be read as capex.
+        usd = _base_usd()
+        usd[self._PPE] = [_fy(2019, 9.0), _fy(2020, 0.0)]
+        usd[self._PA] = [_fy(2022, 2.0), _fy(2023, 4.0), _fy(2024, 35.0)]
+        usd[self._CIP] = [_fy(y, 60.0 + 5 * i) for i, y in enumerate(_YEARS)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.capex, [60.0, 65.0, 70.0, 75.0, 80.0, 85.0])
+        self.assertEqual(
+            [n.split(", the largest")[0] for n in notes if n.startswith("capex")],
+            [f"capex for FY2019-2020 read from {self._CIP}",
+             f"capex for FY2022-2024 read from {self._CIP}"])
+
+    def test_construction_tag_only_fills_years_a_larger_ppe_tag_leaves_empty(self) -> None:
+        # Consolidated Edison: its PP&E tag is larger in the years both report,
+        # so the construction tag only fills the years after it stops.
+        usd = _base_usd()
+        usd[self._PPE] = [_fy(y, 60.0) for y in _YEARS if y <= 2021]
+        usd[self._CIP] = [_fy(y, 50.0 if y <= 2021 else 55.0) for y in _YEARS]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin.capex, [60.0, 60.0, 60.0, 55.0, 55.0, 55.0])
+        self.assertFalse([n for n in notes if n.startswith("capex")], notes)
+
+    def test_a_larger_other_ppe_line_beats_a_construction_only_year(self) -> None:
+        # Gaming and Leisure Properties: after its PP&E tag stops, its other-
+        # PP&E line is the whole capex and construction in progress a part
+        # of it (zero in FY2022), so the larger figure is used.
+        usd = _base_usd()
+        usd[self._PPE] = [_fy(y, 60.0) for y in _YEARS if y <= 2020]
+        usd[self._CIP] = [_fy(y, v) for y, v in zip(_YEARS, (10.0, 10.0, 24.0, 0.0, 40.0, 191.0))]
+        usd[self._OTHER_PPE] = [_fy(y, v) for y, v in zip(_YEARS[2:], (24.0, 47.0, 40.0, 304.0))]
+        fin, _bs, _notes = _parse(usd)
+        self.assertEqual(fin.capex, [60.0, 60.0, 24.0, 47.0, 40.0, 304.0])
+
 
 class BalanceSheetTests(unittest.TestCase):
     def _bs(self, **instants: list[dict]):
@@ -642,6 +829,42 @@ class BalanceSheetTests(unittest.TestCase):
         self.assertEqual(bs.minority_interest, 70.0)
         self.assertIn("minority interest taken from 2024-12-31; not reported at the "
                       "2025-06-30 balance sheet", notes)
+
+    def test_operating_lease_liability_is_read_at_the_snapshot_date(self) -> None:
+        equity = {"StockholdersEquity": [_inst("2024-12-31", 1000.0), _q2("2025-06-30", 1050.0)],
+                  "CashAndCashEquivalentsAtCarryingValue": [_q2("2025-06-30", 210.0)],
+                  "LongTermDebtNoncurrent": [_q2("2025-06-30", 400.0)]}
+        # The total tag at the snapshot date; debt stays the borrowings alone.
+        bs, _notes = self._bs(**equity, OperatingLeaseLiability=[
+            _inst("2024-12-31", 150.0), _q2("2025-06-30", 160.0)])
+        self.assertEqual((bs.as_of, bs.operating_lease_liability), ("2025-06-30", 160.0))
+        self.assertEqual(bs.total_debt, 400.0)
+        # MCD-like: the total was last tagged for an earlier year, the parts
+        # at the snapshot date; their sum is used, never the stale total.
+        parts = {"OperatingLeaseLiability": [_inst("2023-12-31", 12170.0)],
+                 "OperatingLeaseLiabilityNoncurrent": [_inst("2024-12-31", 14147.0),
+                                                       _q2("2025-06-30", 14039.0)],
+                 "OperatingLeaseLiabilityCurrent": [_q2("2025-06-30", 690.0)]}
+        bs, _notes = self._bs(**equity, **parts)
+        self.assertEqual(bs.operating_lease_liability, 14729.0)
+        # A current part not tagged at the date adds nothing.
+        bs, _notes = self._bs(**equity, **dict(parts, OperatingLeaseLiabilityCurrent=[
+            _inst("2024-12-31", 700.0)]))
+        self.assertEqual(bs.operating_lease_liability, 14039.0)
+        # Only facts dated before the snapshot (or only a current part): None.
+        for stale in ({"OperatingLeaseLiability": [_inst("2024-12-31", 150.0)],
+                       "OperatingLeaseLiabilityNoncurrent": [_inst("2024-12-31", 140.0)]},
+                      {"OperatingLeaseLiabilityCurrent": [_q2("2025-06-30", 690.0)]},
+                      {}):
+            with self.subTest(tags=sorted(stale)):
+                bs, _notes = self._bs(**equity, **stale)
+                self.assertIsNone(bs.operating_lease_liability)
+        # IFRS facts are not read (an IFRS filer's lease-inclusive debt comes
+        # from the yfinance fallback, which leaves the field None).
+        client = EdgarClient(user_agent="equity-research-tests test@example.com")
+        ifrs = {"facts": {"ifrs-full": {"LeaseLiabilities": {"units": {"USD": [
+            _q2("2025-06-30", 500.0)]}}}}}
+        self.assertIsNone(client._operating_lease_liability(ifrs, "2025-06-30"))
 
     def test_debt_current_is_not_added_to_its_own_components(self) -> None:
         # DebtCurrent 70 = short-term borrowings 40 + current LTD 30.
@@ -696,6 +919,42 @@ class BalanceSheetTests(unittest.TestCase):
             PreferredStockValue=[_inst("2024-12-31", 250.0)],
         )
         self.assertEqual(bs.preferred_equity, 250.0)
+
+    @staticmethod
+    def _q(end: str, val: float) -> dict:
+        """An instant fact from a 10-Q."""
+        return {"end": end, "val": val, "filed": "2025-05-01", "form": "10-Q", "fp": "Q1"}
+
+    def test_a_10q_item_left_out_of_the_next_10k_is_not_reused(self) -> None:
+        # Alliant Energy: short-term investments in the Q3 10-Q only; the
+        # 10-K and the next 10-Q no longer report them.
+        dates = ("2024-09-30", "2024-12-31", "2025-03-31")
+        bs, notes = self._bs(
+            Assets=[self._q(dates[0], 5000.0), _inst(dates[1], 5000.0),
+                    self._q(dates[2], 5000.0)],
+            StockholdersEquity=[self._q(dates[0], 990.0), _inst(dates[1], 1000.0),
+                                self._q(dates[2], 1010.0)],
+            CashAndCashEquivalentsAtCarryingValue=[self._q(dates[2], 115.0)],
+            ShortTermInvestments=[self._q(dates[0], 250.0)],
+        )
+        self.assertEqual(bs.as_of, "2025-03-31")
+        self.assertEqual(bs.cash_and_investments, 115.0)
+        self.assertIn("short-term investments last reported 2024-09-30 (250) and left out of "
+                      "the 2024-12-31 annual balance sheet; treated as 0 at the 2025-03-31 "
+                      "balance sheet", notes)
+
+    def test_a_10q_item_is_still_used_at_the_next_10k_date(self) -> None:
+        # At the annual balance sheet itself the grace window still applies
+        # (a line the 10-K tags with a company-specific element).
+        bs, notes = self._bs(
+            Assets=[self._q("2024-09-30", 5000.0), _inst("2024-12-31", 5000.0)],
+            StockholdersEquity=[_inst("2024-12-31", 1000.0)],
+            CashAndCashEquivalentsAtCarryingValue=[_inst("2024-12-31", 115.0)],
+            ShortTermInvestments=[self._q("2024-09-30", 250.0)],
+        )
+        self.assertEqual(bs.cash_and_investments, 365.0)
+        self.assertIn("short-term investments taken from 2024-09-30; not reported at the "
+                      "2024-12-31 balance sheet", notes)
 
 
 class CashTagTests(unittest.TestCase):
@@ -814,6 +1073,28 @@ class CashTagTests(unittest.TestCase):
             "CashCashEquivalentsAndShortTermInvestments": [_inst("2024-12-31", 76.8)],
         })
         self.assertAlmostEqual(bs.cash_and_investments, 76.8)
+
+    def test_current_debt_securities_count_as_short_term_investments(self) -> None:
+        # Intel, Elevance and GM (available-for-sale debt securities), Nike
+        # (without accrued interest), NVIDIA (debt securities) put their
+        # short-term investments line under these tags.
+        for tag in ("DebtSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+                    "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent"):
+            with self.subTest(tag=tag):
+                bs, _notes = self._bs(**{
+                    "CashAndCashEquivalentsAtCarryingValue": [_inst("2024-12-31", 12.87)],
+                    tag: [_inst("2024-12-31", 16.85)],
+                })
+                self.assertAlmostEqual(bs.cash_and_investments, 29.72)
+
+    def test_short_term_investments_line_beats_a_debt_securities_tag(self) -> None:
+        # Both tagged at the snapshot: the balance-sheet line is used, never both.
+        bs, _notes = self._bs(**{
+            "CashAndCashEquivalentsAtCarryingValue": [_inst("2024-12-31", 20.0)],
+            "ShortTermInvestments": [_inst("2024-12-31", 10.0)],
+            "AvailableForSaleSecuritiesDebtSecuritiesCurrent": [_inst("2024-12-31", 12.0)],
+        })
+        self.assertAlmostEqual(bs.cash_and_investments, 30.0)
 
 
 class DebtTagTests(unittest.TestCase):
@@ -948,6 +1229,167 @@ class DebtTagTests(unittest.TestCase):
             SecuredLongTermDebt=[_inst("2024-12-31", 8.0)],
         )
         self.assertAlmostEqual(bs.total_debt, 48.0)
+
+    def test_noncurrent_convertible_notes_are_debt(self) -> None:
+        # DoorDash / Robinhood: noncurrent convertible notes are all their debt.
+        for tag in ("ConvertibleLongTermNotesPayable", "ConvertibleDebtNoncurrent"):
+            with self.subTest(tag=tag):
+                bs, notes = self._bs(**{tag: [_inst("2024-12-31", 27.27)]})
+                self.assertAlmostEqual(bs.total_debt, 27.27)
+                self.assertTrue(any(f"debt lines ({tag})" in n for n in notes), notes)
+
+    def test_noncurrent_convertible_notes_take_their_current_tranche(self) -> None:
+        # Cloudflare / Akamai: the current tranche only under a current
+        # convertible-notes tag.
+        for tag in ("ConvertibleNotesPayableCurrent", "ConvertibleDebtCurrent"):
+            with self.subTest(tag=tag):
+                bs, notes = self._bs(**{
+                    "ConvertibleDebtNoncurrent": [_inst("2024-12-31", 30.0)],
+                    tag: [_inst("2024-12-31", 5.0)],
+                })
+                self.assertAlmostEqual(bs.total_debt, 35.0)
+                self.assertTrue(any("(ConvertibleDebtNoncurrent) plus current debt" in n
+                                    for n in notes), notes)
+
+    def _bs_at_q2(self, **instants: list[dict]):
+        """A 2025-06-30 10-Q snapshot after the FY2024 10-K balance sheet."""
+        usd = _without(_base_usd(), "LongTermDebtNoncurrent")
+        usd["Assets"] = [_inst("2023-12-31", 4000.0), _inst("2024-12-31", 5000.0),
+                         _q2("2025-06-30", 5200.0)]
+        usd["StockholdersEquity"] = [_inst("2024-12-31", 1000.0), _q2("2025-06-30", 1050.0)]
+        usd.update(instants)
+        _fin, bs, notes = _parse(usd)
+        self.assertEqual(bs.as_of, "2025-06-30")
+        return bs, notes
+
+    # The stale-components note ("long-term debt (noncurrent) ... not used: the
+    # <date> balance sheet reports a ... total").
+    _STALE_DROPPED = " not used: the "
+
+    def test_a_total_at_the_snapshot_beats_stale_noncurrent_and_current_debt(self) -> None:
+        # Chevron: its 10-Qs tag only the long-term total including current
+        # maturities, plus short-term borrowings; the noncurrent line and
+        # DebtCurrent from the 10-K six months earlier must not be summed.
+        total_tag = "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities"
+        bs, notes = self._bs_at_q2(**{
+            "LongTermDebtAndCapitalLeaseObligations": [_inst("2024-12-31", 397.81)],
+            "LongTermDebtCurrent": [_inst("2024-12-31", 23.45)],
+            "DebtCurrent": [_inst("2024-12-31", 109.18)],
+            "CommercialPaper": [_inst("2024-12-31", 46.42)],
+            total_tag: [_inst("2024-12-31", 397.81), _q2("2025-06-30", 366.74)],
+            "ShortTermBorrowings": [_q2("2025-06-30", 4.01)],
+        })
+        self.assertAlmostEqual(bs.total_debt, 370.75)
+        self.assertIn("long-term debt (noncurrent), current portion of long-term debt and "
+                      "current debt last reported 2024-12-31 are not used: the 2025-06-30 "
+                      "balance sheet reports a long-term debt total, used with the "
+                      "short-term borrowings reported there", notes)
+        self.assertFalse([n for n in notes if n.startswith(
+            ("long-term debt (noncurrent) taken from", "current debt taken from"))], notes)
+
+    def test_the_stale_debt_note_names_only_the_items_dropped(self) -> None:
+        # No short-term borrowings at the snapshot and a short- plus
+        # long-term total there: neither is claimed as used.
+        bs, notes = self._bs_at_q2(
+            LongTermDebtNoncurrent=[_inst("2024-12-31", 300.0)],
+            DebtLongtermAndShorttermCombinedAmount=[_q2("2025-06-30", 320.0)],
+        )
+        self.assertAlmostEqual(bs.total_debt, 320.0)
+        self.assertIn("long-term debt (noncurrent) last reported 2024-12-31 is not used: the "
+                      "2025-06-30 balance sheet reports a short- and long-term debt total",
+                      notes)
+        # A current portion from a later balance sheet keeps its own date;
+        # with no short-term borrowings at the snapshot none are mentioned.
+        q1 = {"end": "2025-03-31", "filed": "2025-05-01", "form": "10-Q", "fp": "Q1"}
+        bs, notes = self._bs_at_q2(
+            Assets=[_inst("2023-12-31", 4000.0), _inst("2024-12-31", 5000.0),
+                    dict(q1, val=5100.0), _q2("2025-06-30", 5200.0)],
+            LongTermDebtNoncurrent=[_inst("2024-12-31", 300.0)],
+            LongTermDebtCurrent=[dict(q1, val=20.0)],
+            LongTermDebt=[_q2("2025-06-30", 310.0)],
+        )
+        self.assertAlmostEqual(bs.total_debt, 310.0)
+        self.assertIn("long-term debt (noncurrent) last reported 2024-12-31 and current "
+                      "portion of long-term debt last reported 2025-03-31 are not used: the "
+                      "2025-06-30 balance sheet reports a long-term debt total", notes)
+
+    def test_a_zero_current_tranche_from_the_last_10k_is_no_debt_found(self) -> None:
+        # Shopify: its convertible notes, repaid, are last tagged 0 in the
+        # 10-K; the 10-Q tags no debt. Debt is unavailable (the provider's
+        # backfill phrase), with no note claiming a figure was used.
+        bs, notes = self._bs_at_q2(ConvertibleDebtCurrent=[_inst("2024-12-31", 0.0)])
+        self.assertEqual(bs.total_debt, 0.0)
+        self.assertIn("total debt unavailable on EDGAR; set to 0.0", notes)
+        self.assertFalse([n for n in notes if "counts current debt only" in n
+                          or n.startswith("current portion of long-term debt taken from")],
+                         notes)
+        # A non-zero current tranche is still counted, with both notes.
+        bs, notes = self._bs_at_q2(ConvertibleDebtCurrent=[_inst("2024-12-31", 5.0)])
+        self.assertEqual(bs.total_debt, 5.0)
+        self.assertTrue([n for n in notes if "counts current debt only" in n], notes)
+        self.assertTrue([n for n in notes
+                         if n.startswith("current portion of long-term debt taken from")], notes)
+
+    def test_a_current_portion_at_the_snapshot_keeps_the_noncurrent_path(self) -> None:
+        # Qualcomm tags its 10-Q noncurrent line as LongTermDebt beside a
+        # current portion, so a fresh LongTermDebt there is not read as a
+        # total including current maturities; the existing path is kept.
+        bs, notes = self._bs_at_q2(
+            LongTermDebtNoncurrent=[_inst("2024-12-31", 148.11)],
+            LongTermDebt=[_inst("2024-12-31", 148.11), _q2("2025-06-30", 127.81)],
+            LongTermDebtCurrent=[_q2("2025-06-30", 19.91)],
+            DebtCurrent=[_q2("2025-06-30", 24.89)],
+        )
+        self.assertAlmostEqual(bs.total_debt, 148.11 + 24.89)
+        self.assertFalse([n for n in notes if self._STALE_DROPPED in n], notes)
+
+    def test_a_combined_total_at_the_snapshot_beats_an_older_long_term_total(self) -> None:
+        # GATX: LongTermDebt only in the 10-K, the combined total every quarter.
+        bs, _notes = self._bs_at_q2(
+            LongTermDebt=[_inst("2024-12-31", 125.06)],
+            DebtLongtermAndShorttermCombinedAmount=[_inst("2024-12-31", 125.34),
+                                                    _q2("2025-06-30", 123.33)],
+        )
+        self.assertAlmostEqual(bs.total_debt, 123.33)
+
+    def test_long_term_debt_tagged_as_the_noncurrent_line_takes_current_debt(self) -> None:
+        # Tesla: LongTermDebt is its noncurrent line; with DebtCurrent it
+        # matches the debt note's carrying amount, so current debt is added.
+        bs, notes = self._bs(
+            LongTermDebt=[_inst("2024-12-31", 77.21)],
+            DebtCurrent=[_inst("2024-12-31", 13.40)],
+            DebtInstrumentCarryingAmount=[_inst("2024-12-31", 90.80)],
+        )
+        self.assertAlmostEqual(bs.total_debt, 90.61)
+        self.assertIn("LongTermDebt is the noncurrent line here: with DebtCurrent (13) it "
+                      "matches the debt carrying amount (91) at 2024-12-31, so all current "
+                      "debt is added", notes)
+        # A carrying amount that matches LongTermDebt alone keeps it a total.
+        bs, notes = self._bs(
+            LongTermDebt=[_inst("2024-12-31", 77.21)],
+            DebtCurrent=[_inst("2024-12-31", 13.40)],
+            DebtInstrumentCarryingAmount=[_inst("2024-12-31", 77.50)],
+        )
+        self.assertAlmostEqual(bs.total_debt, 77.21)
+        self.assertFalse([n for n in notes if n.startswith("LongTermDebt is")], notes)
+
+    def test_stale_debt_far_from_the_carrying_amount_is_a_warning(self) -> None:
+        # CoreWeave: every debt tag is from the earlier balance sheet, but the
+        # debt note's carrying amount at the snapshot is 43% higher.
+        stale = dict(LongTermDebtNoncurrent=[_inst("2024-12-31", 173.12)],
+                     LongTermDebtCurrent=[_inst("2024-12-31", 75.47)])
+        bs, notes = self._bs_at_q2(DebtInstrumentCarryingAmount=[_q2("2025-06-30", 355.51)],
+                                   **stale)
+        self.assertAlmostEqual(bs.total_debt, 248.59)
+        self.assertIn("WARNING: total debt (249) comes from debt tags last reported before "
+                      "the 2025-06-30 balance sheet, where the debt note's carrying amount "
+                      "(DebtInstrumentCarryingAmount) is 356; the debt has changed since, so "
+                      "net debt and the WACC debt weight may be out of date", notes)
+        self.assertIsNone(_missing_debt_warning(notes))  # not the Yahoo-backfill trigger
+        # Within 10% of the carrying amount: no warning.
+        _bs, notes = self._bs_at_q2(DebtInstrumentCarryingAmount=[_q2("2025-06-30", 260.0)],
+                                    **stale)
+        self.assertFalse([n for n in notes if n.startswith("WARNING: total debt")], notes)
 
 
 class DebtPlausibilityTests(unittest.TestCase):
@@ -1215,6 +1657,83 @@ class FinancialFilerTests(unittest.TestCase):
             NetInvestmentIncome=[_fy(y, 30.0) for y in _YEARS],
         ))
 
+    def test_utility_interest_above_the_lender_share_is_still_derived(self) -> None:
+        # Sempra / AES: interest at 11% of revenue is on the debt that funds
+        # their plant, a financing cost; net PP&E marks the asset-heavy filer.
+        for tag in ("PublicUtilitiesPropertyPlantAndEquipmentNet", "PropertyPlantAndEquipmentNet"):
+            with self.subTest(tag=tag):
+                usd = self._usd(**{tag: [_inst("2024-12-31", 4300.0)],
+                                   "LongTermDebtNoncurrent": [_inst("2024-12-31", 3000.0)]})
+                usd["InterestExpense"] = [_fy(y, 165.0) for y in _YEARS]
+                fin, _bs, notes = _parse(usd)
+                self.assertIsNone(fin._financial_kind)
+                self.assertEqual(fin.ebit, [295.0, 305.0, 315.0, 325.0, 335.0, 345.0])
+                self.assertFalse([n for n in notes if "as for a lender" in n], notes)
+
+    def test_lender_with_little_plant_is_still_not_derived(self) -> None:
+        # Affirm-like: net PP&E 4% of total assets is not an asset-heavy operator.
+        usd = self._usd(PropertyPlantAndEquipmentNet=[_inst("2024-12-31", 400.0)])
+        usd["InterestExpense"] = [_fy(y, 480.0) for y in _YEARS]
+        fin, _notes = self._assert_not_derived(
+            usd, None, "FY2024 interest expense is 32% of revenue, as for a lender")
+        self.assertEqual(fin.ebit, [0.0] * 6)
+
+    def test_real_estate_investments_mark_a_reit_without_a_property_tag(self) -> None:
+        # VICI: its properties are leases accounted for as investments (97%
+        # of total assets); interest at 21% of revenue is on property debt.
+        usd = self._usd(RealEstateInvestments=[_inst("2024-12-31", 9700.0)])
+        usd["InterestExpense"] = [_fy(y, 315.0) for y in _YEARS]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin._financial_kind, "reit")
+        self.assertTrue(notes[0].startswith(
+            "WARNING: EDGAR tags mark this company as a REIT (real-estate investments are "
+            "97% of total assets)"), notes)
+        self.assertEqual(fin.ebit[-1], 495.0)
+
+    def test_annuity_writer_is_an_insurer_by_its_policyholder_liabilities(self) -> None:
+        # Apollo (Athene): premiums are 8% of revenue, since annuity deposits
+        # are not premiums, but contract deposits are 70% of total assets.
+        fin, _bs, notes = _parse(self._usd(
+            PremiumsEarnedNet=[_fy(y, 120.0) for y in _YEARS],
+            PolicyholderContractDeposits=[_inst("2024-12-31", 7000.0)],
+            PolicyholderFunds=[_inst("2024-12-31", 6900.0)],
+        ))
+        self.assertEqual(fin._financial_kind, "insurer")
+        self.assertTrue(notes[0].startswith(
+            "WARNING: EDGAR tags mark this company as an insurer (policyholder liabilities "
+            "are 70% of total assets)"), notes)
+
+    def test_policy_benefits_and_separate_accounts_count_together_and_alone(self) -> None:
+        # Voya: future policy benefits plus separate accounts at one date.
+        fin, _bs, _notes = _parse(self._usd(
+            LiabilityForFuturePolicyBenefits=[_inst("2024-12-31", 2500.0)],
+            SeparateAccountsLiability=[_inst("2024-12-31", 2000.0)],
+        ))
+        self.assertEqual(fin._financial_kind, "insurer")
+        # Future policy benefits tagged at an earlier balance sheet, separate
+        # accounts at the later one: each is read at its own latest date.
+        usd = self._usd(
+            LiabilityForFuturePolicyBenefits=[_inst("2024-06-30", 4100.0)],
+            SeparateAccountsLiability=[_inst("2024-12-31", 500.0)],
+        )
+        usd["Assets"] = usd["Assets"] + [_inst("2024-06-30", 9000.0)]
+        fin, _bs, notes = _parse(usd)
+        self.assertEqual(fin._financial_kind, "insurer")
+        self.assertIn("policyholder liabilities are 46% of total assets", notes[0])
+
+    def test_run_off_insurance_book_is_not_an_insurer(self) -> None:
+        # GE: a run-off book at 26% of total assets.
+        self._assert_derived(self._usd(
+            LiabilityForFuturePolicyBenefits=[_inst("2024-12-31", 2600.0)]))
+
+    def test_bank_with_separate_accounts_stays_a_bank(self) -> None:
+        # Ameriprise: bank deposits pass the bank test, which comes first.
+        fin, _bs, _notes = _parse(self._usd(
+            Deposits=[_inst("2024-12-31", 1600.0)],
+            SeparateAccountsLiability=[_inst("2024-12-31", 4600.0)],
+        ))
+        self.assertEqual(fin._financial_kind, "bank")
+
 
 class CaptiveFinanceTests(unittest.TestCase):
     """Industrial groups that consolidate a finance and leasing arm.
@@ -1416,6 +1935,20 @@ class CaptiveFinanceTests(unittest.TestCase):
             FinancingReceivableExcludingAccruedInterestAfterAllowanceForCreditLoss=[
                 _inst("2024-12-31", 3000.0)],
         ), "InventoryNet"))
+
+    def test_a_sliver_of_hardware_inventory_is_not_a_product_business(self) -> None:
+        # Shopify: 0.14% of total assets in point-of-sale hardware does not
+        # make its merchant cash advances (36% of revenue) a captive arm.
+        originations = [_fy(y, 540.0) for y in _YEARS]
+        self._assert_not_captive(self._usd(
+            InventoryNet=[_inst("2024-12-31", 14.0)],
+            PaymentsToAcquireFinanceReceivables=originations,
+        ))
+        # At 1.5% of total assets the inventory is a product business.
+        self._assert_captive(self._usd(
+            InventoryNet=[_inst("2024-12-31", 150.0)],
+            PaymentsToAcquireFinanceReceivables=originations,
+        ), "FY2024 loan and lease originations are 36% of revenue", leases=False)
 
     def test_receivables_no_longer_reported_do_not_count(self) -> None:
         # Deere: its receivable tags stopped in 2020 (company tags since).
@@ -1664,7 +2197,11 @@ class HybridProviderEdgarTests(unittest.TestCase):
         usd = _without(_base_usd(), "OperatingIncomeLoss", "DepreciationDepletionAndAmortization")
         cd = self._provider(usd, self._market()).get_company_data("FIX")
         self.assertEqual(cd.source_notes[0], "Fundamentals: SEC EDGAR (CIK 0000000001)")
-        self.assertIn("D&A unavailable on EDGAR; filled with 0.0", cd.source_notes)
+        # The note leads with EDGAR's wording; the Yahoo D&A backfill appends
+        # what it did (this mock market client serves no statements).
+        self.assertTrue(any(n.startswith("D&A unavailable on EDGAR; filled with 0.0; Yahoo's "
+                                         "annual income and cash-flow statements could not be "
+                                         "read") for n in cd.source_notes), cd.source_notes)
         self.assertTrue(any("derived as pretax income + interest expense" in n
                             for n in cd.source_notes), cd.source_notes)
 
@@ -1881,6 +2418,286 @@ class EdgarBoundaryTests(unittest.TestCase):
         converted, _bs = scale_fundamentals(fin, bs, 1.3)
         self.assertEqual(converted.net_income[-1], 117)
         self.assertTrue(converted._income_attribution_adjusted)
+
+class CommonDividendTests(unittest.TestCase):
+    """PaymentsOfDividends covers preferred dividends; the series is common-only."""
+
+    @staticmethod
+    def _usd(**extra: list[dict]) -> dict:
+        usd = _without(_base_usd(), "PaymentsOfDividendsCommonStock")
+        usd["PaymentsOfDividends"] = [_fy(y, 120.0) for y in _YEARS]
+        usd.update(extra)
+        return usd
+
+    def test_preferred_dividends_are_taken_out_of_the_generic_line(self) -> None:
+        # JPMorgan / Goldman Sachs: only the generic line and preferred dividends.
+        fin, _bs, notes = _parse(self._usd(
+            DividendsPreferredStock=[_fy(y, 20.0) for y in _YEARS]))
+        self.assertEqual(fin.dividends_paid, [100.0] * 6)
+        self.assertIn("dividends paid for FY2019-2024 are PaymentsOfDividends less the "
+                      "preferred dividends tagged for those years (that line covers common "
+                      "and preferred dividends)", notes)
+
+    def test_common_dividends_declared_are_used_when_tagged(self) -> None:
+        # Schwab / Morgan Stanley: the common dividends are tagged separately.
+        fin, _bs, notes = _parse(self._usd(
+            DividendsPreferredStockCash=[_fy(y, 25.0) for y in _YEARS],
+            DividendsCommonStockCash=[_fy(y, 95.0) for y in _YEARS]))
+        self.assertEqual(fin.dividends_paid, [95.0] * 6)
+        self.assertTrue(any(n.startswith("dividends paid for FY2019-2024 are the common "
+                                         "dividends declared") for n in notes), notes)
+
+    def test_payments_that_are_all_preferred_leave_no_common_dividend(self) -> None:
+        # Boeing: no common dividend; the payments are its preferred dividends.
+        fin, _bs, _notes = _parse(self._usd(
+            PaymentsOfDividends=[_fy(2024, 33.1)],
+            DividendsPreferredStockCash=[_fy(2024, 34.5)]))
+        self.assertEqual(fin.dividends_paid[-1], 0.0)
+
+    def test_generic_line_is_kept_without_preferred_or_beside_a_preferred_line(self) -> None:
+        fin, _bs, _notes = _parse(self._usd())
+        self.assertEqual(fin.dividends_paid, [120.0] * 6)
+        # The cash flow shows the preferred dividends paid on a line of their
+        # own, so the generic line is the common dividends.
+        fin, _bs, _notes = _parse(self._usd(
+            DividendsPreferredStock=[_fy(y, 20.0) for y in _YEARS],
+            PaymentsOfDividendsPreferredStockAndPreferenceStock=[_fy(y, 20.0) for y in _YEARS]))
+        self.assertEqual(fin.dividends_paid, [120.0] * 6)
+        # The common-stock tag wins outright, preferred dividends or not.
+        usd = _base_usd()
+        usd["DividendsPreferredStock"] = [_fy(y, 5.0) for y in _YEARS]
+        fin, _bs, _notes = _parse(usd)
+        self.assertEqual(fin.dividends_paid, [20.0] * 6)
+
+
+class ShareCountTests(unittest.TestCase):
+    """Annual diluted shares: counts tagged in millions, and a split after
+    the latest annual report."""
+
+    _TAG = "WeightedAverageNumberOfDilutedSharesOutstanding"
+
+    @staticmethod
+    def _cover(count: float, end: str = "2025-01-31") -> dict:
+        return {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": end, "val": count, "filed": "2025-02-20", "form": "10-K"}]}}}
+
+    def _parse(self, entries: list[dict], cover: dict | None = None):
+        facts = _company(_base_usd(), {self._TAG: entries})
+        if cover is not None:
+            facts["facts"]["dei"] = cover
+        fin, _bs, _cik, _name = _client(facts).get_annual_financials("FIX")
+        return fin, fin._source_notes
+
+    def test_counts_tagged_in_millions_are_rescaled(self) -> None:
+        # McDonald's: 785.6M up to FY2020, then 751.8 (millions) and so on.
+        counts = (785.6e6, 780.0e6, 751.8, 741.3, 732.3, 721.9)
+        entries = [_fy(y, v) for y, v in zip(_YEARS, counts)]
+        expected = [785.6e6, 780.0e6, 751.8e6, 741.3e6, 732.3e6, 721.9e6]
+        for cover in (self._cover(707.6e6), None):  # cover page, else the series itself
+            with self.subTest(cover=cover is not None):
+                fin, notes = self._parse(entries, cover)
+                for got, want in zip(fin.diluted_shares, expected):
+                    self.assertAlmostEqual(got, want, delta=1.0)
+                self.assertIn("diluted shares for FY2021-2024 are tagged in millions on EDGAR "
+                              "(far below the shares outstanding on the cover page); "
+                              "multiplied by 1,000,000", notes)
+
+    def test_small_counts_without_a_larger_reference_are_kept(self) -> None:
+        fin, notes = self._parse([_fy(y, 400.0) for y in _YEARS])
+        self.assertEqual(fin.diluted_shares, [400.0] * 6)
+        self.assertFalse([n for n in notes if "diluted shares" in n and "millions" in n])
+
+    @staticmethod
+    def _half_year(val: float, filed: str) -> dict:
+        return _entry("2024-01-01", "2024-06-30", val, filed, fp="Q2", form="10-Q")
+
+    def test_split_after_the_latest_annual_report_restates_every_year(self) -> None:
+        # Honeywell: a 1-for-2 change after the FY2024 10-K; a 2025 10-Q
+        # restates the first half of 2024 from 646.3M to 323.2M.
+        entries = [_fy(y, 680e6 - 7.44e6 * i) for i, y in enumerate(_YEARS)]
+        entries += [self._half_year(646.3e6, "2024-07-25"),
+                    self._half_year(323.15e6, "2025-07-24")]
+        fin, notes = self._parse(entries, self._cover(316.9e6, "2025-06-30"))
+        self.assertAlmostEqual(fin.diluted_shares[-1], (680e6 - 7.44e6 * 5) * 0.5, delta=1.0)
+        self.assertAlmostEqual(fin.diluted_shares[0], 340e6, delta=1.0)
+        self.assertIn("diluted shares multiplied by 0.5 for a stock split after the latest "
+                      "annual report: a later filing restates the 2024-01-01 to 2024-06-30 "
+                      "share count by that factor", notes)
+
+    def test_split_already_in_the_annual_counts_is_not_applied_again(self) -> None:
+        # Netflix: the 10-for-1 split came before its FY2024 10-K, which
+        # restated the annual counts; a later 10-Q's restated half-year
+        # count then matches the annual basis.
+        entries = [_fy(y, 4300e6 + 40e6 * i) for i, y in enumerate(_YEARS)]
+        entries += [self._half_year(445e6, "2024-07-25"),
+                    self._half_year(4450e6, "2025-07-24")]
+        fin, notes = self._parse(entries, self._cover(4250e6))
+        self.assertAlmostEqual(fin.diluted_shares[-1], 4500e6, delta=1.0)
+        self.assertFalse([n for n in notes if "stock split" in n], notes)
+
+    def test_split_inside_the_latest_annual_year_is_not_applied_again(self) -> None:
+        # Fastenal: a 2-for-1 split in May 2025, after its Q1 10-Q, is
+        # already in the FY2025 10-K's counts; the next Q1 10-Q restates the
+        # Q1 comparative by the factor, which then sits at or above the
+        # annual count (buybacks during the year). Also 3-for-2.
+        cases = (("3-for-2", 1.5, 670e6), ("2-for-1", 2.0, 505e6),
+                 ("Fastenal", 2.0, 1149.51e6 / 2.0))
+        for label, factor, q1_old in cases:
+            with self.subTest(label):
+                annual = [1000e6 * (1.0 + 0.01 * (len(_YEARS) - 1 - i))
+                          for i in range(len(_YEARS))]
+                if label == "Fastenal":
+                    annual[-1] = 1150.33e6
+                entries = [_fy(y, v) for y, v in zip(_YEARS, annual)]
+                entries += [
+                    _entry("2024-01-01", "2024-03-31", q1_old, "2024-04-25",
+                           fp="Q1", form="10-Q"),
+                    _entry("2024-01-01", "2024-03-31", q1_old * factor, "2025-04-24",
+                           fp="Q1", form="10-Q"),
+                ]
+                fin, notes = self._parse(entries)
+                self.assertEqual(fin.diluted_shares, annual)
+                self.assertFalse([n for n in notes if "stock split" in n], notes)
+
+    def test_a_split_factor_from_rounded_counts_is_snapped_to_its_plain_ratio(self) -> None:
+        # Booking: the restated half-year count is 24.99 times the original
+        # (both rounded); the split is 25-for-1.
+        entries = [_fy(y, 38e6 - 1e6 * i) for i, y in enumerate(_YEARS)]
+        entries += [self._half_year(33.9e6, "2024-07-30"),
+                    self._half_year(847.1e6, "2025-07-29")]
+        fin, notes = self._parse(entries)
+        self.assertEqual(fin.diluted_shares, [(38e6 - 1e6 * i) * 25 for i in range(len(_YEARS))])
+        self.assertIn("diluted shares multiplied by 25 for a stock split after the latest "
+                      "annual report: a later filing restates the 2024-01-01 to 2024-06-30 "
+                      "share count by that factor", notes)
+
+    def test_plain_split_ratios(self) -> None:
+        for measured, plain in ((24.9886, 25.0), (0.50003, 0.5), (1.0 / 20.04, 0.05),
+                                (1.4993, 1.5), (2.05, 2.05), (0.3338, 1.0 / 3.0)):
+            with self.subTest(measured=measured):
+                self.assertAlmostEqual(_plain_split_factor(measured), plain, places=12)
+
+
+class EdgarHttpTests(unittest.TestCase):
+    """EdgarClient._get_json against a scripted transport (no network)."""
+
+    UA = "equity-research-tests test@example.com"
+
+    class _Adapter(requests.adapters.BaseAdapter):
+        """Replies from a script of (status, body) and records each request."""
+
+        def __init__(self, script):
+            super().__init__()
+            self.script = list(script)
+            self.sent: list = []
+
+        def send(self, request, **kwargs):
+            self.sent.append(request)
+            status, body = self.script.pop(0)
+            resp = requests.Response()
+            resp.status_code, resp._content = status, body
+            resp.request, resp.url = request, request.url
+            return resp
+
+        def close(self) -> None:
+            pass
+
+    def _run(self, script, user_agent: str = UA):
+        client = EdgarClient(user_agent=self.UA)
+        client.user_agent = user_agent
+        adapter = self._Adapter(script)
+        client._session.mount("https://", adapter)
+        with mock.patch("equity_valuation.data.edgar.time.sleep") as sleep, \
+                mock.patch("equity_valuation.config.SEC_MAX_RETRIES", 3), \
+                mock.patch("equity_valuation.config.HTTP_RETRY_BACKOFF", 1.5):
+            try:
+                result, error = client._get_json("https://data.sec.gov/api/x.json"), None
+            except DataError as exc:
+                result, error = None, exc
+        return result, error, adapter.sent, [c.args for c in sleep.call_args_list]
+
+    def test_transient_errors_are_retried_with_backoff_and_the_user_agent(self) -> None:
+        result, error, sent, sleeps = self._run(
+            [(503, b""), (429, b""), (200, b'{"ok": 1}')])
+        self.assertIsNone(error)
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sleeps, [(1.5,), (3.0,)])
+        self.assertTrue(all(r.headers.get("User-Agent") == self.UA for r in sent))
+
+    def test_retry_budget_is_capped(self) -> None:
+        _result, error, sent, sleeps = self._run([(503, b"")] * 3)
+        self.assertIn("SEC returned HTTP 503", str(error))
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(len(sleeps), 2)  # none after the last attempt
+
+    def test_not_found_and_invalid_json_are_not_retried(self) -> None:
+        _result, error, sent, sleeps = self._run([(404, b"")])
+        self.assertIn("404", str(error))
+        self.assertEqual((len(sent), sleeps), (1, []))
+        _result, error, sent, sleeps = self._run([(200, b"<html>not json</html>")])
+        self.assertIn("invalid JSON", str(error))
+        self.assertEqual((len(sent), sleeps), (1, []))
+
+    def test_missing_user_agent_stops_before_any_request(self) -> None:
+        _result, error, sent, _sleeps = self._run([(200, b"{}")], user_agent="")
+        self.assertIn("SEC_USER_AGENT", str(error))
+        self.assertEqual(sent, [])
+
+
+class FilingsHttpTests(unittest.TestCase):
+    """backend.filings: document URLs, HTTP status checks and the text cache."""
+
+    UA = {"User-Agent": "equity-research-tests test@example.com"}
+
+    def setUp(self) -> None:
+        self.patches = [
+            mock.patch.object(filings._edgar, "resolve_cik", return_value=("0000320193", "Apple")),
+            mock.patch.object(filings, "_HEADERS", self.UA),
+            mock.patch.dict(filings._text_cache, clear=True),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in reversed(self.patches):
+            p.stop()
+
+    def test_listed_document_urls_drop_the_accession_dashes(self) -> None:
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = FilingsListTests._submissions(["10-K"])
+        with mock.patch.object(filings.requests, "get", return_value=resp) as get:
+            out = filings.list_filings("AAPL")
+        self.assertEqual(get.call_args.kwargs["headers"], self.UA)
+        self.assertEqual(out["filings"][0]["url"], "https://www.sec.gov/Archives/edgar/data/"
+                                                   "320193/000000000126000000/doc0.htm")
+
+    def test_list_rejects_a_non_200_reply(self) -> None:
+        with mock.patch.object(filings.requests, "get",
+                               return_value=mock.Mock(status_code=403)):
+            with self.assertRaisesRegex(DataError, "HTTP 403"):
+                filings.list_filings("AAPL")
+
+    def test_document_fetch_url_status_and_cache(self) -> None:
+        ok = mock.Mock(status_code=200, text="<p>Annual report</p>")
+        url = ("https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/"
+               "a10k.htm")
+        with mock.patch.object(filings.requests, "get", return_value=ok) as get, \
+                mock.patch.object(filings.time, "time", side_effect=[1000.0, 1010.0, 4700.0]):
+            first = filings.fetch_filing_text("AAPL", "0000320193-24-000123", "a10k.htm")
+            again = filings.fetch_filing_text("AAPL", "0000320193-24-000123", "a10k.htm")
+            self.assertEqual(get.call_count, 1)  # within the hour: cached
+            filings.fetch_filing_text("AAPL", "0000320193-24-000123", "a10k.htm")
+            self.assertEqual(get.call_count, 2)  # after the TTL: fetched again
+        self.assertEqual(get.call_args.args[0], url)
+        self.assertEqual(get.call_args.kwargs["headers"], self.UA)
+        self.assertEqual((first, again), ("Annual report", "Annual report"))
+        filings._text_cache.clear()
+        with mock.patch.object(filings.requests, "get",
+                               return_value=mock.Mock(status_code=404, text="<html>")):
+            with self.assertRaisesRegex(DataError, "HTTP 404"):
+                filings.fetch_filing_text("AAPL", "0000320193-24-000123", "a10k.htm")
+
 
 class FilingsBoundaryTests(unittest.TestCase):
     def test_line_start_checks_entire_prefix(self):

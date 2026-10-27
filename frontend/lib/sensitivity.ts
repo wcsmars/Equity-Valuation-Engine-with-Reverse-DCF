@@ -1,10 +1,10 @@
 // Sensitivity-grid helpers shared by SensitivityPanel (and its tests).
 //
-// The engine builds two kinds of grid: WACC x terminal growth for a Gordon
-// DCF, and WACC x exit EV/EBITDA for an exit-multiple DCF. Axis values are
-// formatted by the axis label, the same rule the Excel and HTML reports use,
-// and the centre cell counts as the base case only when it reproduces the
-// headline DCF price.
+// The engine builds two kinds of grid: WACC x terminal growth for a Gordon or
+// value-driver DCF (its cells run the headline's method), and WACC x exit
+// EV/EBITDA for an exit-multiple DCF. Axis values are formatted by the axis
+// label, the same rule the Excel and HTML reports use, and the centre cell
+// counts as the base case only when it reproduces the headline DCF price.
 
 import type { Sensitivity } from "./types";
 import { fmtMult, fmtPct } from "./format";

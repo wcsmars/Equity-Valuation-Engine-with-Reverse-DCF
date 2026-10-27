@@ -1,1 +1,1 @@
-"""Valuation models: WACC, DCF (FCFF), trading comps, DDM/FCFE, sensitivity."""
+"""Valuation models: WACC, DCF (FCFF), reverse DCF, trading comps, DDM/FCFE, sensitivity."""

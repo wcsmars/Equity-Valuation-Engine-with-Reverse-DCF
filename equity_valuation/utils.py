@@ -95,15 +95,41 @@ def series_cagr(values: Sequence[Optional[float]],
     return cagr(v0, v1, periods)
 
 
+# Adjacent-year share counts more than this factor apart are a unit break in
+# the filed data, not a split or an issue (MCD's later 10-Ks tag FY2021-25
+# diluted shares in millions: 751.8 after 750,100,000 for FY2020). A per-share
+# series across it is off by about that factor.
+SHARE_SCALE_BREAK_FACTOR = 100.0
+
+
+def share_scale_break(shares: Optional[Sequence[Optional[float]]]
+                      ) -> Optional[tuple[int, float]]:
+    """``(position, ratio)`` of the first share count more than
+    ``SHARE_SCALE_BREAK_FACTOR`` times (or under 1/that of) the previous
+    positive one, else None. Missing and non-positive entries are skipped."""
+    prev = None
+    for i, s in enumerate(shares or []):
+        if not (is_num(s) and s > 0):
+            continue
+        if prev is not None:
+            ratio = float(s) / prev
+            if ratio > SHARE_SCALE_BREAK_FACTOR or ratio < 1.0 / SHARE_SCALE_BREAK_FACTOR:
+                return i, ratio
+        prev = float(s)
+    return None
+
+
 def incremental_ratio(changes: Sequence[Optional[float]],
                       levels: Sequence[Optional[float]]) -> Optional[float]:
     """Pooled ``sum(changes_i) / sum(levels_i - levels_{i-1})`` over usable years.
 
     Used for dNWC per unit of revenue change. Pooling (a change-weighted mean)
     keeps one near-flat year from dominating, as a mean of per-year ratios would.
-    A year counts only when its change is finite and both levels are positive
-    (zero-filled years are gaps, not data). Returns None if nothing is usable or
-    the pooled level change is zero.
+    A year counts only when its change is finite and non-zero and both levels
+    are positive (zero-filled years are gaps, not data: the providers fill an
+    unreported dNWC year with 0.0, which would otherwise add that year's whole
+    revenue change to the denominator). Returns None if nothing is usable
+    (including an all-zero series) or the pooled level change is zero.
     """
     return screened_incremental_ratio(changes, levels, one_off_share=None)[0]
 
@@ -127,8 +153,9 @@ def screened_incremental_ratio(
     build stays in (it is in proportion to its revenue change), and so does a
     flat-revenue year with an ordinary dNWC (it is small against revenue). Two
     such KO years (a tax deposit, a settled accrual) otherwise turn a ~0 ratio
-    into 0.92. ``one_off_share=None`` disables the screen. The ratio is None if
-    no year is usable or the pooled level change is zero.
+    into 0.92. ``one_off_share=None`` disables the screen. A zero change is a
+    provider gap, not a reading, and is skipped. The ratio is None if no year
+    is usable or the pooled level change is zero.
     """
     changes = list(changes or [])
     levels = list(levels or [])
@@ -137,7 +164,8 @@ def screened_incremental_ratio(
     dropped: list[int] = []
     for i in range(1, min(len(changes), len(levels))):
         cur, prev, chg = levels[i], levels[i - 1], changes[i]
-        if not (is_num(chg) and is_num(cur) and is_num(prev) and cur > 0 and prev > 0):
+        if not (is_num(chg) and chg != 0 and is_num(cur) and is_num(prev)
+                and cur > 0 and prev > 0):
             continue
         if (one_off_share is not None and abs(chg) > one_off_share * cur
                 and abs(chg) > abs(cur - prev)):
@@ -179,19 +207,35 @@ def pooled_ratio(numerators: Sequence[Optional[float]],
 GROWTH_CAPEX_START = 1.5
 GROWTH_CAPEX_FULL = 2.0
 # The models note a fade only when terminal capex ends at least this far (as a
-# share of revenue) below history. A smaller fade (AMZN 12.1% -> 12.0%, capex
-# just past 1.5x D&A) is still applied, but a note would call ordinary capex
-# growth-phase.
+# share of revenue) below history, or at least GROWTH_CAPEX_NOTE_MIN_REL_FADE
+# of the historical share below it. A smaller fade (AMZN 12.1% -> 12.0%, capex
+# just past 1.5x D&A: 0.1pp, under 1%) is still applied, but a note would call
+# ordinary capex growth-phase.
 GROWTH_CAPEX_NOTE_MIN_FADE = 0.005
+# The relative gate keeps a large fade in a low-capex business from passing
+# silently (JD: 1.54% -> 1.13% of revenue, 0.41pp but 27%, about +30% on the
+# DCF). The path never ends below 1.5x D&A, so it can only fire from about
+# 1.67x D&A up: capex just past 1.5x D&A stays quiet.
+GROWTH_CAPEX_NOTE_MIN_REL_FADE = 0.10
+# The relative gate also needs the fade to reach this share of revenue, so a
+# fade too small to move free cash flow in a very asset-light business (capex
+# 0.4% of revenue, D&A 0.2%, faded to 0.3%: 0.1pp) stays quiet; JD's 0.41pp
+# clears it.
+GROWTH_CAPEX_NOTE_MIN_REL_FADE_FLOOR = 0.002
 
 
 def material_capex_fade(capex_pct: Optional[float],
                         path: Optional[Sequence[float]]) -> bool:
     """True when ``growth_capex_path`` returned a path whose final year sits at
-    least ``GROWTH_CAPEX_NOTE_MIN_FADE`` below the historical ``capex_pct``."""
+    least ``GROWTH_CAPEX_NOTE_MIN_FADE`` (absolute) below the historical
+    ``capex_pct``, or at least ``GROWTH_CAPEX_NOTE_MIN_REL_FADE`` (relative)
+    and ``GROWTH_CAPEX_NOTE_MIN_REL_FADE_FLOOR`` (absolute) below it."""
     if not path or not is_num(capex_pct) or not is_num(path[-1]):
         return False
-    return capex_pct - path[-1] >= GROWTH_CAPEX_NOTE_MIN_FADE
+    fade = capex_pct - path[-1]
+    return (fade >= GROWTH_CAPEX_NOTE_MIN_FADE
+            or (fade >= GROWTH_CAPEX_NOTE_MIN_REL_FADE * capex_pct
+                and fade >= GROWTH_CAPEX_NOTE_MIN_REL_FADE_FLOOR))
 
 
 def growth_capex_path(
@@ -582,6 +626,11 @@ FINANCIAL_KIND_REASONS = {
 # words).
 NOT_IN_BLEND = " (not in blend)"
 
+# Start of the DCF's note for a flagged company with no usable operating
+# income (``models.dcf.run_dcf``): it gives no reference price, and the
+# engine's financial-institution warning then says so.
+NO_OPERATING_MARGIN_NOTE_PREFIX = "EBIT margin unavailable: "
+
 
 def financial_institution_detail(company) -> Optional[tuple[str, str]]:
     """(short reason, kind) if ``company`` is a bank, insurer, REIT or
@@ -607,7 +656,11 @@ def financial_institution_detail(company) -> Optional[tuple[str, str]]:
       * the data layer's classification from the filer's own figures
         (deposits, premiums, fair-value investments, investment property, a
         finance and leasing arm, lease income with heavy interest), carried as
-        ``financials._financial_kind``; an unrecognised non-empty kind counts
+        ``financials._financial_kind``. The EDGAR client also marks an
+        annuity writer as an insurer by its policyholder liabilities (at
+        least 40% of total assets) and a REIT by its real estate investments
+        (``RealEstateInvestments``, without an investment-property line) or
+        its Schedule III real estate. An unrecognised non-empty kind counts
         as "financial";
       * credit services, capital markets, asset management and financial
         conglomerates (or a bare "Financial Services" sector) count only when
@@ -732,10 +785,12 @@ def low_payout_ddm(report) -> Optional[float]:
     With its DCF and FCFE left out, such a company's blend is comps and the
     DDM, and the median of two is their mean, so the DDM carries half the
     weight; without comps it would be the whole target. The DDM counts
-    regular dividends only; below ``LOW_DDM_PAYOUT_SHARE`` of net income the
-    rest of the earnings is bought back or retained, so the DDM understates
-    the company (GM: comps $52.53, DDM $9.81, blend $31.17 "Overvalued
-    -61.6%" at $81.20; without peers, GM $9.81 "-88%", CAT -90%, HOG -67%).
+    dividends only (regular plus any recurring variable ones; buybacks and
+    one-off specials are ignored); below ``LOW_DDM_PAYOUT_SHARE`` of net
+    income the rest of the earnings is bought back or retained, so the DDM
+    understates the company (GM: comps $52.53, DDM $9.81, blend $31.17
+    "Overvalued -61.6%" at $81.20; without peers, GM $9.81 "-88%", CAT -90%,
+    HOG -67%).
     It is therefore left out whether or not comps give a price. Banks and
     insurers keep their DDM: dividends are their usual valuation basis and
     their payout also reflects capital rules.
@@ -755,9 +810,10 @@ def ddm_left_alone(report) -> bool:
     not already left it out.
 
     Its DCF and FCFE are reference-only, so the DDM would be the only method,
-    and it counts regular dividends only (PCAR, at an 87% payout with its
-    year-end extra dividend, read "-50%"). The engine then gives no blended
-    target and asks for peers; the DDM stays on display.
+    and it counts dividends only (regular plus any recurring variable ones;
+    PCAR, at an 87% payout with its year-end extra dividend, read "-50%").
+    The engine then gives no blended target and asks for peers; the DDM
+    stays on display.
     """
     if _reference_only_kind(report) is None or low_payout_ddm(report) is not None:
         return False

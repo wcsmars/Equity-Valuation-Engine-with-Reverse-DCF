@@ -24,6 +24,7 @@ import {
   postChat,
   postDigest,
 } from "@/lib/api";
+import { liveSuggestionValue } from "@/lib/assumptions";
 import { fmtBytes, fmtDate, fmtMult, fmtNum, fmtPct } from "@/lib/format";
 import { Badge, Button, Card, EmptyState, Spinner, cx } from "@/components/ui";
 
@@ -107,22 +108,26 @@ function NoteSection({
   );
 }
 
-// One suggested assumption change with an Apply button.
+// One suggested assumption change with an Apply button. The "from" side is
+// the model on screen (liveSuggestionValue), else the value the AI echoed.
 function SuggestionRow({
   s,
+  report,
   onApply,
 }: {
   s: AssumptionSuggestion;
+  report: Report;
   onApply: (s: AssumptionSuggestion) => void;
 }) {
+  const current = liveSuggestionValue(report, s.field) ?? s.current_value;
   return (
     <div className="flex items-start justify-between gap-3 rounded-lg border border-line p-3">
       <div className="min-w-0">
         <div className="text-sm font-medium text-ink">{s.label || s.field}</div>
         <div className="num mt-0.5 text-sm text-ink-dim">
-          {s.current_value == null
+          {current == null
             ? "model default"
-            : fmtByUnit(s.current_value, s.unit)}{" "}
+            : fmtByUnit(current, s.unit)}{" "}
           <span className="text-ink-faint">→</span>{" "}
           <span className="font-semibold text-ink">
             {fmtByUnit(s.suggested_value, s.unit)}
@@ -578,6 +583,7 @@ export default function AIResearchPanel({
                                   <SuggestionRow
                                     key={`${s.field}-${si}`}
                                     s={s}
+                                    report={report}
                                     onApply={onApplySuggestion}
                                   />
                                 )

@@ -8,28 +8,55 @@ Static values are used where a live formula would be impractical or fragile.
 
 Workbook conventions:
   * Money is in absolute units; we format with the "#,##0.00" currency mask (and a
-    currency-symbol prefix where we know the reporting currency).
+    currency prefix: the symbol, or the ISO code for an unmapped currency).
   * Rates / margins / upside are decimals; we format them with the "0.0%" mask so
     0.082 renders as "8.2%".
+  * A column is widened to fit the widest number in it, so Excel never shows
+    "####" for a large amount (e.g. a $300B enterprise value with cents).
+  * Each formula is saved with its result as the cached value, so a viewer that
+    does not calculate (file previews, pandas) shows the number, not 0. Excel
+    and LibreOffice still recalculate on open.
   * Every `report.dcf / comps / ddm / fcfe` may be None -- we guard each section and
     write a human-readable "not available" note instead of crashing.
   * No network calls, no print(); we only build and save a workbook.
+
+Beyond the bridge, the DCF sheet shows the terminal year's reinvestment check
+(net reinvestment as a share of NOPAT, the return on new invested capital it
+implies, the latest ROIC) under the PV of the terminal value, and the reverse
+DCF (``report.reverse_dcf``: what the market price implies for year-1 growth,
+the target EBIT margin and the discount rate, one at a time) below the bridge;
+the Summary sheet repeats the implied year-1 growth. These are the engine's
+figures, written as values. A value-driver terminal value reinvests
+g / RONIC of NOPAT instead, shown in its own row; the check's rows then
+describe the capex, D&A and working-capital drivers, for comparison, and say
+so. The Comps sheet names the target's metric basis (fiscal year or trailing
+twelve months) and the number of peer values behind each multiple's
+statistics. The HTML report shares these rules (``terminal_check_rows``,
+``reverse_dcf_rows``, ``comps_basis_text``, ``terminal_method_label``); the
+memo and deck use the reverse-DCF ones (``reverse_dcf_message``,
+``reverse_dcf_rows``) and ``terminal_method_label``.
 
 """
 
 from __future__ import annotations
 
 import datetime as _dt
+import io
+import re
+import weakref
+import zipfile
 from typing import Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 from openpyxl import Workbook
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE, Cell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .. import config
 from ..data.market import _BLUME_MARKET_WEIGHT, _BLUME_RAW_WEIGHT
+from ..models.comps import COMPS_TTM_NOTE_PREFIX
 from ..schemas import ValuationReport
 from ..utils import available_model_price, is_num, median
 
@@ -68,6 +95,36 @@ BLUME_NOTE = f"Blume-adjusted toward 1 ({BLUME_FORMULA})"
 # a lessor's DCF and FCFE, and a low-payout or lone DDM) and no usable peers
 # were supplied: trading comps would give a target.
 NO_TARGET_SUPPLY_PEERS = "No target (supply peers)"
+
+# A well-formed ISO 4217 code. The quote currency is provider text; anything
+# else (stray quotes, markup) gets no prefix rather than reaching a number mask
+# or the HTML report.
+_ISO_CURRENCY = re.compile(r"[A-Z]{3}")
+
+
+def currency_prefix(code: object) -> str:
+    """The prefix every output puts before an amount: the currency's symbol, or
+    its ISO code and a space ("SEK 40.84") for an unmapped code
+    (``config.currency_symbol``); '' when the currency is unknown or is not a
+    three-letter code."""
+    if not isinstance(code, str):
+        return ""
+    if code in config.CURRENCY_SYMBOLS or _ISO_CURRENCY.fullmatch(code):
+        return config.currency_symbol(code)
+    return ""
+
+
+# Display names of the dividend discount model variants (DDMResult.method).
+DDM_METHOD_LABELS = {"two_stage": "Two-stage", "h_model": "H-model",
+                     "gordon": "Gordon growth"}
+
+
+def ddm_method_label(method: object) -> str:
+    """A DDM variant's display name ('two_stage' -> 'Two-stage'); an unknown
+    identifier is shown as it is, and a missing one as 'n/a'."""
+    if not method:
+        return "n/a"
+    return DDM_METHOD_LABELS.get(str(method), str(method))
 
 
 def _has_peers(comps: object) -> bool:
@@ -124,6 +181,168 @@ EXIT_MULTIPLE_GROWTH_NOTE = (
 )
 
 
+def terminal_method_label(assumptions: Optional[dict]) -> str:
+    """The DCF's terminal method as the reports show it: the method's name
+    ('gordon', 'exit_multiple'), or 'Value driver (RONIC 15.0%)' for the
+    opt-in value-driver terminal value, with the return on new invested
+    capital it used (``DCFResult.assumptions['terminal_ronic_used']``)."""
+    assumptions = assumptions or {}
+    method = assumptions.get("terminal_method")
+    if method == "value_driver":
+        ronic = assumptions.get("terminal_ronic_used")
+        return f"Value driver (RONIC {ronic:.1%})" if is_num(ronic) else "Value driver"
+    return str(method) if method is not None else "n/a"
+
+
+# The first stable year's reinvestment check (``models/dcf.py``), shown under
+# the PV of the terminal value: (label, ``DCFResult.assumptions`` key). All are
+# rates, and None (n/a) for an exit-multiple terminal value or when NOPAT, the
+# reinvestment rate or the growth is not positive.
+TERMINAL_DIAGNOSTICS = (
+    ("Terminal net reinvestment (% of NOPAT)", "terminal_reinvestment_rate"),
+    ("Implied return on new invested capital", "implied_terminal_ronic"),
+    ("Latest ROIC", "latest_roic"),
+)
+# What the check measures (the Excel note beside its first row).
+TERMINAL_CHECK_NOTE = ("Terminal-year check (values): implied return on new capital "
+                       "= terminal growth / net reinvestment rate")
+# A value-driver terminal value does not reinvest what the capex, D&A and
+# working-capital drivers carry into the stable year: FCFF = NOPAT x (1 - g /
+# RONIC), so it reinvests g / RONIC of NOPAT. This row shows that share above
+# the drivers' check, which ``models/dcf.py`` keeps for comparison.
+VALUE_DRIVER_REINVESTMENT_LABEL = "Reinvestment the TV uses (g / RONIC)"
+
+
+def value_driver_reinvestment(assumptions: Optional[dict]) -> Optional[float]:
+    """The share of the first stable year's NOPAT a value-driver terminal value
+    reinvests, terminal growth used / RONIC used (negative under negative
+    growth: the capital a shrinking business releases). None for the other
+    terminal methods or when either figure is missing."""
+    a = assumptions or {}
+    g, ronic = a.get("terminal_growth_used"), a.get("terminal_ronic_used")
+    if a.get("terminal_method") != "value_driver" or not (is_num(g) and is_num(ronic)) \
+            or ronic == 0:
+        return None
+    return float(g) / float(ronic)
+
+
+def terminal_check_rows(assumptions: Optional[dict]) -> list[tuple[str, Optional[float]]]:
+    """(label, rate or None) rows of the terminal reinvestment check, shown
+    under the PV of the terminal value: ``TERMINAL_DIAGNOSTICS``, preceded for a
+    value-driver terminal value by the reinvestment it uses
+    (``VALUE_DRIVER_REINVESTMENT_LABEL``, ``value_driver_reinvestment``)."""
+    a = assumptions or {}
+    rows = [(label, _num(a.get(key))) for label, key in TERMINAL_DIAGNOSTICS]
+    reinvest = value_driver_reinvestment(a)
+    if reinvest is not None:
+        rows.insert(0, (VALUE_DRIVER_REINVESTMENT_LABEL, reinvest))
+    return rows
+
+
+def value_driver_check_note(assumptions: Optional[dict]) -> Optional[str]:
+    """For a value-driver terminal value, what the check's driver rows are:
+    'From the capex, D&A and working-capital drivers, for comparison; the
+    value-driver TV reinvests g / RONIC = 16.7% of NOPAT at RONIC 15.0%' (or,
+    under negative growth, releases -g / RONIC of NOPAT a year). None for the
+    other terminal methods, whose check describes the terminal value itself."""
+    reinvest = value_driver_reinvestment(assumptions)
+    if reinvest is None:
+        return None
+    uses = (f"reinvests g / RONIC = {reinvest:.1%} of NOPAT" if reinvest >= 0
+            else f"releases -g / RONIC = {-reinvest:.1%} of NOPAT a year")
+    return ("From the capex, D&A and working-capital drivers, for comparison; the "
+            f"value-driver TV {uses} at RONIC {assumptions['terminal_ronic_used']:.1%}")
+
+# The reverse DCF (``report.reverse_dcf``, ``models/reverse_dcf.py``): what the
+# market price implies for one DCF driver at a time, the others held. Each
+# driver is (label, leg key -- None for year-1 growth, whose keys are at the top
+# level --, implied-value key, model-value key).
+REVERSE_DCF_TITLE = "Reverse DCF (market-implied, other inputs held)"
+REVERSE_DCF_DRIVERS = (
+    ("Year-1 revenue growth", None, "implied_growth_y1", "current_assumption_y1"),
+    ("Target EBIT margin", "margin", "implied_target_ebit_margin",
+     "current_target_ebit_margin"),
+    ("Discount rate (WACC)", "wacc", "implied_wacc", "current_wacc"),
+)
+# In place of the driver table when the run has no reverse DCF (no DCF
+# valuation to invert, or the solve was skipped).
+REVERSE_DCF_UNAVAILABLE = "Not available for this run."
+
+
+def reverse_dcf_message(reverse: object) -> Optional[str]:
+    """The one line shown instead of the reverse-DCF driver table, or None when
+    the table is shown. As the CLI prints it: the solver's single note when no
+    driver was solved at all (e.g. 'Not meaningful for a financial institution:
+    the FCFF DCF is reference-only.', or no valid market price), and
+    ``REVERSE_DCF_UNAVAILABLE`` when the run has no reverse DCF."""
+    if not isinstance(reverse, dict):
+        return REVERSE_DCF_UNAVAILABLE
+    if not reverse.get("converged") and reverse.get("margin") is None \
+            and reverse.get("wacc") is None:
+        return str(reverse.get("note") or REVERSE_DCF_UNAVAILABLE)
+    return None
+
+
+def reverse_dcf_rows(reverse: object) -> list[dict]:
+    """One dict per reverse-DCF driver (``REVERSE_DCF_DRIVERS`` order):
+    ``{'label', 'model', 'implied', 'converged', 'note'}``. 'implied' is the
+    market-implied value only when that driver's solve converged (else None,
+    shown as n/a); 'model' is the DCF's own value; 'note' is the solver's note
+    (no solution, several solutions) or None. A driver that could not be
+    computed at all has every value None. Empty when ``reverse_dcf_message``
+    applies instead."""
+    if reverse_dcf_message(reverse) is not None:
+        return []
+    rows = []
+    for label, leg_key, implied_key, model_key in REVERSE_DCF_DRIVERS:
+        leg = reverse if leg_key is None else reverse.get(leg_key)
+        leg = leg if isinstance(leg, dict) else {}
+        converged = bool(leg.get("converged"))
+        implied = leg.get(implied_key) if converged else None
+        rows.append({"label": label,
+                     "model": _num(leg.get(model_key)),
+                     "implied": _num(implied),
+                     "converged": converged and _num(implied) is not None,
+                     "note": leg.get("note") or None})
+    return rows
+
+
+def comps_basis_text(report: object) -> str:
+    """The target metrics the trading comps applied the peers' multiples to:
+    'trailing twelve months to 2025-03-31' when the opt-in trailing basis was
+    used (the comps note starting ``COMPS_TTM_NOTE_PREFIX + ' to '``; its date,
+    else ``MarketData.ttm_as_of``), with ' (some metrics on the fiscal year;
+    see the notes)' when a metric fell back; otherwise 'fiscal year 2024', the
+    statements' latest year ('the latest fiscal year' when unknown). Book value
+    (P/B) is always the latest balance sheet's."""
+    company = getattr(report, "company", None)
+    notes = [str(n) for n in (getattr(getattr(report, "comps", None), "notes", None) or [])]
+    used = next((n for n in notes if n.startswith(f"{COMPS_TTM_NOTE_PREFIX} to ")), None)
+    if used is not None:
+        m = re.match(re.escape(COMPS_TTM_NOTE_PREFIX) + r" to (\d{4}-\d{2}-\d{2})", used)
+        as_of = m.group(1) if m else getattr(getattr(company, "market", None),
+                                             "ttm_as_of", None)
+        text = f"trailing twelve months to {as_of}" if as_of else "trailing twelve months"
+        if any(n.startswith(f"{COMPS_TTM_NOTE_PREFIX}: ") for n in notes):
+            text += " (some metrics on the fiscal year; see the notes)"
+        return text
+    years = getattr(getattr(company, "financials", None), "fiscal_years", None) or []
+    year = years[-1] if years else None
+    return f"fiscal year {int(year)}" if is_num(year) else "the latest fiscal year"
+
+
+def peer_counts(comps: object) -> dict:
+    """{multiple key: number of peer values behind its statistics} (the comps
+    stats' ``n``; 0 when a multiple has none), for the multiples the workbook
+    and the HTML report tabulate, so a thin peer set is visible."""
+    stats = getattr(comps, "stats", None) or {}
+    out = {}
+    for key in config.COMPS_MULTIPLES:
+        n = (stats.get(key) or {}).get("n")
+        out[key] = int(n) if is_num(n) else 0
+    return out
+
+
 # --------------------------------------------------------------------------- #
 #  Small cell helpers (all None-safe)
 # --------------------------------------------------------------------------- #
@@ -134,7 +353,7 @@ def _num(value: object) -> Optional[float]:
 
 def _set(ws: Worksheet, row: int, col: int, value: object,
          *, fmt: Optional[str] = None, font: Optional[Font] = None,
-         align: Optional[Alignment] = None, formula: bool = False) -> "Cell":  # type: ignore[name-defined]
+         align: Optional[Alignment] = None, formula: bool = False) -> Cell:
     """Write a value into (row, col) and apply optional number format / style."""
     if isinstance(value, str):
         # Control characters (e.g. from exception text in a warning) are illegal
@@ -155,9 +374,36 @@ def _set(ws: Worksheet, row: int, col: int, value: object,
     return cell
 
 
-def _formula(ws: Worksheet, row: int, col: int, value: str, **style):
-    """Write an internally constructed formula, never provider-supplied text."""
-    return _set(ws, row, col, value, formula=True, **style)
+# Each formula's result, by worksheet ({coordinate: number or ''}). openpyxl
+# saves a formula without a cached value, which a viewer that does not
+# calculate shows as 0; write_excel stores these results in the saved file.
+_FORMULA_RESULTS: "weakref.WeakKeyDictionary[Worksheet, dict]" = weakref.WeakKeyDictionary()
+
+
+def _formula(ws: Worksheet, row: int, col: int, value: str, *,
+             result: object = None, **style):
+    """Write an internally constructed formula, never provider-supplied text.
+
+    ``result`` is what the formula evaluates to (a number, or '' for an IF that
+    returns an empty string), computed from the cells it references; it is
+    saved as the formula's cached value.
+    """
+    cell = _set(ws, row, col, value, formula=True, **style)
+    if is_num(result) or result == "":
+        _FORMULA_RESULTS.setdefault(ws, {})[cell.coordinate] = (
+            "" if result == "" else float(result))
+    return cell
+
+
+def _cell_number(ws: Worksheet, coord: str) -> float:
+    """A cell's number as a formula reads it: the stored number, a formula's
+    recorded result, or 0 for a blank (Excel treats a blank as 0)."""
+    cell = ws[coord]
+    if cell.data_type == "f":
+        value = _FORMULA_RESULTS.get(ws, {}).get(coord)
+    else:
+        value = cell.value
+    return float(value) if is_num(value) else 0.0
 
 
 def _title(ws: Worksheet, text: str) -> None:
@@ -183,12 +429,98 @@ def _set_widths(ws: Worksheet, widths: dict[int, float]) -> None:
         ws.column_dimensions[get_column_letter(col)].width = width
 
 
+_DEFAULT_WIDTH = 8.43  # Excel's width for a column with no width set
+
+
+def _shown_len(value: float, fmt: str) -> int:
+    """Characters Excel shows for a number in one of this module's masks
+    ('"$"#,##0.00', '#,##0', '0.0%', '0.0"x"', '0.0000'): the quoted literals,
+    a minus sign, the digits with any thousands separators, and the decimals.
+    0 for the General format, which Excel shortens to fit by itself."""
+    body = re.sub(r'"[^"]*"', "", fmt)
+    if "0" not in body:
+        return 0
+    literals = "".join(re.findall(r'"([^"]*)"', fmt))
+    decimals = len(body.split(".", 1)[1].replace("%", "")) if "." in body else 0
+    v = float(value) * (100 if "%" in body else 1)
+    digits = f"{v:,.{decimals}f}" if "," in body else f"{v:.{decimals}f}"
+    return len(literals) + len(digits) + body.count("%")
+
+
+def _fit_number_columns(ws: Worksheet) -> None:
+    """Widen any column too narrow for a number in it (formulas by their
+    result), leaving two characters of room. Excel shows '####' for a
+    formatted number that does not fit, and does not resize a column whose
+    width is set. Columns are only ever widened."""
+    results = _FORMULA_RESULTS.get(ws, {})
+    need: dict[str, int] = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            value = results.get(cell.coordinate) if cell.data_type == "f" else cell.value
+            if is_num(value) and not isinstance(value, bool):
+                n = _shown_len(value, cell.number_format or "General")
+                if n:
+                    letter = cell.column_letter
+                    need[letter] = max(need.get(letter, 0), n + 2)
+    for letter, width in need.items():
+        current = (ws.column_dimensions[letter].width
+                   if letter in ws.column_dimensions else _DEFAULT_WIDTH)
+        if width > (current or _DEFAULT_WIDTH):
+            ws.column_dimensions[letter].width = width
+
+
+_CACHEABLE_FORMULA = re.compile(
+    r'<c r="(?P<ref>[A-Z]+[0-9]+)"(?P<attrs>[^>]*)>(?P<f><f>[^<]*</f>)(?:<v\s*/>|<v></v>)</c>')
+
+
+def _store_formula_results(wb: Workbook, data: bytes) -> bytes:
+    """The saved workbook ``data`` with each recorded formula result written in
+    as that formula's cached value (<v>), which openpyxl leaves empty.
+
+    Only the empty <v> of a recorded formula cell is filled; the formulas, and
+    the workbook's full recalculation on load, are unchanged. The rewrite is
+    done in memory, so no temporary file is left beside the workbook.
+    """
+    edits = {}
+    for ws in wb.worksheets:
+        results = _FORMULA_RESULTS.pop(ws, None)
+        if results:
+            edits[ws.path.lstrip("/")] = results
+    if not edits:
+        return data
+
+    def fill(results: dict):
+        def repl(m: "re.Match") -> str:
+            if m.group("ref") not in results:
+                return m.group(0)
+            value, attrs = results[m.group("ref")], m.group("attrs")
+            if isinstance(value, str):
+                attrs += ' t="str"'
+                cached = _xml_escape(value)
+            else:
+                cached = repr(value)
+            return f'<c r="{m.group("ref")}"{attrs}>{m.group("f")}<v>{cached}</v></c>'
+        return repl
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, \
+            zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            part = src.read(info)
+            if info.filename in edits:
+                part = _CACHEABLE_FORMULA.sub(
+                    fill(edits[info.filename]), part.decode("utf-8")).encode("utf-8")
+            dst.writestr(info, part)
+    return out.getvalue()
+
+
 def _money_fmt(report: ValuationReport) -> str:
-    """Currency mask, prefixed with the reporting-currency symbol when known."""
+    """Currency mask, prefixed with the reporting currency's symbol, or its ISO
+    code when it has none (``currency_prefix``)."""
     cur = getattr(getattr(report.company, "market", None), "currency", None)
-    symbol = config.CURRENCY_SYMBOLS.get(cur) if cur else None
+    symbol = currency_prefix(cur)
     if symbol:
-        # Quote the symbol so non-ASCII (€, £, ¥) is treated literally by Excel.
+        # Quote the prefix so non-ASCII (€, £, ¥) and an ISO code are literal.
         return f'"{symbol}"{CURRENCY_FMT}'
     return CURRENCY_FMT
 
@@ -301,12 +633,12 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
         _set(ws, row, 2, imp, fmt=money_fmt, align=_RIGHT)
         if imp is not None and cur_price:
             # Live upside formula referencing the implied-price cell and current price.
+            up_val = imp / cur_price - 1.0
             up_cell = _formula(ws, row, 3, f"=B{row}/{current_price_cell}-1",
-                           fmt=PERCENT_FMT, align=_RIGHT)
+                               result=up_val, fmt=PERCENT_FMT, align=_RIGHT)
             # Best-effort sign coloring (Excel won't recolor on edit; this is the
             # value as-computed now -- a "plus", per the contract). None for a
             # method left out of the blend or when the engine gives no verdict.
-            up_val = imp / cur_price - 1.0
             if method_upside_toned(summary, key):
                 up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
         else:
@@ -353,7 +685,7 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     withheld = "blended_upside" in summary and _num(summary.get("blended_upside")) is None
     if blended is not None and cur_price and not withheld:
         up_cell = _formula(ws, row, 3, f"=B{row}/{current_price_cell}-1",
-                       fmt=PERCENT_FMT, align=_RIGHT)
+                           result=blended / cur_price - 1.0, fmt=PERCENT_FMT, align=_RIGHT)
         # Prefer the engine-computed blended_upside for sign-coloring (keeps the
         # Excel/HTML headline consistent); fall back to the local computation.
         if "blended_upside" in summary:
@@ -367,6 +699,22 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     row += 1
     _set(ws, row, 1, "Verdict", font=_LABEL_FONT)
     _set(ws, row, 2, summary.get("recommendation") or "n/a", align=_RIGHT)
+    row += 1
+    # What the price implies for year-1 revenue growth, the model's own rate
+    # beside it (the DCF sheet's reverse-DCF block has every driver).
+    _set(ws, row, 1, "Market-implied year-1 growth", font=_LABEL_FONT)
+    reverse = getattr(report, "reverse_dcf", None)
+    growth = next(iter(reverse_dcf_rows(reverse)), None)
+    if growth is not None and growth["converged"]:
+        _set(ws, row, 2, growth["implied"], fmt=PERCENT_FMT, align=_RIGHT)
+        model = growth["model"]
+        _note(ws, row, (f"Model {model:.1%}; reverse DCF" if model is not None
+                        else "Reverse DCF") + " on the DCF sheet", col=3)
+    else:
+        _set(ws, row, 2, "n/a", align=_RIGHT)
+        why = reverse_dcf_message(reverse) or (growth or {}).get("note")
+        if why:
+            _note(ws, row, why, col=3)
     row += 2
 
     # --- Football-field ranges -------------------------------------------- #
@@ -446,7 +794,6 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     # WACC and its components from the WACCResult (with graceful fallbacks).
     wacc_val = _num(getattr(wacc_res, "wacc", None)) if wacc_res else None
     _set(ws, row, 1, "WACC", font=_LABEL_FONT)
-    wacc_cell_ref = f"B{row}"
     _set(ws, row, 2, wacc_val, fmt=PERCENT_FMT, align=_RIGHT)
     row += 1
     if wacc_res is not None:
@@ -471,7 +818,8 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     tax_rate = assumptions.get("tax_rate")
     mid_year = assumptions.get("mid_year_convention")
     _set(ws, row, 1, "Terminal method")
-    _set(ws, row, 2, str(term_method) if term_method is not None else "n/a", align=_RIGHT)
+    # 'Value driver (RONIC x%)' names the return on new capital that TV used.
+    _set(ws, row, 2, terminal_method_label(assumptions), align=_RIGHT)
     row += 1
     # The multiple that sets an exit-multiple terminal value (and centres the
     # exit EV/EBITDA sensitivity axis).
@@ -481,7 +829,6 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
         _set(ws, row, 2, _num(exit_mult), fmt=MULTIPLE_FMT, align=_RIGHT)
         row += 1
     _set(ws, row, 1, "Terminal growth")
-    term_growth_cell_ref = f"B{row}"
     _set(ws, row, 2, _num(term_growth), fmt=PERCENT_FMT, align=_RIGHT)
     if term_method == "exit_multiple":
         # The multiple alone sets this DCF's terminal value; the growth rate
@@ -536,9 +883,12 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
         else:
             prev = get_column_letter(col - 1)
             cur = get_column_letter(col)
+            prev_rev = _cell_number(ws, f"{prev}{r_rev}")
             # Guarded: the model projects zero revenue when it has no base.
             _formula(ws, r_growth, col,
                  f'=IF({prev}{r_rev}=0,"",{cur}{r_rev}/{prev}{r_rev}-1)',
+                 result=(_cell_number(ws, f"{cur}{r_rev}") / prev_rev - 1.0
+                         if prev_rev else ""),
                  fmt=PERCENT_FMT, align=_RIGHT)
 
     r_ebit = body + 2
@@ -548,8 +898,10 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, r_margin, 1, "  EBIT margin %", font=_LABEL_FONT)
     for j in range(n):
         col = get_column_letter(first_year_col + j)
+        rev_j = _cell_number(ws, f"{col}{r_rev}")
         _formula(ws, r_margin, first_year_col + j,
              f'=IF({col}{r_rev}=0,"",{col}{r_ebit}/{col}{r_rev})',
+             result=_cell_number(ws, f"{col}{r_ebit}") / rev_j if rev_j else "",
              fmt=PERCENT_FMT, align=_RIGHT)
 
     r_nopat = body + 4
@@ -584,6 +936,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
         if j < len(fcff) and j < len(dfs) and _num(fcff[j]) is not None \
                 and _num(dfs[j]) is not None:
             _formula(ws, r_pv, first_year_col + j, f"={col}{r_fcff}*{col}{r_df}",
+                 result=_cell_number(ws, f"{col}{r_fcff}") * _cell_number(ws, f"{col}{r_df}"),
                  fmt=money_fmt, align=_RIGHT)
         else:
             val = _num(pv_fcff[j]) if j < len(pv_fcff) else None
@@ -604,7 +957,10 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, row, 1, "Σ PV of explicit FCFF", font=_LABEL_FONT)
     if n:
         sum_pv_formula = f"=SUM({first_year_col_letter}{r_pv}:{last_year_col}{r_pv})"
-        _formula(ws, row, 2, sum_pv_formula, fmt=money_fmt, align=_RIGHT)
+        _formula(ws, row, 2, sum_pv_formula,
+                 result=sum(_cell_number(ws, f"{get_column_letter(first_year_col + j)}{r_pv}")
+                            for j in range(n)),
+                 fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, None, fmt=money_fmt, align=_RIGHT)
     sum_pv_cell = f"B{row}"
@@ -621,9 +977,27 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     pv_terminal_cell = f"B{row}"
     row += 1
 
+    # The terminal year's reinvestment check (indented: annotations of the
+    # terminal value, not bridge items; the formulas below skip them). Snapshot
+    # values from the model, n/a when it gives none (e.g. an exit multiple).
+    # A value-driver TV adds the reinvestment it uses (g / RONIC) on top, and
+    # the note says the rows below it describe the drivers, for comparison.
+    first_check = TERMINAL_DIAGNOSTICS[0][0]
+    for label, value in terminal_check_rows(assumptions):
+        _set(ws, row, 1, f"  {label}")
+        if value is None:
+            _set(ws, row, 2, "n/a", align=_RIGHT)
+        else:
+            _set(ws, row, 2, value, fmt=PERCENT_FMT, align=_RIGHT)
+        if label == first_check:
+            _note(ws, row, value_driver_check_note(assumptions) or TERMINAL_CHECK_NOTE, col=3)
+        row += 1
+
     # Enterprise value = Σ PV explicit + PV terminal  (LIVE formula).
     _set(ws, row, 1, "Enterprise value", font=_LABEL_FONT)
-    _formula(ws, row, 2, f"={sum_pv_cell}+{pv_terminal_cell}", fmt=money_fmt, align=_RIGHT)
+    _formula(ws, row, 2, f"={sum_pv_cell}+{pv_terminal_cell}",
+             result=_cell_number(ws, sum_pv_cell) + _cell_number(ws, pv_terminal_cell),
+             fmt=money_fmt, align=_RIGHT)
     ev_cell = f"B{row}"
     row += 1
 
@@ -647,6 +1021,8 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     # Equity value = EV - net debt - minority - preferred  (LIVE formula).
     _set(ws, row, 1, "Equity value", font=_LABEL_FONT)
     _formula(ws, row, 2, f"={ev_cell}-{net_debt_cell}-" + "-".join(claim_cells),
+         result=(_cell_number(ws, ev_cell) - _cell_number(ws, net_debt_cell)
+                 - sum(_cell_number(ws, c) for c in claim_cells)),
          fmt=money_fmt, align=_RIGHT)
     equity_cell = f"B{row}"
     row += 1
@@ -661,7 +1037,9 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     shares_val = _num(getattr(dcf, "shares", None))
     available_price = available_model_price(dcf)
     if available_price is not None and shares_val and shares_val > 0:
-        _formula(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
+        _formula(ws, row, 2, f"={equity_cell}/{shares_cell}",
+                 result=_cell_number(ws, equity_cell) / shares_val,
+                 fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, available_price,
              fmt=money_fmt, align=_RIGHT)
@@ -681,14 +1059,55 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     if available_price is not None and cur_p and cur_p > 0:
         up_val = available_price / cur_p - 1.0
         up_cell = _formula(ws, row, 2, f"={implied_cell}/{current_cell}-1",
-                       fmt=PERCENT_FMT, align=_RIGHT)
+                           result=_cell_number(ws, implied_cell) / cur_p - 1.0,
+                           fmt=PERCENT_FMT, align=_RIGHT)
     else:
         up_cell = _set(ws, row, 2, up_val, fmt=PERCENT_FMT, align=_RIGHT)
     # Uncoloured for a reference-only DCF or when the engine gives no verdict.
     if up_val is not None and method_upside_toned(report.summary, "DCF"):
         up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
+    row += 2
 
-    _set_widths(ws, {1: 26, **{c: 16 for c in range(2, max(3, n + 2))}})
+    _write_reverse_dcf(ws, row, getattr(report, "reverse_dcf", None))
+
+    # Column A fits the terminal-check labels, column B the method label (a
+    # value-driver run's 'Value driver (RONIC 15.0%)').
+    widths = {1: 40, **{c: 16 for c in range(2, max(3, n + 2))}}
+    widths[2] = max(widths[2], len(terminal_method_label(assumptions)) + 2)
+    _set_widths(ws, widths)
+
+
+def _write_reverse_dcf(ws: Worksheet, row: int, reverse: object) -> int:
+    """The reverse-DCF block from ``row``: per driver the model's value and the
+    one the market price implies with the other inputs held (n/a when that
+    solve did not converge), then the solver's notes; or the single line of
+    ``reverse_dcf_message`` (e.g. 'Not meaningful for a financial institution:
+    ...'). The engine solved these, so they are values, not live formulas.
+    Returns the next free row."""
+    _set(ws, row, 1, REVERSE_DCF_TITLE, font=_SUBHEADER_FONT)
+    row += 1
+    message = reverse_dcf_message(reverse)
+    if message is not None:
+        _note(ws, row, message)
+        return row + 1
+    _note(ws, row, "Solved by the model, one driver at a time; values, not live formulas.")
+    row += 1
+    _header_row(ws, row, ["Driver", "Model", "Market-implied"])
+    row += 1
+    rows = reverse_dcf_rows(reverse)
+    for r in rows:
+        _set(ws, row, 1, r["label"], font=_LABEL_FONT)
+        for col, value in ((2, r["model"]), (3, r["implied"])):
+            if value is None:
+                _set(ws, row, col, "n/a", align=_RIGHT)
+            else:
+                _set(ws, row, col, value, fmt=PERCENT_FMT, align=_RIGHT)
+        row += 1
+    for r in rows:
+        if r["note"]:
+            _note(ws, row, f"{r['label']}: {r['note']}")
+            row += 1
+    return row
 
 
 # --------------------------------------------------------------------------- #
@@ -727,6 +1146,9 @@ def _write_comps(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None
     # --- Target + peer multiples table ------------------------------------ #
     _set(ws, row, 1, "Multiples table", font=_SUBHEADER_FONT)
     row += 1
+    # Which of the target's figures the peers' multiples were applied to.
+    _note(ws, row, f"Target metrics: {comps_basis_text(report)}")
+    row += 1
     _header_row(ws, row, [label for _, label, _ in _COMP_COLS])
     row += 1
 
@@ -750,19 +1172,23 @@ def _write_comps(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None
         row += 1
     row += 1
 
-    # --- Stats table (median / mean / min / max / p25 / p75) -------------- #
+    # --- Stats table (median / mean / min / max / p25 / p75, and n) ------- #
     stats = getattr(comps, "stats", None) or {}
     _set(ws, row, 1, "Peer statistics", font=_SUBHEADER_FONT)
     row += 1
     stat_keys = ["median", "mean", "min", "max", "p25", "p75"]
-    _header_row(ws, row, ["Multiple"] + [k.upper() for k in stat_keys])
+    # N: the peer values behind each multiple's statistics, so a thin sample
+    # does not look as solid as a broad one.
+    _header_row(ws, row, ["Multiple"] + [k.upper() for k in stat_keys] + ["N"])
     row += 1
+    counts = peer_counts(comps)
     for mult in _STAT_MULTIPLES:
         s = stats.get(mult) or {}
         _set(ws, row, 1, _STAT_LABELS[mult], font=_LABEL_FONT)
         fmt = "0.00" if mult == "peg" else MULTIPLE_FMT
         for j, k in enumerate(stat_keys):
             _set(ws, row, 2 + j, _num(s.get(k)), fmt=fmt, align=_RIGHT)
+        _set(ws, row, 2 + len(stat_keys), counts.get(mult, 0), fmt="0", align=_RIGHT)
         row += 1
     row += 1
 
@@ -815,7 +1241,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
         row += 2
     else:
         _set(ws, row, 1, "Method", font=_LABEL_FONT)
-        _set(ws, row, 2, getattr(ddm, "method", None) or "n/a", align=_RIGHT)
+        _set(ws, row, 2, ddm_method_label(getattr(ddm, "method", None)), align=_RIGHT)
         row += 1
         _set(ws, row, 1, "Cost of equity", font=_LABEL_FONT)
         _set(ws, row, 2, _num(getattr(ddm, "cost_of_equity", None)),
@@ -872,7 +1298,6 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
 
     # Projection table: metrics as rows, forecast years as columns.
     _header_row(ws, row, ["(reporting currency)"] + _year_labels(report, years))
-    table_top = row
     first_col = 2
     row += 1
 
@@ -898,6 +1323,8 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     _set(ws, row, 1, "Σ PV of explicit FCFE", font=_LABEL_FONT)
     if n:
         _formula(ws, row, 2, f"=SUM({first_col_letter}{r_pv}:{last_col}{r_pv})",
+             result=sum(_cell_number(ws, f"{get_column_letter(first_col + j)}{r_pv}")
+                        for j in range(n)),
              fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, None, fmt=money_fmt, align=_RIGHT)
@@ -917,7 +1344,9 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
 
     # Equity value = Σ PV + PV terminal  (LIVE formula).
     _set(ws, row, 1, "Equity value", font=_LABEL_FONT)
-    _formula(ws, row, 2, f"={sum_pv_cell}+{pv_term_cell}", fmt=money_fmt, align=_RIGHT)
+    _formula(ws, row, 2, f"={sum_pv_cell}+{pv_term_cell}",
+             result=_cell_number(ws, sum_pv_cell) + _cell_number(ws, pv_term_cell),
+             fmt=money_fmt, align=_RIGHT)
     equity_cell = f"B{row}"
     row += 1
 
@@ -930,7 +1359,9 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     _set(ws, row, 1, "Implied price / share", font=_LABEL_FONT)
     available_price = available_model_price(fcfe)
     if available_price is not None and (_num(getattr(fcfe, "shares", None)) or 0) > 0:
-        _formula(ws, row, 2, f"={equity_cell}/{shares_cell}", fmt=money_fmt, align=_RIGHT)
+        _formula(ws, row, 2, f"={equity_cell}/{shares_cell}",
+                 result=_cell_number(ws, equity_cell) / _cell_number(ws, shares_cell),
+                 fmt=money_fmt, align=_RIGHT)
     else:
         _set(ws, row, 2, available_price,
              fmt=money_fmt, align=_RIGHT)
@@ -949,7 +1380,8 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     imp = available_price
     if imp is not None and cur_p and cur_p > 0:
         up_cell = _formula(ws, row, 2, f"={implied_cell}/{current_cell}-1",
-                       fmt=PERCENT_FMT, align=_RIGHT)
+                           result=_cell_number(ws, implied_cell) / cur_p - 1.0,
+                           fmt=PERCENT_FMT, align=_RIGHT)
         # Uncoloured for a reference-only FCFE or when the engine gives no verdict.
         if imp is not None and method_upside_toned(report.summary, "FCFE"):
             up_cell.font = _GREEN_FONT if (imp / cur_p - 1.0) >= 0 else _RED_FONT
@@ -1114,10 +1546,14 @@ def write_excel(report: ValuationReport, path: str) -> str:
 
     Sheets: Summary, DCF, Comps, DDM_FCFE, Sensitivity. Every model section is
     guarded against being None and degrades to a human-readable "not available"
-    note. Live Excel formulas are used where practical (PV = FCFF*DF,
-    EV = SUM(PVs)+PV_TV, equity = EV - net debt - minority interest - preferred
-    equity, implied = equity/shares, upside = implied/current - 1) so the
-    workbook recalculates on user edits.
+    note. The DCF sheet also carries the terminal reinvestment check and the
+    reverse DCF, the Comps sheet the target's metric basis and the peer count
+    per multiple (values, not formulas). Live Excel formulas are used where
+    practical (PV = FCFF*DF, EV = SUM(PVs)+PV_TV, equity = EV - net debt -
+    minority interest - preferred equity, implied = equity/shares, upside =
+    implied/current - 1) so the workbook recalculates on user edits. Each
+    formula is saved with its result as the cached value, and every column is
+    wide enough for its numbers.
     """
     money_fmt = _money_fmt(report)
 
@@ -1142,6 +1578,13 @@ def write_excel(report: ValuationReport, path: str) -> str:
             writer(ws, report, money_fmt)
         except Exception as exc:  # noqa: BLE001 - degrade to a note on that sheet
             _note(ws, ws.max_row + 2, f"This section could not be written: {exc}")
+        _fit_number_columns(ws)
 
-    wb.save(path)
+    # Saved to memory, the formula results stored, then written to ``path`` in
+    # one go: the file is never read back, and gets the usual permissions.
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    data = _store_formula_results(wb, buffer.getvalue())
+    with open(path, "wb") as fh:
+        fh.write(data)
     return path

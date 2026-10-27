@@ -63,6 +63,11 @@ class BalanceSheetSnapshot:
     total_equity: float             # common stockholders' equity (book value)
     minority_interest: float = 0.0
     preferred_equity: float = 0.0
+    # Operating-lease liabilities that total_debt leaves out (EDGAR's
+    # borrowings), for the comps EV bridge on the peers' lease-inclusive
+    # basis. None when unknown or already in total_debt (Yahoo's and IFRS
+    # filers' debt includes leases). Not part of net_debt.
+    operating_lease_liability: Optional[float] = None
 
     @property
     def net_debt(self) -> float:
@@ -90,6 +95,27 @@ class MarketData:
     sector: Optional[str] = None
     industry: Optional[str] = None
     raw_beta: Optional[float] = None
+    # Yahoo's industry identifier (info['industryKey'], e.g.
+    # "beverages-non-alcoholic"); opt-in peer discovery reads that industry's list.
+    industry_key: Optional[str] = None
+    # Yahoo's trailing-twelve-month revenue, EBITDA and net income to common
+    # (info totalRevenue, ebitda, netIncomeToCommon), absolute amounts in the
+    # quote currency. Filled only when Yahoo's reporting currency
+    # (`ttm_currency`) is `currency`: no FX conversion is applied. Read only by
+    # comps: the opt-in trailing basis (``models.comps.run_comps(basis="ttm")``)
+    # and the default basis's fiscal-year vs trailing gap note; every other
+    # model uses the fiscal-year statements. Not screened for one-off items.
+    ttm_revenue: Optional[float] = None
+    ttm_ebitda: Optional[float] = None
+    ttm_net_income: Optional[float] = None
+    # ISO dates (UTC) of the quarter the trailing figures run to
+    # (info mostRecentQuarter) and of the latest fiscal year end
+    # (info lastFiscalYearEnd).
+    ttm_as_of: Optional[str] = None
+    fiscal_year_end: Optional[str] = None
+    # Yahoo's reporting currency (info financialCurrency, major unit), which
+    # the trailing figures are in; when it is not `currency` they are None.
+    ttm_currency: Optional[str] = None
 
 
 @dataclass
@@ -127,7 +153,7 @@ class DCFAssumptions:
     # from historical CAGR toward `terminal_growth`.
     revenue_growth: Optional[list[float]] = None
     terminal_growth: float = 0.025
-    terminal_method: str = "gordon"          # "gordon" | "exit_multiple"
+    terminal_method: str = "gordon"          # "gordon" | "exit_multiple" | "value_driver"
     exit_ev_ebitda: Optional[float] = None   # required if terminal_method == "exit_multiple"
     # Operating drivers. If None, derived from the trailing historical average and
     # held flat (or faded to the target where given).
@@ -139,6 +165,16 @@ class DCFAssumptions:
     # shield keeps using MacroAssumptions.tax_rate (else the historical effective rate).
     tax_rate: Optional[float] = None
     mid_year_convention: bool = True
+    # Return on new invested capital (decimal) for terminal_method
+    # "value_driver": the terminal FCFF is NOPAT x (1 - g / RONIC). None, or
+    # anything but a positive number above the terminal growth used, uses WACC
+    # (growth adds no value; a note says so). Ignored by the other methods.
+    terminal_ronic: Optional[float] = None
+    # Year-1 revenue growth (decimal) for the derived path: when revenue_growth
+    # is None the path starts here instead of the historical CAGR and fades to
+    # the terminal growth actually used (after any clamp below WACC), as the
+    # derived path does. Ignored when revenue_growth is given.
+    revenue_growth_start: Optional[float] = None
 
 
 @dataclass
@@ -216,6 +252,17 @@ class CompsResult:
     implied: dict
     implied_price_summary: dict      # {'low':.., 'median':.., 'high':..}
     notes: list[str] = field(default_factory=list)
+    # peer_status[TICKER] = what comps did with each requested peer (upper-case
+    # ticker, request order): 'used', 'not found' (no data came back), 'no
+    # usable multiple' (data with no positive multiple), 'is target' (the
+    # target itself) or 'not fetched' (the peer-data fetch failed). Empty when
+    # no peers were requested. See ``models.comps.run_comps``.
+    peer_status: dict = field(default_factory=dict)
+    # target_metrics = the target's {'revenue', 'ebitda', 'net_income'} the
+    # implied prices were computed on: the latest fiscal year's, or Yahoo's
+    # trailing figures under the opt-in trailing basis. The football field
+    # re-prices its EV bars on them. Empty when comps stopped before pricing.
+    target_metrics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -276,3 +323,7 @@ class ValuationReport:
     warnings: list[str] = field(default_factory=list)
     # UTC calculation timestamp, preserved when the same valuation is exported.
     valued_at: Optional[str] = None
+    # What the market price implies for year-1 revenue growth, the target EBIT
+    # margin and the discount rate, other DCF inputs held
+    # (``models.reverse_dcf.solve_reverse_dcf``); None without an available DCF.
+    reverse_dcf: Optional[dict] = None

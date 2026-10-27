@@ -1,7 +1,7 @@
 // Render actual TSX panels in Node using the project's own React/TypeScript.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Script } from "node:vm";
 import ts from "typescript";
@@ -19,9 +19,14 @@ export function loadComponent(name) {
     fileName: file,
   });
   const module = { exports: {} };
+  // "@/x" is the project root; "./x" (lib modules import each other so) is
+  // relative to the importing file.
+  const local = (rel) => loadComponent(rel + (existsSync(join(root, rel + ".tsx")) ? ".tsx" : ".ts"));
   const require = (id) => id.startsWith("@/")
-    ? loadComponent(id.slice(2) + (id.startsWith("@/components/") ? ".tsx" : ".ts"))
-    : nodeRequire(id);
+    ? local(id.slice(2))
+    : id.startsWith("./") || id.startsWith("../")
+      ? local(relative(root, join(dirname(file), id)))
+      : nodeRequire(id);
   new Script(`(function(require,module,exports){${outputText}\n})`, { filename: file })
     .runInThisContext()(require, module, module.exports);
   cache.set(file, module.exports);

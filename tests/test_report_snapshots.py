@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from docx import Document
 from fastapi.testclient import TestClient
 
 from backend import app as api, exports, valuation_service as vs
@@ -74,6 +75,11 @@ class ReportSnapshotTests(unittest.TestCase):
                     self.assertGreater(Path(path).stat().st_size, 100)
             text = (Path(tmp) / 'SYNT_valuation.html').read_text()
             self.assertIn('40.84', text)
+            # The snapshot's reverse DCF, as displayed, in the HTML and the memo.
+            self.assertIn('Year-1 revenue growth</th><td>8.0%</td><td>17.5%</td>', text)
+            memo = '\n'.join(p.text for p in
+                             Document(Path(tmp) / 'SYNT_research_memo.docx').paragraphs)
+            self.assertIn('The price implies 17.5% year-1 growth (model 8.0%)', memo)
 
     def test_expired_export_returns_conflict_instead_of_new_value(self):
         client = TestClient(api.app, base_url='http://127.0.0.1')
